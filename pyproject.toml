@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hteng-camera"
+version = "0.1.0"
+description = "Clean, fast Python interface to HTENG/MindVision machine-vision cameras (12-bit raw fast path)."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Proprietary" }
+authors = [{ name = "Your Name" }]
+dependencies = [
+    "numpy>=1.20",
+    "opencv-python>=4.5",
+]
+
+[project.optional-dependencies]
+# Web-based live viewer example (examples/live_viser.py)
+viser = ["viser>=0.2"]
+dev = ["pytest>=7"]
+
+[tool.setuptools]
+# The vendored SDK binaries are platform-specific shared libraries; ship them
+# all in one wheel and let hteng_camera._loader pick the right one at runtime.
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+hteng_camera = [
+    "_libs/linux-x86_64/*.so",
+    "_libs/linux-aarch64/*.so",
+    "_libs/darwin-arm64/*.dylib",
+]

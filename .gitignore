@@ -1,0 +1,11 @@
+__pycache__/
+Camera/*
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+*.png
+snap_*.png
+.DS_Store
