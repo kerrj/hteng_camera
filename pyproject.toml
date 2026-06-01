@@ -29,6 +29,8 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
+# Both the vendor SDK lib (libMVSDK / libmvsdk) and our native kernel
+# (libhteng_fast) live here; the *.so/*.dylib globs ship both.
 hteng_camera = [
     "_libs/linux-x86_64/*.so",
     "_libs/linux-aarch64/*.so",

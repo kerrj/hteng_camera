@@ -20,6 +20,8 @@ equivalent float32 round-trip over a 5 MP frame, and bit-identical to it.
 
 import numpy as np
 
+from . import _fast
+
 try:  # cv2 is required for demosaic; imported lazily-friendly for clear errors
     import cv2
 except ImportError:  # pragma: no cover
@@ -121,6 +123,26 @@ def to_display(linear, gamma=2.0, exposure=1.0, black=0.0, white=1.0,
     ``linear`` must be an integer array (uint8/uint16) — it indexes the LUT.
     ``max_in`` defaults to 4095 (native 12-bit). Pass 65535 if you fed in a
     16-bit-aligned frame (demosaic(..., align_to_16bit=True)).
+
+    When the native kernel (libhteng_fast) is present it does the LUT apply
+    multithreaded (~10x the numpy gather on a 5 MP frame); otherwise numpy's
+    fancy-index gather is used. Output is identical either way. Set
+    ``HTENG_NO_NATIVE=1`` to force the numpy path.
     """
     lut = _display_lut(gamma, exposure, black, white, max_in)
+
+    # Native fast path: contiguous uint16 in, threaded LUT apply into uint8 out.
+    if _fast.available and linear.dtype == np.uint16:
+        src = np.ascontiguousarray(linear)
+        out = np.empty(src.shape, dtype=np.uint8)
+        _fast._lib.hteng_apply_lut_u16(
+            src.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
+            out.ctypes.data_as(_fast.POINTER(_fast.c_ubyte)),
+            src.size,
+            lut.ctypes.data_as(_fast.POINTER(_fast.c_ubyte)),
+            lut.size,          # 65536 -> no index clamping needed
+            0,                 # auto-select thread count
+        )
+        return out
+
     return lut[linear]

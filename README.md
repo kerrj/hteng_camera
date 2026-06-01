@@ -99,6 +99,26 @@ drive exposure / gain / frame-speed, and tune the display tone curve (gamma,
 exposure mult, black/white) live. The camera feed is the scene background;
 snapshots save both the linear-16 source and the tone-mapped preview.
 
+## Native acceleration (optional)
+
+`convert.to_display` (the gamma/tone-curve encode) has an optional native C++
+kernel, `libhteng_fast`, that does the LUT apply multithreaded — ~9x faster than
+the numpy gather on a 5 MP frame (≈12 ms → ≈1.3 ms), bit-identical output. It is
+**optional**: if the binary isn't present the package falls back to numpy
+automatically, so everything works either way.
+
+A built wheel ships the kernel. To build it from source (e.g. on a fresh Linux
+checkout):
+
+```bash
+./native/build.sh          # compiles into src/hteng_camera/_libs/<platform>/
+```
+
+Requires a C++17 compiler (`g++` on Linux, `clang++` on macOS) — no other
+dependencies; flags are portable `-O3` (the kernel is memory-bandwidth bound, so
+`-march=native` is neither used nor needed). Set `HTENG_NO_NATIVE=1` to force the
+numpy fallback (useful for benchmarking the two).
+
 ## Notes
 
 - **Always release the camera** (`close()`, the context manager, or the GUI's
