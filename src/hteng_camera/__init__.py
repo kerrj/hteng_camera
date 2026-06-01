@@ -23,6 +23,7 @@ Two cameras are two independent ``HTCamera`` instances — open each by serial.
 
 from . import convert, enums
 from .camera import HTCamera, list_cameras
+from .convert import set_num_threads
 from .enums import (
     FRAME_SPEED_HIGH, FRAME_SPEED_LOW, FRAME_SPEED_NORMAL, FRAME_SPEED_SUPER,
     GET_NEWEST, GET_NEXT, GET_OLDEST,
@@ -31,7 +32,7 @@ from .enums import (
 __version__ = "0.1.0"
 
 __all__ = [
-    "HTCamera", "list_cameras", "convert", "enums",
+    "HTCamera", "list_cameras", "convert", "enums", "set_num_threads",
     "FRAME_SPEED_LOW", "FRAME_SPEED_NORMAL", "FRAME_SPEED_HIGH", "FRAME_SPEED_SUPER",
     "GET_OLDEST", "GET_NEWEST", "GET_NEXT",
 ]

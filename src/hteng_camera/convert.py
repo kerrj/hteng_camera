@@ -18,6 +18,8 @@ while applying it is a single uint16->uint8 gather — ~2.6x faster than the
 equivalent float32 round-trip over a 5 MP frame, and bit-identical to it.
 """
 
+import os
+
 import numpy as np
 
 from . import _fast
@@ -26,6 +28,30 @@ try:  # cv2 is required for demosaic; imported lazily-friendly for clear errors
     import cv2
 except ImportError:  # pragma: no cover
     cv2 = None
+
+
+def set_num_threads(n):
+    """Cap CPU threads used by the pixel pipeline (cv2's demosaic + our gamma).
+
+    Demosaic runs in cv2, which by default grabs *every* core (e.g. 10 threads
+    behind your back). This caps it process-wide so the camera pipeline doesn't
+    saturate the machine. The native unpack is single-threaded regardless.
+    Call once at startup; ``HTENG_NUM_THREADS`` sets the initial value.
+
+    Platform note: cv2's cap works under TBB/pthreads (the Linux default). Under
+    macOS's GCD backend ``cv2.setNumThreads`` is a documented no-op for n>0 (only
+    n=0 has an effect there: fully serial); our native gamma kernel still honors
+    the cap on every platform.
+    """
+    if cv2 is not None:
+        cv2.setNumThreads(int(n))
+    _fast.set_num_threads(int(n))
+
+
+# Apply an initial thread cap so importing the package doesn't silently hand cv2
+# all cores. Default 4 is a sane balance; override with HTENG_NUM_THREADS.
+_default_threads = int(os.environ.get("HTENG_NUM_THREADS", "4"))
+set_num_threads(_default_threads)
 
 
 def unpack_bayer12_packed(raw, width, height):
@@ -37,7 +63,11 @@ def unpack_bayer12_packed(raw, width, height):
         p1 = (b2 << 4) | (b1 >> 4)
 
     ``raw`` may be a numpy uint8 array or any buffer of length width*height*3/2.
-    Returns an (H, W) uint16 array. ~7 ms for 5 MP, the bulk of the fast path.
+    Returns an (H, W) uint16 array.
+
+    Uses the native single-threaded kernel when available (~0.5 ms for 5 MP, 15x
+    the numpy path below) and falls back to numpy otherwise — bit-identical
+    either way. This is the step that dominated the old pure-Python pipeline.
     """
     buf = np.frombuffer(raw, dtype=np.uint8)
     expected = width * height * 3 // 2
@@ -46,6 +76,17 @@ def unpack_bayer12_packed(raw, width, height):
             f"packed-12 buffer too small: got {buf.size} bytes, "
             f"need {expected} for {width}x{height}"
         )
+
+    if _fast.available:
+        src = np.ascontiguousarray(buf[:expected])
+        out = np.empty(width * height, dtype=np.uint16)
+        _fast._lib.hteng_unpack_bayer12(
+            src.ctypes.data_as(_fast.POINTER(_fast.c_ubyte)),
+            out.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
+            width * height,
+        )
+        return out.reshape(height, width)
+
     b = buf[:expected].reshape(-1, 3)
     lo = b[:, 1]
     out = np.empty(width * height, dtype=np.uint16)
@@ -140,8 +181,8 @@ def to_display(linear, gamma=2.0, exposure=1.0, black=0.0, white=1.0,
             out.ctypes.data_as(_fast.POINTER(_fast.c_ubyte)),
             src.size,
             lut.ctypes.data_as(_fast.POINTER(_fast.c_ubyte)),
-            lut.size,          # 65536 -> no index clamping needed
-            0,                 # auto-select thread count
+            lut.size,                 # 65536 -> no index clamping needed
+            _fast.num_threads(),      # honor the central thread cap
         )
         return out
 

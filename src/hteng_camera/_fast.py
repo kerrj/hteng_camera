@@ -27,6 +27,20 @@ _PLATFORM_MAP = {
 _lib = None
 available = False
 
+# Thread cap passed to the native gamma kernel (0 = let it auto-pick all cores).
+# convert.set_num_threads keeps this in sync with cv2's cap.
+_num_threads = 0
+
+
+def set_num_threads(n):
+    """Set the thread count the native kernels use (0 = auto / all cores)."""
+    global _num_threads
+    _num_threads = max(0, int(n))
+
+
+def num_threads():
+    return _num_threads
+
 
 def _candidate_path():
     system = platform.system()
@@ -56,6 +70,12 @@ def _try_load():
             POINTER(c_ubyte),   # lut
             c_int,              # lut_size
             c_int,              # n_threads
+        ]
+        lib.hteng_unpack_bayer12.restype = None
+        lib.hteng_unpack_bayer12.argtypes = [
+            POINTER(c_ubyte),   # in  (packed bytes)
+            POINTER(c_uint16),  # out (bayer plane)
+            c_size_t,           # n_pixels
         ]
         _lib = lib
         available = True
