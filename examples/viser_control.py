@@ -73,10 +73,26 @@ def main():
             "Frame speed", options=("Low", "Mid", "High"), initial_value="High")
 
     # -- Display tone curve (preview only) ---------------------------------
+    # Per-curve "strength" slider range/default — the slider's meaning adapts to
+    # the selected curve (gamma exponent / log shadow-lift a / reinhard k).
+    curve_param_cfg = {
+        "gamma":    dict(min=0.4, max=4.0, step=0.05, default=2.0,
+                         hint="Gamma exponent. 2.0=sqrt, 1.0=linear. High gamma "
+                              "lifts darks but washes out mid/highlights."),
+        "log":      dict(min=2.0, max=300.0, step=1.0, default=80.0,
+                         hint="Shadow-lift strength a. Higher = more dark detail. "
+                              "Best all-round for HDR scenes."),
+        "reinhard": dict(min=0.02, max=1.0, step=0.01, default=0.18,
+                         hint="Shoulder k. Lower = brighter midtones."),
+    }
     with server.gui.add_folder("Display tone curve (preview only)"):
-        gamma_slider = server.gui.add_slider(
-            "Gamma", min=0.4, max=4.0, step=0.05, initial_value=2.0,
-            hint="Output = linear^(1/gamma). 2.0 = sqrt (fast). 1.0 = linear.")
+        curve_dropdown = server.gui.add_dropdown(
+            "Curve", options=("gamma", "log", "reinhard"), initial_value="gamma",
+            hint="gamma: classic power curve.  log: equal detail per stop (HDR).  "
+                 "reinhard: smooth global tone map.")
+        param_slider = server.gui.add_slider(
+            "Curve strength", min=0.4, max=4.0, step=0.05, initial_value=2.0,
+            hint=curve_param_cfg["gamma"]["hint"])
         ev_slider = server.gui.add_slider(
             "Exposure mult", min=0.1, max=16.0, step=0.1, initial_value=1.0,
             hint="Brightens the linear signal before clipping (display only).")
@@ -90,6 +106,16 @@ def main():
                  f"(vs {DISPLAY_WIDTH}px). Cheaper encode + much less bandwidth; "
                  f"capture and snapshots stay full-res.")
         reset_btn = server.gui.add_button("Reset tone curve")
+
+    @curve_dropdown.on_update
+    def _(_e):
+        # Retarget the strength slider to the selected curve's range/default.
+        cfg = curve_param_cfg[curve_dropdown.value]
+        param_slider.min = cfg["min"]
+        param_slider.max = cfg["max"]
+        param_slider.step = cfg["step"]
+        param_slider.value = cfg["default"]
+        param_slider.hint = cfg["hint"]
 
     # -- Capture -----------------------------------------------------------
     with server.gui.add_folder("Capture"):
@@ -148,9 +174,16 @@ def main():
             np.zeros((360, 640, 3), np.uint8), format="jpeg")
         conn_text.value = "closed (released)"
 
+    def tone_kwargs():
+        """Current tone-curve settings as to_display() keyword args."""
+        return dict(curve=curve_dropdown.value, param=param_slider.value,
+                    exposure=ev_slider.value, black=black_slider.value,
+                    white=white_slider.value)
+
     @reset_btn.on_click
     def _(_e):
-        gamma_slider.value = 2.0
+        curve_dropdown.value = "gamma"          # also retargets param slider via on_update
+        param_slider.value = 2.0
         ev_slider.value = 1.0
         black_slider.value = 0.01
         white_slider.value = 1.0
@@ -165,8 +198,7 @@ def main():
         # The real data: full-depth linear RGB (12-bit values aligned to 16-bit).
         lin16 = lin << 4
         cv2.imwrite(f"snap_{ts}_linear16.png", cv2.cvtColor(lin16, cv2.COLOR_RGB2BGR))
-        prev = convert.to_display(lin, gamma_slider.value, ev_slider.value,
-                                  black_slider.value, white_slider.value)
+        prev = convert.to_display(lin, **tone_kwargs())
         cv2.imwrite(f"snap_{ts}_preview.png", cv2.cvtColor(prev, cv2.COLOR_RGB2BGR))
         status_text.value = (f"saved snap_{ts}_linear16.png + _preview.png "
                              f"({lin.shape[1]}x{lin.shape[0]})")
@@ -190,8 +222,7 @@ def main():
 
             target_w = LOWRES_WIDTH if lowres_box.value else DISPLAY_WIDTH
             disp_lin = downscale(lin, target_w)
-            disp = convert.to_display(disp_lin, gamma_slider.value, ev_slider.value,
-                                      black_slider.value, white_slider.value)
+            disp = convert.to_display(disp_lin, **tone_kwargs())
             server.scene.set_background_image(disp, format="jpeg",
                                               jpeg_quality=JPEG_QUALITY)
 
@@ -206,7 +237,7 @@ def main():
                 status_text.value = (
                     f"{lin.shape[1]}x{lin.shape[0]}  {tag}  "
                     f"lin mean={lin.mean():.0f} max={int(lin.max())}  "
-                    f"gamma {gamma_slider.value:.2f} ev {ev_slider.value:.1f}x  "
+                    f"{curve_dropdown.value} {param_slider.value:.2f} ev {ev_slider.value:.1f}x  "
                     f"{preview_tag}  {fps:.1f} fps")
                 fps_t0 = now
                 frames = 0

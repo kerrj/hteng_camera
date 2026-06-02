@@ -115,62 +115,125 @@ def demosaic(bayer12, cv_code, align_to_16bit=False):
     return rgb
 
 
-# Cache the most recent display LUT so repeated calls with unchanged tone-curve
-# params (the common case in a live loop) reuse it. The table is keyed on the
-# full parameter tuple; one entry is plenty since callers vary params slowly.
+# Tone curves: pure 0..1 -> 0..1 pointwise mappings applied to the normalised
+# linear signal. Each is monotonic so it round-trips a 1-D LUT exactly. Add new
+# ones here and they immediately work through the cache + native kernel.
+#
+#   gamma     out = x**(1/gamma)            — classic power curve; one knob, but
+#                                             lifting shadows (high gamma) washes
+#                                             out mid/highlights (see README).
+#   log       out = log(1+a*x)/log(1+a)     — allocates output per stop of light:
+#                                             strong shadow/mid detail, gentle
+#                                             highlight rolloff, black stays black.
+#                                             Best all-round for HDR machine-vision
+#                                             scenes. `a` = shadow-lift strength.
+#   reinhard  out = (x/(x+k)) * (1+k)/1     — smooth global tone map; great
+#                                             midtones, soft highlights. `k` sets
+#                                             the shoulder.
+def _curve_gamma(x, gamma):
+    if gamma == 2.0:
+        return np.sqrt(x)               # exact, and the common fast default
+    if gamma == 1.0:
+        return x
+    return x ** (1.0 / gamma)
+
+
+def _curve_log(x, a):
+    a = max(1e-3, float(a))
+    return np.log1p(a * x) / np.log1p(a)
+
+
+def _curve_reinhard(x, k):
+    k = max(1e-3, float(k))
+    return (x / (x + k)) * (1.0 + k)     # scaled so x=1 -> 1
+
+
+_CURVES = {"gamma": _curve_gamma, "log": _curve_log, "reinhard": _curve_reinhard}
+
+# Default shape param per curve, used when the caller doesn't pass `param`.
+_CURVE_DEFAULT_PARAM = {"gamma": 2.0, "log": 80.0, "reinhard": 0.18}
+
+
+# Cache the most recent display LUT so repeated calls with an unchanged tone
+# curve (the common case in a live loop) reuse it. Keyed on the full spec —
+# curve name, shape param, and the exposure/black/white normalisation — so any
+# change rebuilds (~0.08 ms) and anything steady is a free lookup.
 _LUT_CACHE = {"key": None, "lut": None}
 
 
-def _display_lut(gamma, exposure, black, white, max_in):
+def _display_lut(curve, param, exposure, black, white, max_in):
     """Build (or fetch from cache) the uint16->uint8 display-encode table.
 
     The table has 65536 entries — one per possible uint16 input — so indexing it
     with any uint16 frame is always in-bounds, no clamping of indices needed.
-    Building it touches 65536 values (~0.08 ms), vs millions for a per-pixel
-    float path, so the sqrt/pow runs a few thousand times instead of millions.
+    The curve runs over 65536 values (~0.08 ms) instead of per-pixel, so even an
+    expensive curve costs the same at apply time as a plain sqrt.
+
+    ``curve`` is a name in ``_CURVES`` or a callable ``f(x01_array) -> 0..1``.
+    ``param`` is the curve's shape knob (gamma exponent / log a / reinhard k);
+    None uses that curve's default. Callables ignore ``param``.
     """
-    key = (gamma, exposure, black, white, max_in)
+    key = (curve if isinstance(curve, str) else id(curve),
+           param, exposure, black, white, max_in)
     if _LUT_CACHE["key"] == key:
         return _LUT_CACHE["lut"]
 
+    # Normalise linear input -> 0..1 with exposure gain and black/white levels.
     f = np.arange(65536, dtype=np.float32) * (exposure / max_in)
     if black != 0.0 or white != 1.0:
         f = (f - black) / max(1e-6, (white - black))
     np.clip(f, 0.0, 1.0, out=f)
-    if gamma == 2.0:
-        np.sqrt(f, out=f)            # gamma 2.0 == sqrt
-    elif gamma != 1.0:
-        f **= (1.0 / gamma)
-    lut = (f * 255.0 + 0.5).astype(np.uint8)
 
+    # Apply the tone curve.
+    if callable(curve):
+        f = np.clip(curve(f), 0.0, 1.0)
+    else:
+        fn = _CURVES.get(curve)
+        if fn is None:
+            raise ValueError(f"unknown curve {curve!r}; options: {list(_CURVES)}")
+        p = _CURVE_DEFAULT_PARAM[curve] if param is None else param
+        f = fn(f, p)
+
+    lut = (f * 255.0 + 0.5).astype(np.uint8)
     _LUT_CACHE["key"] = key
     _LUT_CACHE["lut"] = lut
     return lut
 
 
-def to_display(linear, gamma=2.0, exposure=1.0, black=0.0, white=1.0,
-               max_in=4095.0):
+def to_display(linear, gamma=None, exposure=1.0, black=0.0, white=1.0,
+               max_in=4095.0, curve="gamma", param=None):
     """Encode a linear RGB (or mono) frame to uint8 for display/export.
 
         norm = clip((linear/max_in * exposure - black) / (white - black), 0, 1)
-        out  = norm ** (1/gamma) * 255
+        out  = curve(norm) * 255
 
-    Implemented as a cached lookup table (built once per distinct tone curve),
-    then a single uint16->uint8 gather — bit-identical to the float computation
-    but ~2.6x faster on a 5 MP frame, since it never materialises a float buffer
-    the size of the image. gamma=2.0 (default) is sqrt; 1.0 is linear; 2.2 is
-    sRGB-ish.
+    ``curve`` selects the tone curve (see :data:`_CURVES`):
+      * ``"gamma"`` — power curve; ``param`` is the gamma exponent (default 2.0,
+        a plain sqrt). 1.0 = linear, 2.2 = sRGB-ish. Lifting shadows via high
+        gamma washes out mid/highlights.
+      * ``"log"`` — ``out = log(1+a*x)/log(1+a)``; ``param`` = a, the shadow-lift
+        strength (default 80). Best all-round for HDR scenes: strong shadow and
+        midtone detail, gentle highlight rolloff, black stays black.
+      * ``"reinhard"`` — smooth global tone map; ``param`` = k (default 0.18).
+      * a callable ``f(x01) -> 0..1`` for an arbitrary pointwise curve.
 
-    ``linear`` must be an integer array (uint8/uint16) — it indexes the LUT.
-    ``max_in`` defaults to 4095 (native 12-bit). Pass 65535 if you fed in a
-    16-bit-aligned frame (demosaic(..., align_to_16bit=True)).
+    ``gamma=`` is kept as a back-compat shortcut: passing it is equivalent to
+    ``curve="gamma", param=<gamma>``.
+
+    Implemented as a cached lookup table (built once per distinct curve), then a
+    single uint16->uint8 gather — the curve runs over 65536 values, not per
+    pixel, so even an expensive curve is free per-frame. ``linear`` must be an
+    integer array (uint8/uint16) — it indexes the LUT.
 
     When the native kernel (libhteng_fast) is present it does the LUT apply
     multithreaded (~10x the numpy gather on a 5 MP frame); otherwise numpy's
     fancy-index gather is used. Output is identical either way. Set
     ``HTENG_NO_NATIVE=1`` to force the numpy path.
     """
-    lut = _display_lut(gamma, exposure, black, white, max_in)
+    # Back-compat: gamma= is shorthand for curve="gamma", param=gamma.
+    if gamma is not None:
+        curve, param = "gamma", gamma
+    lut = _display_lut(curve, param, exposure, black, white, max_in)
 
     # Native fast path: contiguous uint16 in, threaded LUT apply into uint8 out.
     if _fast.available and linear.dtype == np.uint16:
