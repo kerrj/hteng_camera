@@ -232,12 +232,14 @@ class HTCamera:
 
     def play(self):
         if not self._playing:
-            check(_sdk.CameraPlay(self.h), "CameraPlay")
+            # Route through _ctrl so a wedged control channel (-52) recovers via
+            # CameraReConnect instead of raising — same as every other write.
+            self._ctrl(lambda: _sdk.CameraPlay(self.h), "CameraPlay")
             self._playing = True
 
     def pause(self):
         if self._playing:
-            check(_sdk.CameraPause(self.h), "CameraPause")
+            self._ctrl(lambda: _sdk.CameraPause(self.h), "CameraPause")
             self._playing = False
 
     # -- robust control writes --------------------------------------------

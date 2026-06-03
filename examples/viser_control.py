@@ -48,6 +48,8 @@ def main():
         "cam": None,          # HTCamera or None
         "latest_linear": None,  # most recent full-res linear uint16 RGB
         "quit": False,
+        "full_w": 0,          # native sensor resolution, learned on open
+        "full_h": 0,
     }
 
     cams = list_cameras()
@@ -71,6 +73,32 @@ def main():
             "Analog gain (x)", min=1.0, max=22.0, step=0.1, initial_value=1.0)
         speed_dropdown = server.gui.add_dropdown(
             "Frame speed", options=("Low", "Mid", "High"), initial_value="High")
+
+    # -- Sensor ROI (firmware crop -> less USB bandwidth) ------------------
+    # set_roi() sets a true sensor-readout window, so only the cropped region
+    # is transferred over USB. Defaults to full res; slider bounds + the full
+    # baseline are filled in from current_resolution() when a camera opens.
+    ROI_STEP = 16  # most MindVision sensors want width/offset on a 16-px grid
+    with server.gui.add_folder("Sensor ROI (USB bandwidth)"):
+        roi_full_box = server.gui.add_checkbox(
+            "Full resolution", initial_value=True,
+            hint="Read out the whole sensor. Uncheck to crop the readout (e.g. "
+                 "to a fisheye's image circle) and cut USB transfer time.")
+        roi_w = server.gui.add_slider(
+            "Width", min=ROI_STEP, max=4096, step=ROI_STEP, initial_value=4096,
+            disabled=True)
+        roi_h = server.gui.add_slider(
+            "Height", min=ROI_STEP, max=4096, step=ROI_STEP, initial_value=4096,
+            disabled=True)
+        roi_x = server.gui.add_slider(
+            "X offset", min=0, max=4096, step=ROI_STEP, initial_value=0,
+            disabled=True)
+        roi_y = server.gui.add_slider(
+            "Y offset", min=0, max=4096, step=ROI_STEP, initial_value=0,
+            disabled=True)
+        roi_center_btn = server.gui.add_button("Center ROI")
+        roi_apply_btn = server.gui.add_button("Apply ROI")
+        roi_text = server.gui.add_text("Sensor", initial_value="—", disabled=True)
 
     # -- Display tone curve (preview only) ---------------------------------
     # Per-curve "strength" slider range/default — the slider's meaning adapts to
@@ -157,6 +185,19 @@ def main():
             lo, hi, step = cam.gain_range()
             gain_slider.min, gain_slider.max, gain_slider.step = lo, hi, step
             pushed.update(ae=None, exp=None, gain=None, speed=None)  # force re-push
+
+            # Learn the native sensor size and set up the ROI sliders at full res.
+            res = cam.current_resolution()
+            fw = max(int(res.iWidthFOV), int(res.iWidth))
+            fh = max(int(res.iHeightFOV), int(res.iHeight))
+            state["full_w"], state["full_h"] = fw, fh
+            roi_w.max, roi_w.value = fw, fw
+            roi_h.max, roi_h.value = fh, fh
+            roi_x.max, roi_x.value = fw, 0
+            roi_y.max, roi_y.value = fh, 0
+            roi_full_box.value = True
+            roi_text.value = f"full {fw}x{fh}"
+
             state["cam"] = cam
             conn_text.value = f"open: {cam.serial} ({cam.name})"
         except Exception as exc:  # surface SDK errors in the GUI, don't crash
@@ -202,6 +243,52 @@ def main():
         cv2.imwrite(f"snap_{ts}_preview.png", cv2.cvtColor(prev, cv2.COLOR_RGB2BGR))
         status_text.value = (f"saved snap_{ts}_linear16.png + _preview.png "
                              f"({lin.shape[1]}x{lin.shape[0]})")
+
+    def _snap(v, step):
+        """Round to the ROI grid (avoids the SDK rejecting off-grid windows)."""
+        return int(round(v / step)) * step
+
+    @roi_full_box.on_update
+    def _(_e):
+        # Greyed-out sliders when full-res; enabled when cropping.
+        full = roi_full_box.value
+        for s in (roi_w, roi_h, roi_x, roi_y):
+            s.disabled = full
+        if full:
+            roi_w.value, roi_h.value = state["full_w"], state["full_h"]
+            roi_x.value, roi_y.value = 0, 0
+            _apply_roi()
+
+    @roi_center_btn.on_click
+    def _(_e):
+        fw, fh = state["full_w"], state["full_h"]
+        roi_x.value = max(0, _snap((fw - roi_w.value) / 2, ROI_STEP))
+        roi_y.value = max(0, _snap((fh - roi_h.value) / 2, ROI_STEP))
+
+    def _apply_roi():
+        cam = state["cam"]
+        if cam is None:
+            roi_text.value = "open a camera first"
+            return
+        fw, fh = state["full_w"], state["full_h"]
+        if roi_full_box.value:
+            w, h, x, y = fw, fh, 0, 0
+        else:
+            # Clamp to a valid on-grid window inside the sensor.
+            w = min(_snap(roi_w.value, ROI_STEP), fw)
+            h = min(_snap(roi_h.value, ROI_STEP), fh)
+            x = min(_snap(roi_x.value, ROI_STEP), fw - w)
+            y = min(_snap(roi_y.value, ROI_STEP), fh - h)
+        try:
+            cam.set_roi(w, h, x, y)
+            state["latest_linear"] = None  # old-size frame is stale
+            roi_text.value = f"ROI {w}x{h} @ ({x},{y})  of {fw}x{fh}"
+        except Exception as exc:  # surface SDK rejection, keep streaming
+            roi_text.value = f"ROI failed: {exc}"
+
+    @roi_apply_btn.on_click
+    def _(_e):
+        _apply_roi()
 
     print("Viser up — open the printed URL. Use 'Open' to connect a camera.")
     fps_t0 = time.time()
