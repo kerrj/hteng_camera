@@ -40,14 +40,49 @@ Usage
 
 import argparse
 import queue
+import shutil
 import subprocess
+import sys
 import threading
 import time
 from typing import Optional
 
 import numpy as np
 
-from hteng_camera import HTCamera
+from hteng_camera import HTCamera, enums
+
+
+# ---------------------------------------------------------------------------
+# Preflight: make sure ffmpeg exists and can do 10-bit HEVC NVENC
+# ---------------------------------------------------------------------------
+
+def _preflight_ffmpeg() -> None:
+    """Fail early with an actionable message if ffmpeg / NVENC isn't usable.
+
+    Without this, a missing ffmpeg surfaces as a raw FileNotFoundError and a
+    missing NVENC encoder only shows up as a late nonzero exit code with the
+    real error buried in ffmpeg's stderr.
+    """
+    if shutil.which("ffmpeg") is None:
+        sys.exit(
+            "[error] ffmpeg not found on PATH.\n"
+            "        Install it (e.g. `sudo apt install ffmpeg`) — it must be "
+            "built with --enable-nvenc."
+        )
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (subprocess.SubprocessError, OSError) as e:
+        sys.exit(f"[error] could not query ffmpeg encoders: {e}")
+    if "hevc_nvenc" not in out:
+        sys.exit(
+            "[error] this ffmpeg has no hevc_nvenc encoder.\n"
+            "        You need an NVIDIA GPU (Maxwell+), driver >= 418, and an "
+            "ffmpeg built with --enable-nvenc.\n"
+            "        Check with: ffmpeg -encoders | grep nvenc"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +292,9 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    # Fail fast if ffmpeg / NVENC isn't usable, before we touch the camera.
+    _preflight_ffmpeg()
+
     frame_interval_ms = 1000.0 / args.fps
     if args.exposure_ms >= frame_interval_ms:
         print(
@@ -269,6 +307,7 @@ def main() -> None:
     print("[info] Opening camera…")
     cam = HTCamera(serial=args.serial)
     cam.set_ae(False)                        # fixed exposure → stable fps
+    cam.set_frame_speed(enums.FRAME_SPEED_HIGH)  # max USB throughput; avoid underrun
     cam.set_exposure_ms(args.exposure_ms)
     cam.set_analog_gain(args.gain)
 
@@ -308,20 +347,36 @@ def main() -> None:
     enc_thread.start()
 
     # ── Wait for duration / Ctrl+C ───────────────────────────────────────────
+    # Sleep in short slices (rather than one long sleep / blocking join) so a
+    # Ctrl+C is noticed promptly and the encoder thread can't keep us hanging.
     try:
-        if args.duration is not None:
-            time.sleep(args.duration)
-        else:
-            print("[info] Recording… press Ctrl+C to stop.")
-            enc_thread.join()          # blocks until BrokenPipe or stop
+        print("[info] Recording… press Ctrl+C to stop.")
+        t_end = None if args.duration is None else time.monotonic() + args.duration
+        while enc_thread.is_alive():
+            if t_end is not None and time.monotonic() >= t_end:
+                break
+            if proc.poll() is not None:    # ffmpeg died (e.g. NVENC error)
+                print("[warn] ffmpeg exited early — stopping.")
+                break
+            time.sleep(0.1)
     except KeyboardInterrupt:
-        print()                        # newline after ^C
+        print()                            # newline after ^C
 
     # ── Tear down ─────────────────────────────────────────────────────────────
+    # Order matters: stop+join the CAPTURE producer first so it stops feeding the
+    # queue, otherwise the encoder's "stop and queue empty" exit can never be
+    # reached (the daemon keeps refilling it). Then the encoder drains and exits.
     print("[info] Stopping…")
     stop.set()
+    cap_thread.join(timeout=5)
     enc_thread.join(timeout=10)
-    ret = proc.wait(timeout=15)
+
+    try:
+        ret = proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        print("[warn] ffmpeg didn't exit in time — killing it.")
+        proc.kill()
+        ret = proc.wait()
     cam.close()
 
     if ret == 0:
