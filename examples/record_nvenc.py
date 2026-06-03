@@ -164,7 +164,7 @@ def _capture_loop(
     of temporary encoder hiccups.
     """
     while not stop.is_set():
-        frame = cam.grab(align_to_16bit=True)
+        frame, _info = cam.grab(align_to_16bit=True)
         if frame is None:
             continue                 # timeout — retry immediately
         if q.full():
@@ -314,7 +314,7 @@ def main() -> None:
     # Discard the first grab: the oldest buffered frame may pre-date our
     # exposure setting.
     cam.grab()
-    test_frame = cam.grab(align_to_16bit=True)
+    test_frame, _ = cam.grab(align_to_16bit=True)
     if test_frame is None:
         raise RuntimeError("Camera returned no frame — check connection.")
     h, w = test_frame.shape[:2]

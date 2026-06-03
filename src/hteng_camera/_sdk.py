@@ -151,6 +151,10 @@ CameraGetImageBufferPriority = _sig("CameraGetImageBufferPriority", c_int,
 CameraReleaseImageBuffer = _sig("CameraReleaseImageBuffer", c_int,
                                 [c_int, POINTER(c_ubyte)])
 
+# Reset the per-camera frame-timestamp counter to 0 (for software cross-camera
+# frame pairing — see HTCamera.reset_timestamp).
+CameraRstTimeStamp = _sig("CameraRstTimeStamp", c_int, [c_int])
+
 
 class SdkError(RuntimeError):
     """A vendor SDK call returned a non-zero status code."""
