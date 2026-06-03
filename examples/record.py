@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Record an HTENG camera to a 10-bit HEVC MP4 using NVENC.
+Record an HTENG camera to a 10-bit HEVC MP4.
 
 Pixel path
 ----------
@@ -9,9 +9,16 @@ Camera (12-bit linear Bayer)
   -> uint16 RGB, values 0..65520   (12-bit data left-shifted to fill 16-bit)
   -> pipe as rgb48le to ffmpeg
   -> scale (software BT.709 RGB->YUV)
-  -> p010le (10-bit YUV 4:2:0, full range)
-  -> hevc_nvenc (CUDA)
+  -> 10-bit YUV 4:2:0, full range
+  -> HEVC encoder (NVENC / VideoToolbox / x265)
   -> MP4
+
+Encoders
+--------
+Pick with --encoder; default 'auto' maps by platform (no probing/guessing):
+  nvenc         hevc_nvenc       NVIDIA GPU (Maxwell+, driver >=418). Linux auto.
+  videotoolbox  hevc_videotoolbox  Apple Silicon hardware HEVC. macOS auto.
+  x265          libx265          software, universal, slower. Manual fallback.
 
 Colour metadata
 ---------------
@@ -28,17 +35,19 @@ master.
 Requirements
 ------------
   pip install hteng_camera
-  FFmpeg built with --enable-nvenc (standard in most Linux distro packages)
-  NVIDIA driver >= 418 and a Maxwell or newer GPU
+  FFmpeg with the chosen encoder (nvenc on Linux, videotoolbox on macOS, or
+  libx265 anywhere).
 
 Usage
 -----
-  python record_nvenc.py output.mp4
-  python record_nvenc.py --duration 10 --exposure-ms 25 --qp 20 clip.mp4
-  python record_nvenc.py --serial 044162023020 --fps 60 fast.mp4
+  python record.py output.mp4
+  python record.py --duration 10 --exposure-ms 25 --quality 20 clip.mp4
+  python record.py --serial 044162023020 --fps 60 fast.mp4
+  python record.py --encoder x265 software.mp4
 """
 
 import argparse
+import platform
 import queue
 import shutil
 import subprocess
@@ -53,22 +62,73 @@ from hteng_camera import HTCamera, enums
 
 
 # ---------------------------------------------------------------------------
-# Preflight: make sure ffmpeg exists and can do 10-bit HEVC NVENC
+# Encoder registry — codec name, output pixel format, and the quality flag each
+# encoder uses. RGB->YUV conversion, colour metadata, and container are shared.
 # ---------------------------------------------------------------------------
 
-def _preflight_ffmpeg() -> None:
-    """Fail early with an actionable message if ffmpeg / NVENC isn't usable.
+# quality_flag: the ffmpeg flag controlling constant-quality rate control, and a
+#   builder turning our 0..51-style --quality into that encoder's args.
+_ENCODERS = {
+    "nvenc": {
+        "codec": "hevc_nvenc",
+        "pix_fmt": "p010le",          # 10-bit 4:2:0 semi-planar
+        "extra": ["-profile:v", "main10", "-preset", "p4"],
+        # constant-QP archival mode; -b:v 0 lets QP govern.
+        "quality": lambda q: ["-rc", "constqp", "-qp", str(q), "-b:v", "0"],
+    },
+    "videotoolbox": {
+        "codec": "hevc_videotoolbox",
+        "pix_fmt": "p010le",          # Apple HW also speaks p010le
+        "extra": ["-profile:v", "main10"],
+        # VideoToolbox has no QP mode; -q:v is a 0..100 quality (higher=better),
+        # so map QP (lower=better) onto it roughly.
+        "quality": lambda q: ["-q:v", str(max(1, min(100, 100 - 2 * q)))],
+    },
+    "x265": {
+        "codec": "libx265",
+        "pix_fmt": "yuv420p10le",     # x265 uses planar 10-bit, not p010le
+        "extra": ["-preset", "medium"],
+        # x265's CRF is already a 0..51 quality scale (lower=better) — use --quality directly.
+        "quality": lambda q: ["-crf", str(q)],
+    },
+}
+
+# Platform default for --encoder auto. A deterministic lookup, not a capability
+# probe — mirrors how the library picks its shared lib by platform.
+_AUTO_ENCODER = {"Linux": "nvenc", "Darwin": "videotoolbox"}
+
+
+def _resolve_encoder(name: str) -> str:
+    """Map 'auto' to the platform default, else pass an explicit name through."""
+    if name != "auto":
+        return name
+    enc = _AUTO_ENCODER.get(platform.system())
+    if enc is None:
+        sys.exit(
+            f"[error] no default encoder for platform {platform.system()!r}; "
+            f"pass --encoder explicitly ({'/'.join(_ENCODERS)})."
+        )
+    return enc
+
+
+# ---------------------------------------------------------------------------
+# Preflight: make sure ffmpeg exists and has the chosen encoder
+# ---------------------------------------------------------------------------
+
+def _preflight_ffmpeg(encoder: str) -> None:
+    """Fail early with an actionable message if ffmpeg / the encoder isn't usable.
 
     Without this, a missing ffmpeg surfaces as a raw FileNotFoundError and a
-    missing NVENC encoder only shows up as a late nonzero exit code with the
-    real error buried in ffmpeg's stderr.
+    missing encoder only shows up as a late nonzero exit code with the real
+    error buried in ffmpeg's stderr.
     """
     if shutil.which("ffmpeg") is None:
         sys.exit(
             "[error] ffmpeg not found on PATH.\n"
-            "        Install it (e.g. `sudo apt install ffmpeg`) — it must be "
-            "built with --enable-nvenc."
+            "        Install it (e.g. `sudo apt install ffmpeg`, "
+            "`brew install ffmpeg`)."
         )
+    codec = _ENCODERS[encoder]["codec"]
     try:
         out = subprocess.run(
             ["ffmpeg", "-hide_banner", "-encoders"],
@@ -76,12 +136,18 @@ def _preflight_ffmpeg() -> None:
         ).stdout
     except (subprocess.SubprocessError, OSError) as e:
         sys.exit(f"[error] could not query ffmpeg encoders: {e}")
-    if "hevc_nvenc" not in out:
+    if codec not in out:
+        hint = {
+            "nvenc": "Needs an NVIDIA GPU (Maxwell+), driver >=418, and ffmpeg "
+                     "built with --enable-nvenc.",
+            "videotoolbox": "Needs macOS with VideoToolbox (Apple Silicon or "
+                            "recent Intel Macs).",
+            "x265": "Needs ffmpeg built with --enable-libx265.",
+        }[encoder]
         sys.exit(
-            "[error] this ffmpeg has no hevc_nvenc encoder.\n"
-            "        You need an NVIDIA GPU (Maxwell+), driver >= 418, and an "
-            "ffmpeg built with --enable-nvenc.\n"
-            "        Check with: ffmpeg -encoders | grep nvenc"
+            f"[error] this ffmpeg has no {codec} encoder (for --encoder "
+            f"{encoder}).\n        {hint}\n"
+            f"        Check with: ffmpeg -encoders | grep {codec}"
         )
 
 
@@ -89,17 +155,20 @@ def _preflight_ffmpeg() -> None:
 # FFmpeg command builder
 # ---------------------------------------------------------------------------
 
-def _ffmpeg_cmd(w: int, h: int, fps: int, qp: int, output: str) -> list[str]:
-    """Build the ffmpeg invocation for 10-bit HEVC NVENC encoding.
+def _ffmpeg_cmd(encoder: str, w: int, h: int, fps: int, quality: int,
+                output: str) -> list[str]:
+    """Build the ffmpeg invocation for 10-bit HEVC encoding with ``encoder``.
 
     Input pixel format rgb48le (3 x uint16-LE channels, 0-65535 per channel)
     is the natural container for our 16-bit-aligned demosaiced frames.
 
-    The software scale filter does the RGB->YUV colour-matrix conversion on
-    the CPU before handing p010le frames to the NVENC hardware encoder.
-    Full range (in_range=full:out_range=full) avoids any luma/chroma clipping
-    and preserves the entire 0-65520 dynamic range we captured.
+    The software scale filter does the RGB->YUV colour-matrix conversion on the
+    CPU; full range (in_range=full:out_range=full) avoids luma/chroma clipping
+    and preserves the entire 0-65520 dynamic range we captured. Only the codec,
+    output pixel format, and quality flags vary by encoder (see _ENCODERS); the
+    input, colour conversion, metadata, and container are identical.
     """
+    enc = _ENCODERS[encoder]
     return [
         "ffmpeg", "-y",
 
@@ -119,20 +188,31 @@ def _ffmpeg_cmd(w: int, h: int, fps: int, qp: int, output: str) -> list[str]:
             "in_range=full:out_range=full"
         ),
 
-        # ── NVENC 10-bit HEVC ─────────────────────────────────────────────
-        "-c:v", "hevc_nvenc",
-        "-profile:v", "main10",
-        "-pix_fmt", "p010le",        # 10-bit 4:2:0 semi-planar (NV12 family)
-
-        # Constant-quantiser archival mode.
-        # QP 18 is visually lossless for linear machine-vision footage.
-        # Raise to 24-28 for half the file size with still-excellent quality.
-        "-rc", "constqp",
-        "-qp", str(qp),
-        "-b:v", "0",                 # disable bitrate target; let QP govern
-        "-preset", "p4",             # balanced quality/speed (p1=fast, p7=best)
+        # ── encoder (codec + 10-bit pixel format + quality) ──────────────
+        "-c:v", enc["codec"],
+        *enc["extra"],
+        "-pix_fmt", enc["pix_fmt"],
+        # --quality is a QP/CRF-style number (lower = better; ~18 visually
+        # lossless, 24-28 ~half size). Each encoder maps it to its own knob.
+        *enc["quality"](quality),
 
         # ── colour metadata ───────────────────────────────────────────────
+        # The -color_* output flags alone DON'T reach the HEVC bitstream for
+        # these encoders (nvenc/videotoolbox/x265 each drop transfer/primaries),
+        # so a decoder would read "unknown" and apply the wrong tone map. The
+        # hevc_metadata bitstream filter stamps the VUI into the stream itself,
+        # encoder-agnostically. H.265 enum values:
+        #   transfer_characteristics=8  -> Linear (scene-linear, no OETF)
+        #   colour_primaries=1          -> BT.709
+        #   matrix_coefficients=1       -> BT.709
+        #   video_full_range_flag=1     -> full range (matches out_range=full)
+        "-bsf:v", (
+            "hevc_metadata="
+            "transfer_characteristics=8:colour_primaries=1:"
+            "matrix_coefficients=1:video_full_range_flag=1"
+        ),
+        # Also pass the high-level tags (harmless; helps tools that read
+        # container-level metadata rather than the bitstream VUI).
         "-colorspace", "bt709",
         "-color_primaries", "bt709",
         "-color_trc", "linear",      # scene-linear light, no OETF baked in
@@ -255,10 +335,17 @@ def _encode_loop(
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Record HTENG camera to 10-bit HEVC MP4 via NVENC",
+        description="Record HTENG camera to a 10-bit HEVC MP4",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("output", help="Output .mp4 path")
+    ap.add_argument(
+        "--encoder", choices=["auto", *_ENCODERS], default="auto",
+        help=(
+            "HEVC encoder. 'auto' maps by platform (Linux->nvenc, "
+            "macOS->videotoolbox); or force nvenc / videotoolbox / x265."
+        ),
+    )
     ap.add_argument(
         "--fps", type=int, default=30,
         help="Target output frame rate",
@@ -284,16 +371,20 @@ def main() -> None:
         help="Analog gain multiplier",
     )
     ap.add_argument(
-        "--qp", type=int, default=18,
+        "--quality", type=int, default=18,
         help=(
-            "NVENC constant quantizer (0=best quality, 51=worst). "
-            "18 is visually lossless; 24-28 gives roughly half the file size."
+            "Constant-quality level, QP/CRF-style (0=best, 51=worst). "
+            "18 is visually lossless; 24-28 gives roughly half the file size. "
+            "Mapped to each encoder's native knob (nvenc QP / x265 CRF / "
+            "videotoolbox quality)."
         ),
     )
     args = ap.parse_args()
 
-    # Fail fast if ffmpeg / NVENC isn't usable, before we touch the camera.
-    _preflight_ffmpeg()
+    encoder = _resolve_encoder(args.encoder)
+
+    # Fail fast if ffmpeg / the chosen encoder isn't usable, before the camera.
+    _preflight_ffmpeg(encoder)
 
     frame_interval_ms = 1000.0 / args.fps
     if args.exposure_ms >= frame_interval_ms:
@@ -321,11 +412,11 @@ def main() -> None:
     print(
         f"[info] {w}x{h} @ {args.fps} fps, "
         f"exposure {args.exposure_ms:.1f} ms, gain {args.gain:.2f}x, "
-        f"QP {args.qp}"
+        f"encoder {encoder} ({_ENCODERS[encoder]['codec']}), quality {args.quality}"
     )
 
     # ── Start ffmpeg ─────────────────────────────────────────────────────────
-    cmd = _ffmpeg_cmd(w, h, args.fps, args.qp, args.output)
+    cmd = _ffmpeg_cmd(encoder, w, h, args.fps, args.quality, args.output)
     print(f"[info] ffmpeg command:\n  {' '.join(cmd)}\n")
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
