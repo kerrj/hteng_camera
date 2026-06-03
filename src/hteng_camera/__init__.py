@@ -15,10 +15,12 @@ Quick start::
     with HTCamera(serial="044162023020") as cam:
         cam.set_exposure_ms(15)
         cam.set_analog_gain(1.0)
-        rgb16 = cam.grab()                  # linear uint16 (H, W, 3), GET_NEWEST
+        rgb16, info = cam.grab()            # linear uint16 (H, W, 3), GET_NEWEST
         preview = convert.to_display(rgb16) # sqrt-encoded uint8 for screen/PNG
+        # info["time"] = hardware frame timestamp in microseconds
 
 Two cameras are two independent ``HTCamera`` instances — open each by serial.
+Pair their frames in software via ``cam.reset_timestamp()`` + ``info["time"]``.
 """
 
 from . import convert, enums

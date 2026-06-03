@@ -215,7 +215,7 @@ def main():
                 continue
 
             apply_settings(cam)
-            lin = cam.grab(timeout_ms=500)   # linear uint16 RGB, GET_NEWEST
+            lin, _info = cam.grab(timeout_ms=500)   # linear uint16 RGB, GET_NEWEST
             if lin is None:
                 continue
             state["latest_linear"] = lin

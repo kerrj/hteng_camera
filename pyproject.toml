@@ -7,7 +7,7 @@ name = "hteng-camera"
 version = "0.1.0"
 description = "Clean, fast Python interface to HTENG/MindVision machine-vision cameras (12-bit raw fast path)."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = { text = "Proprietary" }
 authors = [{ name = "Your Name" }]
 dependencies = [

@@ -132,7 +132,7 @@ class HTCamera:
         with HTCamera(serial="044162023020") as cam:
             cam.set_exposure_ms(15)
             cam.set_analog_gain(1.0)
-            rgb16 = cam.grab()                 # linear uint16 (H, W, 3)
+            rgb16, info = cam.grab()             # linear uint16 (H, W, 3); info["time"] µs
             preview = convert.to_display(rgb16)  # sqrt-encoded uint8 for display
     """
 
@@ -370,14 +370,20 @@ class HTCamera:
 
     def grab_bayer12(self, timeout_ms=500, priority=enums.GET_NEWEST):
         """Grab one raw 12-bit Bayer frame, unpacked to a uint16 (H, W) plane
-        (0..4095). No demosaic. Returns None on timeout.
+        (0..4095). No demosaic.
+
+        Returns ``(bayer, info)``. ``info`` is a dict carrying per-frame metadata
+        — currently ``{"time": <microseconds>}``, the camera's hardware frame
+        timestamp (frame-head counter, 100 µs resolution, promoted to µs). Reset
+        the counter with :meth:`reset_timestamp` to establish a common time base
+        across cameras. On timeout returns ``(None, {})``.
         """
         self.play()
         head = tSdkFrameHead()
         raw_ptr = POINTER(c_ubyte)()
         if _sdk.CameraGetImageBufferPriority(
                 self.h, byref(head), byref(raw_ptr), timeout_ms, priority) != 0:
-            return None
+            return None, {}
         try:
             w, h, nb = head.iWidth, head.iHeight, head.uBytes
             if nb * 2 != w * h * 3:
@@ -388,9 +394,11 @@ class HTCamera:
                 (c_ubyte * nb).from_address(ctypes.addressof(raw_ptr.contents)),
                 dtype=np.uint8, count=nb)
             bayer = convert.unpack_bayer12_packed(raw, w, h)
+            # uiTimeStamp is in 0.1 ms units; promote to integer microseconds.
+            info = {"time": int(head.uiTimeStamp) * 100}
         finally:
             _sdk.CameraReleaseImageBuffer(self.h, raw_ptr)
-        return bayer
+        return bayer, info
 
     def grab(self, timeout_ms=2000, drop_first=0, priority=enums.GET_NEWEST,
              align_to_16bit=False):
@@ -401,11 +409,27 @@ class HTCamera:
 
         align_to_16bit: left-shift to the full 0..65520 range (for 16-bit PNG
         export). Default keeps native 0..4095.
-        Returns None on timeout.
+
+        Returns ``(rgb, info)`` — see :meth:`grab_bayer12` for ``info`` (carries
+        the per-frame ``"time"`` in microseconds). On timeout returns
+        ``(None, {})``.
         """
         for _ in range(drop_first):
             self.grab_bayer12(timeout_ms, priority)
-        bayer = self.grab_bayer12(timeout_ms, priority)
+        bayer, info = self.grab_bayer12(timeout_ms, priority)
         if bayer is None:
-            return None
-        return convert.demosaic(bayer, self._cv_code, align_to_16bit=align_to_16bit)
+            return None, {}
+        rgb = convert.demosaic(bayer, self._cv_code, align_to_16bit=align_to_16bit)
+        return rgb, info
+
+    def reset_timestamp(self):
+        """Reset this camera's hardware frame-timestamp counter to 0.
+
+        To pair frames across two cameras with no wiring: call this on both
+        cameras back-to-back from the same thread to establish a shared time
+        base, then match frames by the ``"time"`` value in each grab's info dict.
+        Sync accuracy is bounded by the gap between the two reset calls
+        (~50-200 µs) plus per-frame USB jitter — typically 1-2 ms on a quiet
+        Linux host. For true simultaneous exposure, use a hardware trigger.
+        """
+        self._ctrl(lambda: _sdk.CameraRstTimeStamp(self.h), "CameraRstTimeStamp")
