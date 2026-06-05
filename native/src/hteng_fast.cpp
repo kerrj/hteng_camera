@@ -21,7 +21,7 @@
 extern "C" {
 
 // Return a small version int so Python can sanity-check the loaded binary.
-int hteng_fast_version() { return 2; }
+int hteng_fast_version() { return 3; }
 
 // Unpack a 12-bit *packed* Bayer buffer (hi-byte-first, 2 px per 3 bytes) into a
 // uint16 plane (values 0..4095). Single-threaded on purpose: at ~0.7 ms for 5 MP
@@ -66,6 +66,42 @@ void hteng_apply_lut_u16(const uint16_t* in, uint8_t* out, size_t n,
     };
 
     // Threading only pays above a threshold; below it the spawn cost dominates.
+    int T = n_threads;
+    if (T <= 0) {
+        unsigned hc = std::thread::hardware_concurrency();
+        T = hc ? (int)hc : 4;
+    }
+    const size_t MIN_PER_THREAD = 1u << 18;  // ~256K samples
+    if ((size_t)T * MIN_PER_THREAD > n || T == 1) {
+        worker(0, n);
+        return;
+    }
+
+    std::vector<std::thread> pool;
+    pool.reserve(T);
+    size_t chunk = (n + T - 1) / T;
+    for (int t = 0; t < T; ++t) {
+        size_t lo = (size_t)t * chunk;
+        if (lo >= n) break;
+        size_t hi = std::min(n, lo + chunk);
+        pool.emplace_back(worker, lo, hi);
+    }
+    for (auto& th : pool) th.join();
+}
+
+// uint16->uint16 variant of the above: out[i]=lut[in[i]], LUT has 65536 uint16
+// entries (one per possible input), so there is no index clamping. This is the
+// transfer-function encode path (linear uint16 -> gamma/log uint16) used before
+// 10-bit HEVC encoding, where collapsing to uint8 like hteng_apply_lut_u16 would
+// throw away the precision the 10-bit encoder is there to keep. Same threading
+// policy as the uint8 version; memory-bandwidth bound, plain -O3, no SIMD.
+void hteng_apply_lut_u16_u16(const uint16_t* in, uint16_t* out, size_t n,
+                             const uint16_t* lut, int n_threads) {
+    auto worker = [=](size_t lo, size_t hi) {
+        for (size_t i = lo; i < hi; ++i)
+            out[i] = lut[in[i]];
+    };
+
     int T = n_threads;
     if (T <= 0) {
         unsigned hc = std::thread::hardware_concurrency();

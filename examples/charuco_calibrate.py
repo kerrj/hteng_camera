@@ -56,8 +56,12 @@ JPEG_QUALITY = 85
 SIDE_W = 760            # per-camera tile width in the side-by-side preview
 SIDES = ("L", "R")
 
-# Preview / detector tone curve (per request): log space, strength 120.
-TONE = dict(curve="log", param=120.0)
+# Preview / detector tone curve: BT.709 standard SDR gamma, matching record.py's
+# default master (bt709 takes no param). OpenCV's marker detection thresholds
+# locally, so the milder shadow-lift vs the old log/120 doesn't hurt detection on
+# a well-lit board; switch back to dict(curve="log", param=120.0) for very dark
+# or high-dynamic-range capture conditions.
+TONE = dict(curve="bt709")
 
 # Board "held steady" thresholds — below these frame-to-frame pose deltas the
 # board counts as stationary, so a stereo pair is safe to capture (both cameras
@@ -601,7 +605,7 @@ def main():
 
     # -- Per-frame analysis -----------------------------------------------------
     def analyze(lin, w, h):
-        disp = convert.to_display(lin, **TONE)
+        disp = convert.tonemap_linear(lin, **TONE)
         gray = cv2.cvtColor(disp, cv2.COLOR_RGB2GRAY)
         cc, ci, _mc, _mi = detector.detectBoard(gray)
         n = 0 if ci is None else len(ci)

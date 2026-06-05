@@ -7,7 +7,7 @@ Design goals:
   * Fast path only: the sensor streams raw 12-bit packed Bayer; we unpack +
     cv2-demosaic in :mod:`convert` (~10x faster than the SDK ISP). ``grab()``
     returns *linear* uint16 RGB — gamma is never baked in; encode for display
-    with :func:`convert.to_display`.
+    with :func:`convert.tonemap_linear`.
   * Robust against this hardware's quirks: a USB control channel that comes up
     wedged (-52) is recovered in-session via CameraReConnect; handles are always
     released (atexit + SIGTERM/SIGINT + __del__) so a leaked handle never wedges
@@ -133,7 +133,7 @@ class HTCamera:
             cam.set_exposure_ms(15)
             cam.set_analog_gain(1.0)
             rgb16, info = cam.grab()             # linear uint16 (H, W, 3); info["time"] µs
-            preview = convert.to_display(rgb16)  # sqrt-encoded uint8 for display
+            preview = convert.tonemap_linear(rgb16)  # sqrt-encoded uint8 for display
     """
 
     def __init__(self, serial=None, index=None, *, fov=None, frame_speed=None,
@@ -424,7 +424,7 @@ class HTCamera:
         """Grab one **linear** RGB frame as (H, W, 3) uint16 — the primary path.
 
         Raw 12-bit Bayer is unpacked and cv2-demosaiced (fast path). The result
-        is linear (no gamma); encode for display with :func:`convert.to_display`.
+        is linear (no gamma); encode for display with :func:`convert.tonemap_linear`.
 
         align_to_16bit: left-shift to the full 0..65520 range (for 16-bit PNG
         export). Default keeps native 0..4095.

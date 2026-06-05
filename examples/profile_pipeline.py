@@ -7,7 +7,7 @@ Breaks one frame into its constituent steps and times each over N frames:
     unpack    12-bit packed Bayer bytes -> uint16 Bayer plane (numpy)
     release   hand the SDK buffer back to the kernel
     demosaic  Bayer -> linear uint16 RGB (cv2 SIMD)
-    display   to_display: linear -> uint8 with gamma (sqrt) encode
+    display   tonemap_linear: linear -> uint8 with gamma (sqrt) encode
 
 The capture stage is dominated by exposure, so lower --exposure to see the true
 CPU cost of the rest. Use --no-display to skip the gamma encode (it's a preview-
@@ -40,7 +40,7 @@ def parse():
     p.add_argument("--frames", type=int, default=200, help="frames to time (default 200)")
     p.add_argument("--warmup", type=int, default=15, help="warmup frames (default 15)")
     p.add_argument("--gamma", type=float, default=2.0, help="display gamma (default 2.0=sqrt)")
-    p.add_argument("--no-display", action="store_true", help="skip the to_display stage")
+    p.add_argument("--no-display", action="store_true", help="skip the tonemap_linear stage")
     p.add_argument("--timeout", type=int, default=2000, help="grab timeout ms")
     return p.parse_args()
 
@@ -126,7 +126,7 @@ def main():
 
             if not a.no_display:
                 p0 = time.perf_counter()
-                convert.to_display(rgb, gamma=a.gamma)
+                convert.tonemap_linear(rgb, gamma=a.gamma)
                 p1 = time.perf_counter()
                 t_display.append((p1 - p0) * 1e3)
 

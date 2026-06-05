@@ -71,6 +71,14 @@ def _try_load():
             c_int,              # lut_size
             c_int,              # n_threads
         ]
+        lib.hteng_apply_lut_u16_u16.restype = None
+        lib.hteng_apply_lut_u16_u16.argtypes = [
+            POINTER(c_uint16),  # in
+            POINTER(c_uint16),  # out
+            c_size_t,           # n
+            POINTER(c_uint16),  # lut (65536 entries)
+            c_int,              # n_threads
+        ]
         lib.hteng_unpack_bayer12.restype = None
         lib.hteng_unpack_bayer12.argtypes = [
             POINTER(c_ubyte),   # in  (packed bytes)
@@ -79,8 +87,9 @@ def _try_load():
         ]
         _lib = lib
         available = True
-    except OSError:
-        # Missing/incompatible binary — stay on the numpy fallback silently.
+    except (OSError, AttributeError):
+        # Missing/incompatible binary, or an older build lacking a newer symbol —
+        # stay on the numpy fallback silently.
         _lib = None
         available = False
 

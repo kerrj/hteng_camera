@@ -9,11 +9,12 @@ encode never get conflated:
 
     raw bytes  --unpack_bayer12_packed-->  uint16 Bayer plane (0..4095)
     Bayer      --demosaic-->               uint16 linear RGB  (0..4095, hi-aligned optional)
-    linear RGB --to_display-->             uint8 RGB for screen/export (gamma encoded)
+    linear RGB --tonemap_linear-->         uint8 RGB for screen/export (gamma encoded)
 
 ``grab()`` on the camera returns the *linear* RGB; gamma is applied only by
-``to_display`` and only for preview/export. The encode is a cached lookup table
-(see :func:`to_display`): building the curve over 65536 entries is ~0.08 ms,
+``tonemap_linear`` and only for preview/export. The encode is a cached lookup
+table
+(see :func:`tonemap_linear`): building the curve over 65536 entries is ~0.08 ms,
 while applying it is a single uint16->uint8 gather — ~2.6x faster than the
 equivalent float32 round-trip over a 5 MP frame, and bit-identical to it.
 """
@@ -106,7 +107,7 @@ def demosaic(bayer12, cv_code, align_to_16bit=False):
 
     align_to_16bit: if True, left-shift the result by 4 so values span the full
     0..65520 uint16 range (useful for 16-bit PNG export). Default keeps the
-    native 0..4095 scale, which is what :func:`to_display` expects.
+    native 0..4095 scale, which is what :func:`tonemap_linear` expects.
     """
     if cv2 is None:
         raise RuntimeError("opencv-python is required for demosaic()")
@@ -149,21 +150,38 @@ def _curve_reinhard(x, k):
     return (x / (x + k)) * (1.0 + k)     # scaled so x=1 -> 1
 
 
-_CURVES = {"gamma": _curve_gamma, "log": _curve_log, "reinhard": _curve_reinhard}
+def _curve_bt709(x, _param=None):
+    # BT.709 opto-electronic transfer function (the standard's OETF):
+    #   V = 4.5 * L                  for L < 0.018   (linear toe near black)
+    #   V = 1.099 * L^0.45 - 0.099   for L >= 0.018  (power segment)
+    # Unlike the tone curves above this is a *standard, reversible* transfer:
+    # paired with out_dtype=uint16 it OETF-encodes a linear master so a 10-bit
+    # encoder compresses it well, and `zscale=transfer=linear` recovers the
+    # original on decode. It takes no shape param (param is ignored).
+    return np.where(x < 0.018, 4.5 * x, 1.099 * np.power(x, 0.45) - 0.099)
+
+
+_CURVES = {
+    "gamma": _curve_gamma,
+    "log": _curve_log,
+    "reinhard": _curve_reinhard,
+    "bt709": _curve_bt709,
+}
 
 # Default shape param per curve, used when the caller doesn't pass `param`.
-_CURVE_DEFAULT_PARAM = {"gamma": 2.0, "log": 80.0, "reinhard": 0.18}
+# bt709 takes no param; None flows through to the (param-ignoring) curve.
+_CURVE_DEFAULT_PARAM = {"gamma": 2.0, "log": 80.0, "reinhard": 0.18, "bt709": None}
 
 
-# Cache the most recent display LUT so repeated calls with an unchanged tone
+# Cache the most recent encode LUT so repeated calls with an unchanged tone
 # curve (the common case in a live loop) reuse it. Keyed on the full spec —
-# curve name, shape param, and the exposure/black/white normalisation — so any
-# change rebuilds (~0.08 ms) and anything steady is a free lookup.
+# curve name, shape param, the exposure/black/white normalisation, and the
+# output dtype — so any change rebuilds (~0.08 ms) and anything steady is free.
 _LUT_CACHE = {"key": None, "lut": None}
 
 
-def _display_lut(curve, param, exposure, black, white, max_in):
-    """Build (or fetch from cache) the uint16->uint8 display-encode table.
+def _encode_lut(curve, param, exposure, black, white, max_in, out_dtype):
+    """Build (or fetch from cache) the uint16->uint8/uint16 encode table.
 
     The table has 65536 entries — one per possible uint16 input — so indexing it
     with any uint16 frame is always in-bounds, no clamping of indices needed.
@@ -173,9 +191,13 @@ def _display_lut(curve, param, exposure, black, white, max_in):
     ``curve`` is a name in ``_CURVES`` or a callable ``f(x01_array) -> 0..1``.
     ``param`` is the curve's shape knob (gamma exponent / log a / reinhard k);
     None uses that curve's default. Callables ignore ``param``.
+
+    ``out_dtype`` is np.uint8 (display, 0..255) or np.uint16 (encode master,
+    0..65535). The output is scaled to that type's full range.
     """
+    out_max = 65535.0 if out_dtype == np.uint16 else 255.0
     key = (curve if isinstance(curve, str) else id(curve),
-           param, exposure, black, white, max_in)
+           param, exposure, black, white, max_in, out_dtype)
     if _LUT_CACHE["key"] == key:
         return _LUT_CACHE["lut"]
 
@@ -195,20 +217,25 @@ def _display_lut(curve, param, exposure, black, white, max_in):
         p = _CURVE_DEFAULT_PARAM[curve] if param is None else param
         f = fn(f, p)
 
-    lut = (f * 255.0 + 0.5).astype(np.uint8)
+    lut = (f * out_max + 0.5).astype(out_dtype)
     _LUT_CACHE["key"] = key
     _LUT_CACHE["lut"] = lut
     return lut
 
 
-def to_display(linear, gamma=None, exposure=1.0, black=0.0, white=1.0,
-               max_in=4095.0, curve="gamma", param=None):
-    """Encode a linear RGB (or mono) frame to uint8 for display/export.
+def tonemap_linear(linear, gamma=None, exposure=1.0, black=0.0, white=1.0,
+                   max_in=4095.0, curve="gamma", param=None,
+                   out_dtype=np.uint8):
+    """Encode a linear RGB (or mono) frame through a tone/transfer curve.
 
         norm = clip((linear/max_in * exposure - black) / (white - black), 0, 1)
-        out  = curve(norm) * 255
+        out  = curve(norm) * (255 or 65535)
 
-    ``curve`` selects the tone curve (see :data:`_CURVES`):
+    ``out_dtype`` selects the output: ``np.uint8`` (default; display/export,
+    0..255) or ``np.uint16`` (encode master, 0..65535 — keeps precision for a
+    10-bit+ encoder downstream).
+
+    ``curve`` selects the tone/transfer curve (see :data:`_CURVES`):
       * ``"gamma"`` — power curve; ``param`` is the gamma exponent (default 2.0,
         a plain sqrt). 1.0 = linear, 2.2 = sRGB-ish. Lifting shadows via high
         gamma washes out mid/highlights.
@@ -216,15 +243,20 @@ def to_display(linear, gamma=None, exposure=1.0, black=0.0, white=1.0,
         strength (default 80). Best all-round for HDR scenes: strong shadow and
         midtone detail, gentle highlight rolloff, black stays black.
       * ``"reinhard"`` — smooth global tone map; ``param`` = k (default 0.18).
+      * ``"bt709"`` — the BT.709 standard OETF (no param). Paired with
+        ``out_dtype=np.uint16`` and identity normalisation (default exposure/
+        black/white) this is a *reversible* transfer encode: it makes a linear
+        master compress well under HEVC, and ``zscale=transfer=linear`` (or the
+        inverse curve) recovers the original linear signal on decode.
       * a callable ``f(x01) -> 0..1`` for an arbitrary pointwise curve.
 
     ``gamma=`` is kept as a back-compat shortcut: passing it is equivalent to
     ``curve="gamma", param=<gamma>``.
 
     Implemented as a cached lookup table (built once per distinct curve), then a
-    single uint16->uint8 gather — the curve runs over 65536 values, not per
-    pixel, so even an expensive curve is free per-frame. ``linear`` must be an
-    integer array (uint8/uint16) — it indexes the LUT.
+    single uint16->uint8/uint16 gather — the curve runs over 65536 values, not
+    per pixel, so even an expensive curve is free per-frame. ``linear`` must be
+    an integer array (uint8/uint16) — it indexes the LUT.
 
     When the native kernel (libhteng_fast) is present it does the LUT apply
     multithreaded (~10x the numpy gather on a 5 MP frame); otherwise numpy's
@@ -234,20 +266,34 @@ def to_display(linear, gamma=None, exposure=1.0, black=0.0, white=1.0,
     # Back-compat: gamma= is shorthand for curve="gamma", param=gamma.
     if gamma is not None:
         curve, param = "gamma", gamma
-    lut = _display_lut(curve, param, exposure, black, white, max_in)
+    out_dtype = np.dtype(out_dtype)
+    if out_dtype not in (np.dtype(np.uint8), np.dtype(np.uint16)):
+        raise ValueError(f"out_dtype must be uint8 or uint16, got {out_dtype}")
+    lut = _encode_lut(curve, param, exposure, black, white, max_in, out_dtype)
 
-    # Native fast path: contiguous uint16 in, threaded LUT apply into uint8 out.
+    # Native fast path: contiguous uint16 in, threaded LUT apply. The output
+    # dtype picks the matching kernel (u16->u8 for display, u16->u16 for an
+    # encode master); numpy's gather covers every other case identically.
     if _fast.available and linear.dtype == np.uint16:
         src = np.ascontiguousarray(linear)
-        out = np.empty(src.shape, dtype=np.uint8)
-        _fast._lib.hteng_apply_lut_u16(
-            src.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
-            out.ctypes.data_as(_fast.POINTER(_fast.c_ubyte)),
-            src.size,
-            lut.ctypes.data_as(_fast.POINTER(_fast.c_ubyte)),
-            lut.size,                 # 65536 -> no index clamping needed
-            _fast.num_threads(),      # honor the central thread cap
-        )
+        out = np.empty(src.shape, dtype=out_dtype)
+        if out_dtype == np.dtype(np.uint8):
+            _fast._lib.hteng_apply_lut_u16(
+                src.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
+                out.ctypes.data_as(_fast.POINTER(_fast.c_ubyte)),
+                src.size,
+                lut.ctypes.data_as(_fast.POINTER(_fast.c_ubyte)),
+                lut.size,             # 65536 -> no index clamping needed
+                _fast.num_threads(),  # honor the central thread cap
+            )
+        else:
+            _fast._lib.hteng_apply_lut_u16_u16(
+                src.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
+                out.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
+                src.size,
+                lut.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
+                _fast.num_threads(),
+            )
         return out
 
     return lut[linear]
