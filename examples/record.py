@@ -5,7 +5,7 @@ Record an HTENG camera to a 10-bit HEVC MP4.
 Pixel path
 ----------
 Camera (12-bit linear Bayer)
-  -> demosaic (cv2 bilinear SIMD)
+  -> demosaic (cv2 SIMD; edge-aware by default, see --demosaic)
   -> uint16 RGB, values 0..65520   (12-bit data left-shifted to fill 16-bit)
   -> pipe as rgb48le to ffmpeg
   -> scale (software BT.709 RGB->YUV)
@@ -371,6 +371,13 @@ def main() -> None:
         help="Analog gain multiplier",
     )
     ap.add_argument(
+        "--demosaic", choices=list(enums.DEMOSAIC_QUALITY), default="ea",
+        help=(
+            "Demosaic algorithm. 'ea' (edge-aware, default) suppresses the "
+            "zipper/false-colour fringing that 'bilinear' shows on edges."
+        ),
+    )
+    ap.add_argument(
         "--quality", type=int, default=18,
         help=(
             "Constant-quality level, QP/CRF-style (0=best, 51=worst). "
@@ -396,7 +403,7 @@ def main() -> None:
 
     # ── Open camera ──────────────────────────────────────────────────────────
     print("[info] Opening camera…")
-    cam = HTCamera(serial=args.serial)
+    cam = HTCamera(serial=args.serial, demosaic_quality=args.demosaic)
     cam.set_ae(False)                        # fixed exposure → stable fps
     cam.set_frame_speed(enums.FRAME_SPEED_HIGH)  # max USB throughput; avoid underrun
     cam.set_exposure_ms(args.exposure_ms)

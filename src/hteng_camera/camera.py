@@ -137,7 +137,7 @@ class HTCamera:
     """
 
     def __init__(self, serial=None, index=None, *, fov=None, frame_speed=None,
-                 auto_exposure=False, open_now=True):
+                 auto_exposure=False, demosaic_quality="ea", open_now=True):
         self.h = 0
         self.info = None
         self.serial = None
@@ -146,6 +146,7 @@ class HTCamera:
         self._media_index = None
         self._media_code = None
         self._cv_code = None
+        self._demosaic_quality = demosaic_quality
         # stash construction-time config applied during open
         self._init_fov = fov
         self._init_speed = frame_speed
@@ -301,7 +302,7 @@ class HTCamera:
                    "CameraSetMediaType")
         self._media_index = int(index)
         self._media_code = int(code)
-        self._cv_code = enums.cv_bayer_code(code)
+        self._cv_code = enums.cv_bayer_code(code, self._demosaic_quality)
         if self._cv_code is None:
             raise RuntimeError(f"No demosaic mapping for media 0x{code:08X}")
         if was_playing:
@@ -312,6 +313,22 @@ class HTCamera:
     def set_ae(self, enabled):
         self._ctrl(lambda: _sdk.CameraSetAeState(self.h, 1 if enabled else 0),
                    "CameraSetAeState")
+
+    def set_demosaic_quality(self, quality):
+        """Select the demosaic algorithm: "bilinear", "ea" (edge-aware), "vng".
+
+        "ea"/"vng" suppress the zipper patterns and false-colour fringing that
+        plain "bilinear" shows on edges and fine detail; "vng" is highest
+        quality, "ea" the best quality/speed trade-off. Takes effect on the
+        next :meth:`grab` (no replay needed).
+        """
+        if quality not in enums.DEMOSAIC_QUALITY:
+            raise ValueError(
+                f"demosaic quality must be one of {enums.DEMOSAIC_QUALITY}, "
+                f"got {quality!r}")
+        self._demosaic_quality = quality
+        if self._media_code is not None:
+            self._cv_code = enums.cv_bayer_code(self._media_code, quality)
 
     def set_exposure_ms(self, ms):
         self._ctrl(lambda: _sdk.CameraSetExposureTime(self.h, float(ms) * 1000.0),

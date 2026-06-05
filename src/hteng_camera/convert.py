@@ -99,9 +99,10 @@ def unpack_bayer12_packed(raw, width, height):
 def demosaic(bayer12, cv_code, align_to_16bit=False):
     """Demosaic a uint16 Bayer plane (0..4095) to linear RGB (H, W, 3) uint16.
 
-    ``cv_code`` is the cv2.COLOR_Bayer*2RGB constant for this sensor's tile
-    (see :func:`hteng_camera.enums.cv_bayer_code`). cv2's SIMD bilinear
-    demosaic is ~0.5 ms for 5 MP.
+    ``cv_code`` is the cv2.COLOR_Bayer*2RGB constant for this sensor's tile and
+    chosen quality (see :func:`hteng_camera.enums.cv_bayer_code`). cv2's SIMD
+    bilinear demosaic is ~0.5 ms for 5 MP; edge-aware (EA) and VNG variants are
+    higher quality at a modest / larger cost respectively.
 
     align_to_16bit: if True, left-shift the result by 4 so values span the full
     0..65520 uint16 range (useful for 16-bit PNG export). Default keeps the

@@ -26,12 +26,26 @@ GET_NEWEST = 1  # drop queued stale frames, return the freshest — best for liv
 GET_NEXT = 2    # interrupt the current exposure if the camera supports it
 
 
-def cv_bayer_code(media_type):
+# Demosaic quality -> cv2 enum suffix. Bilinear is fastest but shows zipper
+# patterns and false-colour fringing on edges/fine detail; EA (edge-aware)
+# removes most of it for a small cost. (OpenCV's VNG variant is omitted on
+# purpose: it asserts depth==CV_8U, so it can't run on our 12-bit uint16 Bayer
+# plane without an 8-bit downconvert that would discard HDR range.)
+DEMOSAIC_QUALITY = ("bilinear", "ea")
+_DEMOSAIC_SUFFIX = {"bilinear": "", "ea": "_EA"}
+
+
+def cv_bayer_code(media_type, quality="ea"):
     """Return the cv2.COLOR_Bayer*2RGB code for a packed-12 Bayer media type.
 
     OpenCV's Bayer enum naming is offset one row/col from the sensor's own tile
     label, so the mapping below is the empirically-correct one (a sensor that
     reports its tile as "BG" demosaics correctly with COLOR_BayerRG2RGB, etc).
+
+    ``quality`` selects the demosaic algorithm (see :data:`DEMOSAIC_QUALITY`):
+    "bilinear", "ea" (edge-aware, default), or "vng". All three share the same
+    tile naming, so this just appends OpenCV's suffix to the base constant.
+
     Resolved lazily so importing this module never requires cv2. Returns None
     for an unrecognised (non packed-12) media type.
     """
@@ -42,9 +56,6 @@ def cv_bayer_code(media_type):
     }.get(media_type & 0xFF)
     if tile is None:
         return None
-    return {
-        "GR": cv2.COLOR_BayerGB2RGB,
-        "RG": cv2.COLOR_BayerBG2RGB,
-        "GB": cv2.COLOR_BayerGR2RGB,
-        "BG": cv2.COLOR_BayerRG2RGB,
-    }[tile]
+    cv_pattern = {"GR": "GB", "RG": "BG", "GB": "GR", "BG": "RG"}[tile]
+    suffix = _DEMOSAIC_SUFFIX[quality]
+    return getattr(cv2, f"COLOR_Bayer{cv_pattern}2RGB{suffix}")
