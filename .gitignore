@@ -1,4 +1,5 @@
 __pycache__/
+*.mp4
 Camera/*
 *.pyc
 native/build/
@@ -11,3 +12,8 @@ venv/
 *.png
 snap_*.png
 .DS_Store
+
+# Calibration: publish the JSONs in calibrations/ (tracked, image-free), but
+# keep the raw-image provenance bundles (session folders) out of git.
+calib_session_*/
+wb_measurement_*

@@ -4,15 +4,21 @@ Record an HTENG camera to a 10-bit HEVC MP4.
 
 Pixel path
 ----------
-Camera (12-bit linear Bayer)
-  -> demosaic (cv2 SIMD; edge-aware by default, see --demosaic)
-  -> uint16 RGB, values 0..65520   (12-bit data left-shifted to fill 16-bit)
-  -> [bt709] tonemap_linear: BT.709 OETF in Python (native uint16->uint16 LUT)
+Camera (12-bit packed Bayer)
+  -> capture thread: unpack to a uint16 Bayer plane (native kernel, ~0.5 ms)
+  -> latest-frame mailbox (one slot — always the freshest plane)
+  -> encode thread, at each 1/fps deadline:
+       demosaic (cv2 SIMD; edge-aware by default, see --demosaic)
+       [bt709]  tonemap_linear: BT.709 OETF, 0..4095 -> 0..65535 (native LUT)
+       [linear] left-shift by 4 to fill the 16-bit container (0..65520)
   -> pipe as rgb48le to ffmpeg
   -> scale: BT.709 RGB->YUV matrix conversion
   -> 10-bit YUV 4:2:0, full range
   -> HEVC encoder (NVENC / VideoToolbox / x265)
   -> MP4
+
+Demosaic and the transfer encode run only for frames actually written: when the
+camera outpaces --fps, a dropped frame costs just the cheap unpack.
 
 Encoders
 --------
@@ -51,7 +57,6 @@ Usage
 
 import argparse
 import platform
-import queue
 import shutil
 import signal
 import subprocess
@@ -249,31 +254,40 @@ def _ffmpeg_cmd(encoder: str, w: int, h: int, fps: int, quality: int,
 # Producer: camera capture thread
 # ---------------------------------------------------------------------------
 
-def _capture_loop(
-    cam: HTCamera,
-    q: "queue.Queue[np.ndarray]",
-    stop: threading.Event,
-) -> None:
-    """Grab frames as fast as the hardware allows and push them into the queue.
+class _Mailbox:
+    """Single-slot latest-frame handoff between capture and encode threads.
 
-    align_to_16bit=True shifts the 12-bit (0-4095) demosaiced values left by
-    4 to fill the 16-bit container (0-65520), which maps them to the full
-    dynamic range expected by the rgb48le ffmpeg input format.
+    The encoder only ever wants the freshest frame, so anything deeper than one
+    slot just buffers frames destined to be dropped (and at ~15 MB per 5 MP
+    Bayer plane, depth is real memory). put() overwrites; take() empties.
+    """
 
-    When the queue is full the oldest frame is dropped, so the queue always
-    holds the freshest available footage and memory stays bounded regardless
-    of temporary encoder hiccups.
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._frame: Optional[np.ndarray] = None
+
+    def put(self, frame: np.ndarray) -> None:
+        with self._lock:
+            self._frame = frame
+
+    def take(self) -> Optional[np.ndarray]:
+        with self._lock:
+            frame, self._frame = self._frame, None
+            return frame
+
+
+def _capture_loop(cam: HTCamera, box: _Mailbox, stop: threading.Event) -> None:
+    """Grab raw Bayer planes as fast as the hardware allows.
+
+    Only the cheap unpack (~0.5 ms native) runs here; demosaic and the transfer
+    encode happen in the encode thread, and only for frames actually written —
+    when the camera outpaces --fps, overwritten frames cost nothing more.
     """
     while not stop.is_set():
-        frame, _info = cam.grab(align_to_16bit=True)
-        if frame is None:
+        bayer, _info = cam.grab_bayer12()
+        if bayer is None:
             continue                 # timeout — retry immediately
-        if q.full():
-            try:
-                q.get_nowait()       # drop stale frame
-            except queue.Empty:
-                pass
-        q.put(frame)
+        box.put(bayer)
 
 
 # ---------------------------------------------------------------------------
@@ -282,40 +296,47 @@ def _capture_loop(
 
 def _encode_loop(
     proc: subprocess.Popen,
-    q: "queue.Queue[np.ndarray]",
+    box: _Mailbox,
     stop: threading.Event,
     fps: int,
+    cv_code: int,
     transfer: str = "bt709",
+    wb_gains=None,
 ) -> None:
-    """Pull the freshest available frame at each 1/fps deadline and pipe it
-    to ffmpeg's stdin.
+    """At each 1/fps deadline, demosaic + transfer-encode the freshest Bayer
+    plane and pipe it to ffmpeg's stdin.
 
-    Transfer encode
-    ~~~~~~~~~~~~~~~
-    For transfer='bt709', each frame is run through the BT.709 OETF here (via
-    convert.tonemap_linear's native uint16->uint16 LUT, ~1-2 ms for a 5 MP RGB
-    frame) so the gamma-encoded signal ffmpeg receives compresses ~20-30% better
-    under HEVC. transfer='linear' pipes the scene-linear frame through untouched.
-    The curve is applied at write time only, so a duplicated frame (camera
-    underrun) is never double-encoded.
+    Pixel work
+    ~~~~~~~~~~
+    Demosaic (cv2 SIMD) and the transfer encode run here, per *written* frame:
+      bt709   convert.tonemap_linear's native uint16->uint16 LUT maps the
+              demosaiced 0..4095 linear signal through the BT.709 OETF to the
+              full 0..65535 range (so peak sensor white is peak rgb48le white).
+              Gamma-encoded input compresses ~20-30% better under HEVC.
+              wb_gains (the camera's calibrated white balance, if any) ride the
+              same LUT — zero extra per-frame cost.
+      linear  left-shift by 4 to fill the 16-bit container (0..65520). No WB —
+              the linear master stays raw sensor data for later processing.
+    A duplicated frame (camera underrun) rewrites the previous *encoded* bytes,
+    so duplicates cost no pixel work at all.
 
     Timing model
     ~~~~~~~~~~~~
     A monotonic deadline is advanced by exactly one frame interval on each
     tick, so the output PTS stream is perfectly uniform at the target fps
     regardless of capture jitter.  If the camera delivers faster than the
-    target rate, intermediate frames are dropped (always taking the freshest).
-    If it delivers slower (e.g. long exposure), the last frame is duplicated —
-    the encoded video never stalls.
+    target rate, intermediate frames are dropped (the mailbox keeps only the
+    freshest). If it delivers slower (e.g. long exposure), the last frame is
+    duplicated — the encoded video never stalls.
 
     The inner sleep uses coarse_sleep + 1 ms spin to hit the deadline without
     burning a full CPU core on a tight-loop.
     """
     interval = 1.0 / fps
-    last_frame: Optional[np.ndarray] = None
+    last_out: Optional[np.ndarray] = None
     deadline = time.monotonic() + interval
 
-    while not (stop.is_set() and q.empty()):
+    while not stop.is_set():
         now = time.monotonic()
         remaining = deadline - now
 
@@ -331,35 +352,27 @@ def _encode_loop(
         else:
             deadline += interval
 
-        # Drain the queue to get the freshest available frame.
-        frame: Optional[np.ndarray] = None
-        while True:
-            try:
-                frame = q.get_nowait()
-            except queue.Empty:
-                break
-
-        if frame is None:
-            frame = last_frame   # duplicate on camera underrun
-        if frame is None:
-            continue             # no data yet; wait for the first frame
-
-        last_frame = frame   # keep the *raw* linear frame for underrun reuse
-
-        # Apply the transfer curve (gamma-encode) just before writing, so a
-        # reused last_frame is never encoded twice. 'linear' is a pass-through.
-        if transfer == "linear":
-            out = frame
+        bayer = box.take()
+        if bayer is not None:
+            rgb = convert.demosaic(bayer, cv_code)        # linear, 0..4095
+            if transfer == "linear":
+                out = rgb << 4
+            else:
+                out = convert.tonemap_linear(
+                    rgb, curve=transfer, max_in=4095.0, out_dtype=np.uint16,
+                    wb_gains=wb_gains,
+                )
+            last_out = out
+        elif last_out is not None:
+            out = last_out           # duplicate on camera underrun
         else:
-            out = convert.tonemap_linear(
-                frame, curve=transfer, max_in=65535.0, out_dtype=np.uint16,
-            )
+            continue                 # no data yet; wait for the first frame
 
         # Write frame as raw bytes.  view(uint8) reinterprets the uint16 data
         # as bytes without a copy (the LUT apply / demosaic both return
         # C-contiguous arrays).
         try:
-            proc.stdin.write(np.ascontiguousarray(out).view(np.uint8))
+            proc.stdin.write(out.view(np.uint8))
         except (BrokenPipeError, OSError):
             break
 
@@ -427,6 +440,15 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--no-wb", action="store_true",
+        help=(
+            "Don't apply the camera's calibrated white-balance gains. By "
+            "default, gains from calibrations/calib_<serial>.json (if present) "
+            "are folded into the bt709 transfer LUT — zero per-frame cost. "
+            "Linear masters are never white-balanced (they stay raw)."
+        ),
+    )
+    ap.add_argument(
         "--transfer", choices=["bt709", "linear"], default="bt709",
         help=(
             "Transfer function baked into the encoded file. "
@@ -462,35 +484,44 @@ def main() -> None:
 
     # Discard the first grab: the oldest buffered frame may pre-date our
     # exposure setting.
-    cam.grab()
-    test_frame, _ = cam.grab(align_to_16bit=True)
+    cam.grab_bayer12(timeout_ms=2000)
+    test_frame, _ = cam.grab_bayer12(timeout_ms=2000)
     if test_frame is None:
         raise RuntimeError("Camera returned no frame — check connection.")
     h, w = test_frame.shape[:2]
+
+    wb = None
+    if args.transfer != "linear" and not args.no_wb:
+        wb = cam.wb_gains
+    wb_tag = ("off (linear master)" if args.transfer == "linear" else
+              "off (--no-wb)" if args.no_wb else
+              f"{np.round(wb, 3).tolist()}" if wb is not None else
+              "none calibrated")
     print(
         f"[info] {w}x{h} @ {args.fps} fps, "
         f"exposure {args.exposure_ms:.1f} ms, gain {args.gain:.2f}x, "
         f"encoder {encoder} ({_ENCODERS[encoder]['codec']}), quality {args.quality}, "
-        f"transfer {args.transfer}"
+        f"transfer {args.transfer}, wb {wb_tag}"
     )
 
     # ── Start ffmpeg ─────────────────────────────────────────────────────────
     cmd = _ffmpeg_cmd(encoder, w, h, args.fps, args.quality, args.output, args.transfer)
     print(f"[info] ffmpeg command:\n  {' '.join(cmd)}\n")
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    # bufsize=0: each frame is one big write; buffering would just memcpy
+    # ~30 MB through a BufferedWriter first.
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0)
 
     # ── Start capture + encode threads ───────────────────────────────────────
     stop = threading.Event()
-    # Queue depth of 60 frames: ~2 s of buffering at 30 fps, which is enough
-    # to absorb any OS scheduling jitter without unbounded memory use.
-    q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=60)
+    box = _Mailbox()
 
     cap_thread = threading.Thread(
-        target=_capture_loop, args=(cam, q, stop), daemon=True,
+        target=_capture_loop, args=(cam, box, stop), daemon=True,
         name="hteng-capture",
     )
     enc_thread = threading.Thread(
-        target=_encode_loop, args=(proc, q, stop, args.fps, args.transfer),
+        target=_encode_loop,
+        args=(proc, box, stop, args.fps, cam._cv_code, args.transfer, wb),
         name="hteng-encode",
     )
     cap_thread.start()
@@ -516,9 +547,6 @@ def main() -> None:
         print()                            # newline after ^C
 
     # ── Tear down ─────────────────────────────────────────────────────────────
-    # Order matters: stop+join the CAPTURE producer first so it stops feeding the
-    # queue, otherwise the encoder's "stop and queue empty" exit can never be
-    # reached (the daemon keeps refilling it). Then the encoder drains and exits.
     print("[info] Stopping…")
     stop.set()
     cap_thread.join(timeout=5)

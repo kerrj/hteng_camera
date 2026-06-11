@@ -34,6 +34,15 @@ GET_NEXT = 2    # interrupt the current exposure if the camera supports it
 DEMOSAIC_QUALITY = ("bilinear", "ea")
 _DEMOSAIC_SUFFIX = {"bilinear": "", "ea": "_EA"}
 
+# Packed-12 media ordinal -> the sensor's CFA tile label (first row's first two
+# pixels, GenICam naming: "GR" = rows G R G R / B G B G ...).
+_TILE_BY_ORDINAL = {0x2A: "GR", 0x2B: "RG", 0x2C: "GB", 0x2D: "BG"}
+
+
+def bayer_tile(media_type):
+    """CFA tile label ("GR"/"RG"/"GB"/"BG") for a packed-12 media type, or None."""
+    return _TILE_BY_ORDINAL.get(media_type & 0xFF)
+
 
 def cv_bayer_code(media_type, quality="ea"):
     """Return the cv2.COLOR_Bayer*2RGB code for a packed-12 Bayer media type.
@@ -43,17 +52,15 @@ def cv_bayer_code(media_type, quality="ea"):
     reports its tile as "BG" demosaics correctly with COLOR_BayerRG2RGB, etc).
 
     ``quality`` selects the demosaic algorithm (see :data:`DEMOSAIC_QUALITY`):
-    "bilinear", "ea" (edge-aware, default), or "vng". All three share the same
-    tile naming, so this just appends OpenCV's suffix to the base constant.
+    "bilinear" or "ea" (edge-aware, default). Both share the same tile naming,
+    so this just appends OpenCV's suffix to the base constant.
 
     Resolved lazily so importing this module never requires cv2. Returns None
     for an unrecognised (non packed-12) media type.
     """
     import cv2
 
-    tile = {
-        0x2A: "GR", 0x2B: "RG", 0x2C: "GB", 0x2D: "BG",  # packed-12 ordinals
-    }.get(media_type & 0xFF)
+    tile = bayer_tile(media_type)
     if tile is None:
         return None
     cv_pattern = {"GR": "GB", "RG": "BG", "GB": "GR", "BG": "RG"}[tile]

@@ -85,6 +85,23 @@ def _try_load():
             POINTER(c_uint16),  # out (bayer plane)
             c_size_t,           # n_pixels
         ]
+        # Per-channel (RGB) LUT kernels: lut = 3 concatenated 65536-entry tables.
+        lib.hteng_apply_lut3_u16.restype = None
+        lib.hteng_apply_lut3_u16.argtypes = [
+            POINTER(c_uint16),  # in (interleaved RGB)
+            POINTER(c_ubyte),   # out
+            c_size_t,           # n_pixels
+            POINTER(c_ubyte),   # lut (3 * 65536)
+            c_int,              # n_threads
+        ]
+        lib.hteng_apply_lut3_u16_u16.restype = None
+        lib.hteng_apply_lut3_u16_u16.argtypes = [
+            POINTER(c_uint16),  # in (interleaved RGB)
+            POINTER(c_uint16),  # out
+            c_size_t,           # n_pixels
+            POINTER(c_uint16),  # lut (3 * 65536)
+            c_int,              # n_threads
+        ]
         _lib = lib
         available = True
     except (OSError, AttributeError):

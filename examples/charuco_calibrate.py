@@ -35,15 +35,18 @@ camera's "Close & release" before quitting.
 
 import argparse
 import glob
-import json
 import time
 from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
 import viser
 
-from hteng_camera import HTCamera, list_cameras, convert, enums
+from hteng_camera import (
+    CameraCalibration, HTCamera, Intrinsics, StereoCalibration,
+    convert, enums, list_cameras,
+)
 
 try:
     from scipy.optimize import least_squares
@@ -83,37 +86,37 @@ DICTS = {
 
 # --------------------------------------------------------------------------- #
 # Pure geometry helpers (independently testable; no camera/GUI state).
+# Undistort-map building lives on hteng_camera.Intrinsics.undistort_maps.
 # --------------------------------------------------------------------------- #
-def build_undistort_maps(intr, out_w, out_h, balance):
-    """Remap tables that undistort a frame of size (out_w, out_h).
+def corner_sharpness(gray, corners, patch=4, max_corners=40):
+    """Blur metric: median normalized gradient steepness at charuco corners.
 
-    ``intr`` carries K, dist, model, image_size. K is for the full-res
-    image_size; if the preview is smaller we scale K so the maps still line up.
-    Fisheye builds newK by hand (OpenCV's estimateNewCameraMatrix... returns an
-    off-centre newK for wide fisheyes → garbled remap): centred principal point,
-    focal scaled by ``balance`` (0 = original focal/cropped periphery, higher =
-    zoom out to keep more field of view, black borders at the limit).
+    At each detected corner, take a (2*patch+1)^2 window and compute
+    max|Sobel| / (4 * intensity range) — for an ideal step edge this is ~1.0
+    and it falls off roughly with 1/blur-radius, so motion blur (or defocus)
+    drags it down fast. Contrast normalization makes it exposure-invariant.
+    Median over corners resists a few outliers (e.g. corners on the board edge).
+
+    Rough scale: >0.5 crisp, ~0.35 slightly soft, <0.25 visibly blurred.
     """
-    cw, ch = intr["image_size"]
-    s = out_w / float(cw)
-    K = np.array(intr["K"], np.float64)
-    K = K * np.array([[s, s, s], [s, s, s], [0, 0, 1.0]])
-    K[2, 2] = 1.0
-    dist = np.array(intr["dist"], np.float64)
-    size = (out_w, out_h)
-    if intr.get("model") == "fisheye":
-        D = dist.reshape(4, 1)
-        newK = K.copy()
-        f_scale = 1.0 - 0.7 * balance
-        newK[0, 0] *= f_scale
-        newK[1, 1] *= f_scale
-        newK[0, 2] = out_w / 2.0
-        newK[1, 2] = out_h / 2.0
-        return cv2.fisheye.initUndistortRectifyMap(
-            K, D, np.eye(3), newK, size, cv2.CV_16SC2)
-    newK, _ = cv2.getOptimalNewCameraMatrix(K, dist, size, balance, size)
-    return cv2.initUndistortRectifyMap(
-        K, dist, np.eye(3), newK, size, cv2.CV_16SC2)
+    h, w = gray.shape[:2]
+    pts = corners.reshape(-1, 2)
+    if len(pts) > max_corners:
+        pts = pts[:: len(pts) // max_corners + 1]
+    vals = []
+    for x, y in pts:
+        x, y = int(round(x)), int(round(y))
+        x0, x1 = max(0, x - patch), min(w, x + patch + 1)
+        y0, y1 = max(0, y - patch), min(h, y + patch + 1)
+        win = gray[y0:y1, x0:x1].astype(np.float32)
+        rng = float(win.max() - win.min())
+        if rng < 8.0:        # featureless patch — no edge to measure
+            continue
+        gx = cv2.Sobel(win, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(win, cv2.CV_32F, 0, 1, ksize=3)
+        grad = float(np.sqrt(gx * gx + gy * gy).max())
+        vals.append(grad / (4.0 * rng))
+    return float(np.median(vals)) if vals else 0.0
 
 
 def rotation_angle_deg(rvec_a, rvec_b):
@@ -187,29 +190,31 @@ def calibrate_fisheye(obj_pts, img_pts, w, h):
 
 
 def pnp_pose(objp, imgp, intr):
-    """Board pose (rvec, tvec) in a camera, honoring its distortion model."""
-    K = np.array(intr["K"], np.float64)
-    dist = np.array(intr["dist"], np.float64)
+    """Board pose (rvec, tvec) in a camera, honoring its distortion model.
+
+    ``intr`` is an :class:`hteng_camera.Intrinsics`.
+    """
     objp = objp.reshape(-1, 1, 3).astype(np.float64)
     imgp = imgp.reshape(-1, 1, 2).astype(np.float64)
-    if intr["model"] == "fisheye":
+    if intr.model == "fisheye":
         # No cv2.fisheye.solvePnP — undistort to pinhole-K pixels, then solvePnP.
-        und = cv2.fisheye.undistortPoints(imgp, K, dist.reshape(4, 1), P=K)
-        return cv2.solvePnP(objp, und, K, None, flags=cv2.SOLVEPNP_ITERATIVE)
-    return cv2.solvePnP(objp, imgp, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
+        und = cv2.fisheye.undistortPoints(imgp, intr.K, intr.dist.reshape(4, 1),
+                                          P=intr.K)
+        return cv2.solvePnP(objp, und, intr.K, None, flags=cv2.SOLVEPNP_ITERATIVE)
+    return cv2.solvePnP(objp, imgp, intr.K, intr.dist,
+                        flags=cv2.SOLVEPNP_ITERATIVE)
 
 
 def project_pts(objp, rvec, tvec, intr):
     """Project board points into a camera (model-aware). Returns (N, 2)."""
-    K = np.array(intr["K"], np.float64)
-    dist = np.array(intr["dist"], np.float64)
     objp = objp.reshape(-1, 1, 3).astype(np.float64)
     rvec = np.asarray(rvec, np.float64).reshape(3, 1)
     tvec = np.asarray(tvec, np.float64).reshape(3, 1)
-    if intr["model"] == "fisheye":
-        p, _ = cv2.fisheye.projectPoints(objp, rvec, tvec, K, dist.reshape(4, 1))
+    if intr.model == "fisheye":
+        p, _ = cv2.fisheye.projectPoints(objp, rvec, tvec, intr.K,
+                                         intr.dist.reshape(4, 1))
     else:
-        p, _ = cv2.projectPoints(objp, rvec, tvec, K, dist)
+        p, _ = cv2.projectPoints(objp, rvec, tvec, intr.K, intr.dist)
     return p.reshape(-1, 2)
 
 
@@ -305,6 +310,15 @@ def main():
                     help="pixels per square in the rendered board")
     ap.add_argument("--no-board-window", action="store_true",
                     help="don't render a board (using a physical board instead)")
+    ap.add_argument("--min-sharpness", type=float, default=0.35,
+                    help="reject views blurrier than this (normalized corner "
+                         "gradient: >0.5 crisp, <0.25 visibly blurred; 0 = off)")
+    ap.add_argument("--no-save-images", action="store_true",
+                    help="don't write captured views as 16-bit PNGs to the "
+                         "session folder")
+    ap.add_argument("--calib-dir", default="calibrations",
+                    help="where to publish calib_<serial>.json (git-tracked, "
+                         "image-free; the library loads from here)")
     ap.add_argument("--port", type=int, default=8080)
     args = ap.parse_args()
 
@@ -333,21 +347,66 @@ def main():
     server = viser.ViserServer(port=args.port)
 
     # Per-side mutable state. intr_cap = accumulated intrinsic views; intr = the
-    # last calibration result for that side.
+    # last calibration result for that side (an Intrinsics).
     state = {
         "cams": {"L": None, "R": None},
-        "intr_cap": {s: {"obj": [], "img": [], "poses": []} for s in SIDES},
+        "serials": {"L": None, "R": None},      # kept after close, for saving
+        "intr_cap": {s: {"obj": [], "img": [], "poses": [], "lins": []}
+                     for s in SIDES},
         "image_size": {"L": None, "R": None},
         "intr": {"L": None, "R": None},
         "prev_pose": {"L": None, "R": None},   # last frame's pose, for stillness
         "stereo_pairs": [],                     # (objp, imgL, imgR)
         "stereo_poses": [],                     # left rvec/tvec, for novelty
+        "stereo_lins": [],                      # (linL, linR) raw frames
+        "png_written": {"L": 0, "R": 0, "stereo": 0},  # already-on-disk counts
         "stereo": None,                         # cam2cam result
         "do_intr": False, "do_stereo": False, "force": False,
         "file_calib": {}, "umaps": {"L": {}, "R": {}},
         "fail": {"L": 0, "R": 0},   # consecutive empty grabs, for drop detection
+        "session_dir": None,        # capture session folder, created lazily
         "quit": False,
     }
+
+    # -- Capture session folder, under the calibration dir. Captured views are
+    # held in memory (a 5 MP uint16 frame is ~30 MB; a typical 20-40 view
+    # session fits fine) and written as lossless 16-bit linear PNGs only when a
+    # Calibrate button runs — PNG encoding is a few hundred ms each and would
+    # stall the live loop. The PNGs are gitignored (provenance, not deliverable);
+    # the published JSONs in the parent calibrations/ dir are what's tracked.
+    def session_dir():
+        if state["session_dir"] is None:
+            d = (Path(args.calib_dir)
+                 / f"calib_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+            d.mkdir(parents=True, exist_ok=True)
+            state["session_dir"] = d
+            print(f"[session] writing capture images into {d}/")
+        return state["session_dir"]
+
+    def save_capture_png(name, lin):
+        """Write a linear uint16 frame as a 16-bit PNG (<<4 to fill the range)."""
+        cv2.imwrite(str(session_dir() / f"{name}_lin16.png"),
+                    cv2.cvtColor(lin << 4, cv2.COLOR_RGB2BGR))
+
+    def flush_capture_pngs():
+        """Write captured views not yet on disk (incremental, idempotent)."""
+        if args.no_save_images:
+            return
+        n = 0
+        for s in SIDES:
+            lins = state["intr_cap"][s]["lins"]
+            serial = state["serials"][s]
+            for i in range(state["png_written"][s], len(lins)):
+                save_capture_png(f"{s}_{serial}_view{i + 1:03d}", lins[i])
+                n += 1
+            state["png_written"][s] = len(lins)
+        for i in range(state["png_written"]["stereo"], len(state["stereo_lins"])):
+            for s, lin in zip(SIDES, state["stereo_lins"][i]):
+                save_capture_png(f"stereo{i + 1:03d}_{s}_{state['serials'][s]}", lin)
+                n += 1
+        state["png_written"]["stereo"] = len(state["stereo_lins"])
+        if n:
+            print(f"[session] wrote {n} capture PNG(s) to {session_dir()}/")
 
     cams = list_cameras()
     cam_opts = [f'{c["serial"]}  ({c["name"]})' for c in cams] or ["<none found>"]
@@ -383,6 +442,7 @@ def main():
                     gain_slider.min, gain_slider.max, gain_slider.step = lo, hi, step
                     pushed[side].update(ae=None, exp=None, gain=None, speed=None)
                     state["cams"][side] = cam
+                    state["serials"][side] = cam.serial
                     state["fail"][side] = 0
                     conn_text[side].value = f"open: {cam.serial} ({cam.name})"
                 except Exception as exc:
@@ -442,7 +502,10 @@ def main():
 
     # -- Undistort preview ------------------------------------------------------
     def undistort_options():
-        return ["off", "current (live calib)"] + sorted(glob.glob("calib_*.json"))
+        # Per-sensor files in the CWD and in calib_session_*/ folders.
+        files = sorted(set(glob.glob("calib_*.json") +
+                           glob.glob("calib_session_*/calib_*.json")))
+        return ["off", "current (live calib)"] + files
 
     with server.gui.add_folder("Undistort (preview)"):
         undist_dropdown = server.gui.add_dropdown(
@@ -503,9 +566,11 @@ def main():
     @reset_btn.on_click
     def _(_e):
         for s in SIDES:
-            state["intr_cap"][s] = {"obj": [], "img": [], "poses": []}
+            state["intr_cap"][s] = {"obj": [], "img": [], "poses": [], "lins": []}
         state["stereo_pairs"].clear()
         state["stereo_poses"].clear()
+        state["stereo_lins"].clear()
+        state["png_written"] = {"L": 0, "R": 0, "stereo": 0}
         update_counts()
         intr_text.value = stereo_text.value = "captures cleared"
 
@@ -519,40 +584,51 @@ def main():
 
     @save_btn.on_click
     def _(_e):
+        """Publish per-sensor calib_<serial>.json (+ stereo) to calibrations/.
+
+        calibrations/ is the git-tracked, image-free home the library loads from
+        (HTCamera auto-loads calib_<serial>.json on open). Each per-sensor file
+        merges into any existing calibration for that serial, so the color
+        section from color_calibrate.py is preserved. The raw capture PNGs live
+        in a gitignored session subfolder as re-runnable provenance.
+        """
         if not any(state["intr"].values()):
             stereo_text.value = "calibrate intrinsics first"
             return
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        stem = f"calib_{ts}"
-        out = {"board": {"squares_x": args.squares_x, "squares_y": args.squares_y,
-                         "square_mm": args.square_mm, "marker_ratio": args.marker_ratio,
-                         "dict": args.dict},
-               "cameras": {}, "stereo": None,
-               "convention": "X_right = R @ X_left + t  (t in board units)"}
+        flush_capture_pngs()
+        board_notes = {"board": {
+            "squares_x": args.squares_x, "squares_y": args.squares_y,
+            "square_mm": args.square_mm, "marker_ratio": args.marker_ratio,
+            "dict": args.dict}}
+        pubdir = Path(args.calib_dir)
+        pubdir.mkdir(parents=True, exist_ok=True)
+        written = []
         for s in SIDES:
             intr = state["intr"][s]
-            if intr is None:
+            serial = state["serials"][s]
+            if intr is None or serial is None:
                 continue
-            cam = state["cams"][s]
-            out["cameras"][s] = {
-                "serial": cam.serial if cam else None,
-                "model": intr["model"], "image_size": intr["image_size"],
-                "K": np.asarray(intr["K"]).tolist(),
-                "dist": np.asarray(intr["dist"]).ravel().tolist(),
-                "rms_reproj_px": intr["rms"], "num_views": intr["num_views"]}
+            cal = CameraCalibration.load_or_new(serial, dir=pubdir)
+            cal.intrinsics = intr
+            cal.notes.update(board_notes)
+            cal.save(dir=pubdir)
+            written.append(f"calib_{serial}.json")
         st = state["stereo"]
-        if st is not None:
-            out["stereo"] = {
-                "R": np.asarray(st["R"]).tolist(), "t": np.asarray(st["t"]).tolist(),
-                "baseline_m": st["baseline"], "rotation_deg": st["rot_deg"],
-                "reproj_rms_px": st["reproj_rms"], "num_pairs": st["num_pairs"],
-                "method": st["method"]}
-        with open(f"{stem}.json", "w") as f:
-            json.dump(out, f, indent=2)
-        stereo_text.value = f"saved {stem}.json"
-        print(f"[save] wrote {stem}.json")
+        if st is not None and state["serials"]["L"] and state["serials"]["R"]:
+            stereo = StereoCalibration(
+                serial_left=state["serials"]["L"],
+                serial_right=state["serials"]["R"],
+                R=st["R"], t=st["t"], reproj_rms_px=st["reproj_rms"],
+                num_pairs=st["num_pairs"], method=st["method"],
+                notes=board_notes)
+            stereo.save(dir=pubdir)
+            written.append(stereo.default_path(
+                state["serials"]["L"], state["serials"]["R"]).name)
+        stereo_text.value = f"published {', '.join(written)} -> {pubdir}/"
+        print(f"[save] published {', '.join(written)} to {pubdir}/")
 
     def run_intrinsics():
+        flush_capture_pngs()
         msgs = []
         for s in SIDES:
             cap = state["intr_cap"][s]
@@ -573,9 +649,9 @@ def main():
             except (cv2.error, RuntimeError) as exc:
                 msgs.append(f"{s}:fail({exc})")
                 continue
-            state["intr"][s] = {"K": K, "dist": np.asarray(dist).ravel(),
-                                "model": model, "image_size": [int(w), int(h)],
-                                "rms": float(rms), "num_views": int(used)}
+            state["intr"][s] = Intrinsics(
+                model=model, image_size=(w, h), K=K, dist=dist,
+                rms_reproj_px=float(rms), num_views=int(used))
             state["umaps"][s].clear()
             msgs.append(f"{s}: rms {rms:.3f}px fx {K[0,0]:.1f} cx {K[0,2]:.1f} "
                         f"({used}v,{model})")
@@ -610,13 +686,19 @@ def main():
         cc, ci, _mc, _mi = detector.detectBoard(gray)
         n = 0 if ci is None else len(ci)
         objp = imgp = pose = None
+        sharp = None
         if n >= min_corners:
-            objp, imgp = board.matchImagePoints(cc, ci)
-            ok, rv, tv = cv2.solvePnP(objp, imgp, guessed_K(w, h), None,
-                                      flags=cv2.SOLVEPNP_ITERATIVE)
-            if ok:
-                pose = (rv, tv)
-        return dict(disp=disp, cc=cc, ci=ci, n=n, objp=objp, imgp=imgp, pose=pose)
+            # Motion-blur gate: skip pose/capture entirely for blurred views —
+            # blurred corners are localized poorly and poison the solve.
+            sharp = corner_sharpness(gray, cc)
+            if sharp >= args.min_sharpness:
+                objp, imgp = board.matchImagePoints(cc, ci)
+                ok, rv, tv = cv2.solvePnP(objp, imgp, guessed_K(w, h), None,
+                                          flags=cv2.SOLVEPNP_ITERATIVE)
+                if ok:
+                    pose = (rv, tv)
+        return dict(lin=lin, disp=disp, cc=cc, ci=ci, n=n, objp=objp, imgp=imgp,
+                    pose=pose, sharp=sharp)
 
     def common_corrs(ciL, ccL, ciR, ccR):
         idL = {int(i): ccL[k, 0] for k, i in enumerate(ciL.ravel())}
@@ -630,6 +712,10 @@ def main():
         return objp, imgL, imgR
 
     def side_intr_for_undistort(side):
+        """Intrinsics for this side's undistort preview, or None.
+
+        A calib_<serial>.json applies to whichever open side has that serial.
+        """
         sel = undist_dropdown.value
         if sel == "off":
             return None
@@ -638,15 +724,12 @@ def main():
         cal = state["file_calib"].get(sel)
         if cal is None:
             try:
-                with open(sel) as f:
-                    cal = json.load(f)
+                cal = CameraCalibration.load(sel)
                 state["file_calib"][sel] = cal
             except Exception:
                 return None
-        cam = cal.get("cameras", {}).get(side)
-        if cam and cam.get("K"):
-            return {"K": cam["K"], "dist": cam["dist"], "model": cam["model"],
-                    "image_size": cam["image_size"]}
+        if cal.intrinsics is not None and cal.serial == state["serials"][side]:
+            return cal.intrinsics
         return None
 
     def tile(side, disp):
@@ -661,7 +744,7 @@ def main():
             key = (id(intr), undist_dropdown.value, round(balance_slider.value, 3), tw, th)
             if cache.get("key") != key:
                 try:
-                    m1, m2 = build_undistort_maps(intr, tw, th, balance_slider.value)
+                    m1, m2 = intr.undistort_maps(tw, th, balance_slider.value)
                     cache.update(key=key, m1=m1, m2=m2)
                 except Exception:
                     cache.clear()
@@ -738,6 +821,7 @@ def main():
                 if force or (auto_box.value and novel):
                     cap["obj"].append(r["objp"]); cap["img"].append(r["imgp"])
                     cap["poses"].append((rv, tv))
+                    cap["lins"].append(r["lin"])
 
             # Stereo pair capture: both see the board, steady (unless disabled),
             # and the left pose is novel vs kept stereo poses.
@@ -756,6 +840,8 @@ def main():
                     if take:
                         state["stereo_pairs"].append(corr)
                         state["stereo_poses"].append((rvL, tvL))
+                        state["stereo_lins"].append(
+                            tuple(results[s]["lin"] for s in SIDES))
                     common_n = len(corr[0])
                     tag = ("CAPTURED" if take else
                            "moving" if (novel and not ok_steady) else
@@ -789,7 +875,12 @@ def main():
             now = time.time()
             if now - fps_t0 >= 0.5:
                 fps = frames_n / (now - fps_t0)
-                det = " ".join(f"{s}:{results[s]['n']}c" for s in SIDES if s in results)
+                det = " ".join(
+                    f"{s}:{results[s]['n']}c" + (
+                        f" BLUR({results[s]['sharp']:.2f})"
+                        if results[s]["sharp"] is not None
+                        and results[s]["sharp"] < args.min_sharpness else "")
+                    for s in SIDES if s in results)
                 for s in SIDES:
                     if state["cams"][s] is not None:
                         conn_text[s].value = (

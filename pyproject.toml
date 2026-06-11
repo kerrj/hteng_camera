@@ -9,14 +9,14 @@ description = "Clean, fast Python interface to HTENG/MindVision machine-vision c
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }
-authors = [{ name = "Your Name" }]
+authors = [{ name = "Justin Kerr" }]
 dependencies = [
     "numpy>=1.20",
     "opencv-python>=4.5",
 ]
 
 [project.optional-dependencies]
-# Web-based live viewer example (examples/live_viser.py)
+# Web-based live viewer example (examples/viser_control.py)
 viser = ["viser>=0.2"]
 dev = ["pytest>=7"]
 

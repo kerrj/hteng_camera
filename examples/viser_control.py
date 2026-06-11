@@ -33,11 +33,17 @@ LOWRES_WIDTH = 480     # "Low-res preview" width — cheaper encode + far fewer 
 
 
 def downscale(img, target_w):
+    """Resize to target_w wide (INTER_AREA: proper box filter, no aliasing).
+
+    The old stride-skip (img[::step, ::step]) silently passed full-res frames
+    through whenever width < 2*target_w — e.g. a 2448-wide sensor at a 1280
+    target shipped every full frame to the JPEG encoder.
+    """
     h, w = img.shape[:2]
     if w <= target_w:
         return img
-    step = max(1, w // target_w)
-    return img[::step, ::step]
+    target_h = round(h * target_w / w)
+    return cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
 
 
 def main():
@@ -205,7 +211,8 @@ def main():
             roi_text.value = f"full {fw}x{fh}"
 
             state["cam"] = cam
-            conn_text.value = f"open: {cam.serial} ({cam.name})"
+            wb = "WB calibrated" if cam.wb_gains is not None else "no WB calib"
+            conn_text.value = f"open: {cam.serial} ({cam.name}) [{wb}]"
         except Exception as exc:  # surface SDK errors in the GUI, don't crash
             conn_text.value = f"open failed: {exc}"
 
@@ -222,10 +229,16 @@ def main():
         conn_text.value = "closed (released)"
 
     def tone_kwargs():
-        """Current tone-curve settings as tonemap_linear() keyword args."""
+        """Current tone-curve settings as tonemap_linear() keyword args.
+
+        Includes the open camera's calibrated WB gains (None if uncalibrated) —
+        folded into the tone LUT, so applying them is free per frame.
+        """
+        cam = state["cam"]
         return dict(curve=curve_dropdown.value, param=param_slider.value,
                     exposure=ev_slider.value, black=black_slider.value,
-                    white=white_slider.value)
+                    white=white_slider.value,
+                    wb_gains=cam.wb_gains if cam else None)
 
     @reset_btn.on_click
     def _(_e):

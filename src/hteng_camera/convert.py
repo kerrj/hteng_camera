@@ -97,6 +97,43 @@ def unpack_bayer12_packed(raw, width, height):
     return out.reshape(height, width)
 
 
+def apply_wb_bayer(bayer12, wb_gains, tile, clip=4095):
+    """White-balance a uint16 Bayer plane in place-of (returns a new array).
+
+    Applied *before* demosaic — edge-aware demosaic compares gradients across
+    channels and assumes they're balanced, so WB here improves the demosaic
+    itself, not just the colors. ``wb_gains`` is (R, G, B) multipliers measured
+    in linear light (see :mod:`hteng_camera.calibration`); ``tile`` is the CFA
+    label from :func:`hteng_camera.enums.bayer_tile` ("GR"/"RG"/"GB"/"BG").
+
+    Fixed-point: gains are quantized to 1/1024 steps (max error 0.05% — far
+    below sensor noise) so the multiply stays in integer SIMD. The result is
+    clipped back to ``clip``; with min-1-normalized gains (no channel
+    attenuated) a sensor-clipped highlight maps to >= ``clip`` in every channel
+    and lands on neutral white instead of tinting magenta/cyan.
+    """
+    g_r, g_g, g_b = (float(x) for x in wb_gains)
+    # Per-site gain layout for the 2x2 tile. Tile label names the first two
+    # pixels of the first row; G sits on the other diagonal.
+    row0, row1 = {
+        "RG": ((g_r, g_g), (g_g, g_b)),
+        "GR": ((g_g, g_r), (g_b, g_g)),
+        "BG": ((g_b, g_g), (g_g, g_r)),
+        "GB": ((g_g, g_b), (g_r, g_g)),
+    }[tile]
+    q = np.array([[row0[0], row0[1]], [row1[0], row1[1]]])
+    q = np.round(q * 1024.0).astype(np.uint32)
+
+    h, w = bayer12.shape
+    out = bayer12.astype(np.uint32)
+    for r in range(2):
+        for c in range(2):
+            out[r::2, c::2] *= q[r, c]
+    out >>= 10
+    np.minimum(out, clip, out=out)
+    return out.astype(np.uint16)
+
+
 def demosaic(bayer12, cv_code, align_to_16bit=False):
     """Demosaic a uint16 Bayer plane (0..4095) to linear RGB (H, W, 3) uint16.
 
@@ -180,7 +217,8 @@ _CURVE_DEFAULT_PARAM = {"gamma": 2.0, "log": 80.0, "reinhard": 0.18, "bt709": No
 _LUT_CACHE = {"key": None, "lut": None}
 
 
-def _encode_lut(curve, param, exposure, black, white, max_in, out_dtype):
+def _encode_lut(curve, param, exposure, black, white, max_in, out_dtype,
+                wb_gains=None):
     """Build (or fetch from cache) the uint16->uint8/uint16 encode table.
 
     The table has 65536 entries — one per possible uint16 input — so indexing it
@@ -194,30 +232,42 @@ def _encode_lut(curve, param, exposure, black, white, max_in, out_dtype):
 
     ``out_dtype`` is np.uint8 (display, 0..255) or np.uint16 (encode master,
     0..65535). The output is scaled to that type's full range.
+
+    ``wb_gains`` (R, G, B) folds white balance into the table for free: the
+    gain multiplies the normalisation step per channel, and the result is one
+    (3, 65536) table — apply cost is identical to the single-table case, the
+    gather just reads each channel through its own row.
     """
     out_max = 65535.0 if out_dtype == np.uint16 else 255.0
+    wb = None if wb_gains is None else tuple(float(g) for g in wb_gains)
     key = (curve if isinstance(curve, str) else id(curve),
-           param, exposure, black, white, max_in, out_dtype)
+           param, exposure, black, white, max_in, out_dtype, wb)
     if _LUT_CACHE["key"] == key:
         return _LUT_CACHE["lut"]
 
-    # Normalise linear input -> 0..1 with exposure gain and black/white levels.
-    f = np.arange(65536, dtype=np.float32) * (exposure / max_in)
-    if black != 0.0 or white != 1.0:
-        f = (f - black) / max(1e-6, (white - black))
-    np.clip(f, 0.0, 1.0, out=f)
+    def build(gain):
+        # Normalise linear input -> 0..1 with WB + exposure gain and
+        # black/white levels.
+        f = np.arange(65536, dtype=np.float32) * (gain * exposure / max_in)
+        if black != 0.0 or white != 1.0:
+            f = (f - black) / max(1e-6, (white - black))
+        np.clip(f, 0.0, 1.0, out=f)
 
-    # Apply the tone curve.
-    if callable(curve):
-        f = np.clip(curve(f), 0.0, 1.0)
+        # Apply the tone curve.
+        if callable(curve):
+            f = np.clip(curve(f), 0.0, 1.0)
+        else:
+            fn = _CURVES.get(curve)
+            if fn is None:
+                raise ValueError(f"unknown curve {curve!r}; options: {list(_CURVES)}")
+            p = _CURVE_DEFAULT_PARAM[curve] if param is None else param
+            f = fn(f, p)
+        return (f * out_max + 0.5).astype(out_dtype)
+
+    if wb is None:
+        lut = build(1.0)
     else:
-        fn = _CURVES.get(curve)
-        if fn is None:
-            raise ValueError(f"unknown curve {curve!r}; options: {list(_CURVES)}")
-        p = _CURVE_DEFAULT_PARAM[curve] if param is None else param
-        f = fn(f, p)
-
-    lut = (f * out_max + 0.5).astype(out_dtype)
+        lut = np.stack([build(g) for g in wb])      # (3, 65536), C-contiguous
     _LUT_CACHE["key"] = key
     _LUT_CACHE["lut"] = lut
     return lut
@@ -225,7 +275,7 @@ def _encode_lut(curve, param, exposure, black, white, max_in, out_dtype):
 
 def tonemap_linear(linear, gamma=None, exposure=1.0, black=0.0, white=1.0,
                    max_in=4095.0, curve="gamma", param=None,
-                   out_dtype=np.uint8):
+                   out_dtype=np.uint8, wb_gains=None):
     """Encode a linear RGB (or mono) frame through a tone/transfer curve.
 
         norm = clip((linear/max_in * exposure - black) / (white - black), 0, 1)
@@ -253,6 +303,13 @@ def tonemap_linear(linear, gamma=None, exposure=1.0, black=0.0, white=1.0,
     ``gamma=`` is kept as a back-compat shortcut: passing it is equivalent to
     ``curve="gamma", param=<gamma>``.
 
+    ``wb_gains`` (R, G, B linear-light multipliers, e.g. from a
+    :class:`hteng_camera.ColorCalibration`) applies white balance *for free*:
+    the gains are folded into the cached LUT (three per-channel tables instead
+    of one), so the per-frame apply cost is unchanged. Requires ``linear`` to
+    be (..., 3) RGB. Note this balances *after* demosaic — for the marginally
+    better pre-demosaic variant see :func:`apply_wb_bayer`.
+
     Implemented as a cached lookup table (built once per distinct curve), then a
     single uint16->uint8/uint16 gather — the curve runs over 65536 values, not
     per pixel, so even an expensive curve is free per-frame. ``linear`` must be
@@ -269,31 +326,60 @@ def tonemap_linear(linear, gamma=None, exposure=1.0, black=0.0, white=1.0,
     out_dtype = np.dtype(out_dtype)
     if out_dtype not in (np.dtype(np.uint8), np.dtype(np.uint16)):
         raise ValueError(f"out_dtype must be uint8 or uint16, got {out_dtype}")
-    lut = _encode_lut(curve, param, exposure, black, white, max_in, out_dtype)
+    if wb_gains is not None and (linear.ndim < 1 or linear.shape[-1] != 3):
+        raise ValueError("wb_gains requires (..., 3) RGB input")
+    lut = _encode_lut(curve, param, exposure, black, white, max_in, out_dtype,
+                      wb_gains)
+    per_channel = lut.ndim == 2
 
     # Native fast path: contiguous uint16 in, threaded LUT apply. The output
     # dtype picks the matching kernel (u16->u8 for display, u16->u16 for an
-    # encode master); numpy's gather covers every other case identically.
+    # encode master; *3 variants read each RGB channel through its own table);
+    # numpy's gather covers every other case identically.
     if _fast.available and linear.dtype == np.uint16:
         src = np.ascontiguousarray(linear)
         out = np.empty(src.shape, dtype=out_dtype)
         if out_dtype == np.dtype(np.uint8):
-            _fast._lib.hteng_apply_lut_u16(
-                src.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
-                out.ctypes.data_as(_fast.POINTER(_fast.c_ubyte)),
-                src.size,
-                lut.ctypes.data_as(_fast.POINTER(_fast.c_ubyte)),
-                lut.size,             # 65536 -> no index clamping needed
-                _fast.num_threads(),  # honor the central thread cap
-            )
+            if per_channel:
+                _fast._lib.hteng_apply_lut3_u16(
+                    src.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
+                    out.ctypes.data_as(_fast.POINTER(_fast.c_ubyte)),
+                    src.size // 3,
+                    lut.ctypes.data_as(_fast.POINTER(_fast.c_ubyte)),
+                    _fast.num_threads(),
+                )
+            else:
+                _fast._lib.hteng_apply_lut_u16(
+                    src.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
+                    out.ctypes.data_as(_fast.POINTER(_fast.c_ubyte)),
+                    src.size,
+                    lut.ctypes.data_as(_fast.POINTER(_fast.c_ubyte)),
+                    lut.size,             # 65536 -> no index clamping needed
+                    _fast.num_threads(),  # honor the central thread cap
+                )
         else:
-            _fast._lib.hteng_apply_lut_u16_u16(
-                src.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
-                out.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
-                src.size,
-                lut.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
-                _fast.num_threads(),
-            )
+            if per_channel:
+                _fast._lib.hteng_apply_lut3_u16_u16(
+                    src.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
+                    out.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
+                    src.size // 3,
+                    lut.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
+                    _fast.num_threads(),
+                )
+            else:
+                _fast._lib.hteng_apply_lut_u16_u16(
+                    src.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
+                    out.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
+                    src.size,
+                    lut.ctypes.data_as(_fast.POINTER(_fast.c_uint16)),
+                    _fast.num_threads(),
+                )
         return out
 
+    if per_channel:
+        # numpy fallback: gather each channel through its own table.
+        out = np.empty(linear.shape, dtype=out_dtype)
+        for c in range(3):
+            out[..., c] = lut[c][linear[..., c]]
+        return out
     return lut[linear]

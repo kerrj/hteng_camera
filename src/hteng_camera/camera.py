@@ -25,6 +25,7 @@ from ctypes import POINTER, byref, c_double, c_float, c_int, c_ubyte, cast, c_vo
 import numpy as np
 
 from . import _sdk
+from . import calibration as _calibration
 from . import enums
 from . import convert
 from ._sdk import (
@@ -137,11 +138,17 @@ class HTCamera:
     """
 
     def __init__(self, serial=None, index=None, *, fov=None, frame_speed=None,
-                 auto_exposure=False, demosaic_quality="ea", open_now=True):
+                 auto_exposure=False, demosaic_quality="ea", load_calibration=True,
+                 open_now=True):
         self.h = 0
         self.info = None
         self.serial = None
         self.name = None
+        #: CameraCalibration for this serial, auto-loaded on open from the
+        #: calibration search path (HTENG_CALIB_DIR, ./calibrations, .).
+        #: None if no file exists or load_calibration=False.
+        self.calibration = None
+        self._load_calibration = load_calibration
         self._playing = False
         self._media_index = None
         self._media_code = None
@@ -169,6 +176,8 @@ class HTCamera:
         self.info = chosen["info"]
         self.serial = chosen["serial"]
         self.name = chosen["name"]
+        if self._load_calibration:
+            self.calibration = _calibration.find(self.serial)
 
         handle = c_int(0)
         check(_sdk.CameraInit(byref(self.info), -1, -1, byref(handle)),
@@ -315,12 +324,13 @@ class HTCamera:
                    "CameraSetAeState")
 
     def set_demosaic_quality(self, quality):
-        """Select the demosaic algorithm: "bilinear", "ea" (edge-aware), "vng".
+        """Select the demosaic algorithm: "ea" (edge-aware, default) or "bilinear".
 
-        "ea"/"vng" suppress the zipper patterns and false-colour fringing that
-        plain "bilinear" shows on edges and fine detail; "vng" is highest
-        quality, "ea" the best quality/speed trade-off. Takes effect on the
-        next :meth:`grab` (no replay needed).
+        "ea" suppresses the zipper patterns and false-colour fringing that
+        plain "bilinear" shows on edges and fine detail, at a small speed cost.
+        (OpenCV's VNG variant is unavailable: it requires 8-bit input, which
+        would discard our 12-bit range — see :mod:`hteng_camera.enums`.)
+        Takes effect on the next :meth:`grab` (no replay needed).
         """
         if quality not in enums.DEMOSAIC_QUALITY:
             raise ValueError(
@@ -440,6 +450,19 @@ class HTCamera:
             return None, {}
         rgb = convert.demosaic(bayer, self._cv_code, align_to_16bit=align_to_16bit)
         return rgb, info
+
+    @property
+    def wb_gains(self):
+        """(R, G, B) white-balance gains from this camera's calibration, or None.
+
+        Pass straight to ``convert.tonemap_linear(..., wb_gains=cam.wb_gains)``
+        — None disables WB there, so the call is safe whether or not this
+        sensor has a color calibration on file.
+        """
+        cal = self.calibration
+        if cal is not None and cal.color is not None:
+            return cal.color.wb_gains
+        return None
 
     def reset_timestamp(self):
         """Reset this camera's hardware frame-timestamp counter to 0.
