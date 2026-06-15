@@ -235,7 +235,15 @@ EYE_ID = {"left": 0, "right": 1}
 def build_app(calib, mailboxes, web_dir, send_fps=30):
     """aiohttp app: static client at /, frame stream at /ws.
     Protocol: text calib JSON on connect, then binary [eye_id_byte]+jpeg."""
-    app = web.Application()
+
+    @web.middleware
+    async def _no_cache(request, handler):
+        resp = await handler(request)
+        if not isinstance(resp, web.WebSocketResponse):
+            resp.headers["Cache-Control"] = "no-store"  # headset must not cache JS/shaders
+        return resp
+
+    app = web.Application(middlewares=[_no_cache])
     web_dir = Path(web_dir)
 
     async def ws_handler(request):

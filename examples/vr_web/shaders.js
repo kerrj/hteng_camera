@@ -30,5 +30,5 @@ void main() {
   if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0) {
     gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return;     // outside captured image
   }
-  gl_FragColor = texture2D(map, vec2(u, 1.0 - v));        // v down -> GL up
+  gl_FragColor = texture2D(map, vec2(u, v));              // flipY=false: image row 0 is at v=0
 }`;
