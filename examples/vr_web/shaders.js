@@ -16,7 +16,9 @@ uniform float k1, k2, k3, k4;
 uniform float imgW, imgH, maxTheta;
 void main() {
   // Three local frame -> OpenCV lens frame (x right, y down, z forward).
-  vec3 d = normalize(vec3(vDir.x, -vDir.y, -vDir.z));
+  // Negate x: we view the texture on the *inside* of the sphere (BackSide),
+  // which mirrors it horizontally; this flip restores correct handedness.
+  vec3 d = normalize(vec3(-vDir.x, -vDir.y, -vDir.z));
   float rxy = length(d.xy);
   float theta = atan(rxy, d.z);
   if (theta > maxTheta) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }

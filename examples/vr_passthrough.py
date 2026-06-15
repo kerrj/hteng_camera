@@ -289,7 +289,9 @@ def _run_test_pattern(args):
     for n, mb in mailboxes.items():
         mb.put(pipes[n].process_once())
     app = build_app(calib, mailboxes, web_dir, send_fps=args.fps)
-    web.run_app(app, host="0.0.0.0", port=args.port)
+    print(f"\n  Open in your browser:  http://localhost:{args.port}\n"
+          f"  (test pattern; drag to look around)\n")
+    web.run_app(app, host="0.0.0.0", port=args.port, print=None)
 
 
 def _resolve_pair(args):
