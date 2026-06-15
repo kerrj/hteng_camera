@@ -3,6 +3,7 @@
 Run:  python examples/vr_passthrough.py
 See docs/superpowers/specs/2026-06-15-vr-passthrough-design.md
 """
+import argparse
 import asyncio
 import json
 import subprocess
@@ -264,3 +265,40 @@ def build_app(calib, mailboxes, web_dir, send_fps=30):
     app.router.add_get("/ws", ws_handler)
     app.router.add_static("/", web_dir)  # app.js, shaders.js, vendor/*
     return app
+
+
+def _run_test_pattern(args):
+    web_dir = Path(__file__).resolve().parent / "vr_web"
+    intr = {"model": "fisheye", "image_size": [args.width, round(args.width * 0.75)],
+            "K": [[args.width * 0.42, 0, args.width / 2],
+                  [0, args.width * 0.42, args.width * 0.375], [0, 0, 1]],
+            "dist": [0.0, 0.0, 0.0, 0.0]}
+    calib = build_calib_payload(intr, intr, np.eye(3).tolist(), args.max_fov_deg)
+    mailboxes = {"left": Mailbox(), "right": Mailbox()}
+    pipes = {n: EyePipeline(TestPatternSource(args.width, round(args.width*0.75), n),
+                            out_width=args.width, quality=args.quality)
+             for n in ("left", "right")}
+    for n, mb in mailboxes.items():
+        mb.put(pipes[n].process_once())
+    app = build_app(calib, mailboxes, web_dir, send_fps=args.fps)
+    web.run_app(app, host="0.0.0.0", port=args.port)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="HTENG stereo → Quest 3S WebXR passthrough")
+    ap.add_argument("--test-pattern", action="store_true",
+                    help="serve a synthetic grid instead of cameras (no hardware)")
+    ap.add_argument("--width", type=int, default=1280)
+    ap.add_argument("--fps", type=int, default=30)
+    ap.add_argument("--quality", type=int, default=85)
+    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--max-fov-deg", type=float, default=150.0)
+    args = ap.parse_args()
+    if args.test_pattern:
+        _run_test_pattern(args)
+        return
+    raise SystemExit("camera mode lands in Task 9 — use --test-pattern for now")
+
+
+if __name__ == "__main__":
+    main()
