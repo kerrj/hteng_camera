@@ -89,6 +89,14 @@ function setEyeImage(name, bitmap) {
   tex.needsUpdate = true;
 }
 
+// ---- received-frame counter (diagnose delivery rate) ----
+let _frames = 0;
+const stats = document.getElementById('stats');
+setInterval(() => {
+  if (stats) stats.textContent = `${_frames} f/s  (${Math.round(_frames / 2)}/eye)`;
+  _frames = 0;
+}, 1000);
+
 // ---- WebSocket: text calib, then [eyeByte]+jpeg binary frames ----
 function connect() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
@@ -96,6 +104,7 @@ function connect() {
   ws.onmessage = async (ev) => {
     if (typeof ev.data === 'string') { applyCalib(JSON.parse(ev.data)); return; }
     const bytes = new Uint8Array(ev.data);
+    _frames++;
     const name = bytes[0] === 0 ? 'left' : 'right';
     const blob = new Blob([bytes.subarray(1)], { type: 'image/jpeg' });
     setEyeImage(name, await createImageBitmap(blob));

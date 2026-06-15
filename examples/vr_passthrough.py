@@ -128,12 +128,26 @@ class EyePipeline:
         return encode_jpeg(rgb, quality=self.quality)
 
 
-class CameraSource:
-    """Live HTENG camera → display-ready uint8 RGB (WB + BT.709 tone map)."""
+_FRAME_SPEED = {"low": 0, "normal": 1, "high": 2, "super": 3}
 
-    def __init__(self, serial):
-        self.cam = HTCamera(serial=serial)
+
+class CameraSource:
+    """Live HTENG camera → display-ready uint8 RGB (WB + BT.709 tone map).
+
+    Exposure is capped short by default: a long exposure both over-exposes the
+    image and throttles the sensor frame rate (long integration = fewer fps)."""
+
+    def __init__(self, serial, exposure_ms=10.0, gain=1.0, auto_exposure=False,
+                 frame_speed="high", demosaic="ea"):
+        self.cam = HTCamera(serial=serial, frame_speed=_FRAME_SPEED.get(frame_speed),
+                            demosaic_quality=demosaic)
         self.serial = serial
+        if auto_exposure:
+            self.cam.set_ae(True)
+        else:
+            self.cam.set_ae(False)
+            self.cam.set_exposure_ms(exposure_ms)
+            self.cam.set_analog_gain(gain)
 
     def read(self):
         rgb16, info = self.cam.grab()
@@ -367,7 +381,10 @@ def _run_cameras(args):
     try:
         for name, serial in (("left", left_serial), ("right", right_serial)):
             try:
-                sources[name] = CameraSource(serial)
+                sources[name] = CameraSource(
+                    serial, exposure_ms=args.exposure_ms, gain=args.gain,
+                    auto_exposure=args.ae, frame_speed=args.frame_speed,
+                    demosaic=args.demosaic)
             except Exception as e:
                 print(f"[warn] could not open {name} camera {serial}: {e}")
         if not sources:
@@ -415,6 +432,15 @@ def main():
     ap.add_argument("--max-fov-deg", type=float, default=150.0)
     ap.add_argument("--left", help="left camera serial")
     ap.add_argument("--right", help="right camera serial")
+    ap.add_argument("--exposure-ms", type=float, default=10.0,
+                    help="manual exposure in ms (lower = darker + higher fps)")
+    ap.add_argument("--gain", type=float, default=1.0, help="analog gain multiplier")
+    ap.add_argument("--ae", action="store_true",
+                    help="auto-exposure (adapts brightness; overrides --exposure-ms)")
+    ap.add_argument("--frame-speed", choices=["low", "normal", "high", "super"],
+                    default="high", help="sensor readout speed")
+    ap.add_argument("--demosaic", choices=["ea", "bilinear"], default="ea",
+                    help="'bilinear' is faster (slight zipper artifacts)")
     args = ap.parse_args()
     if args.test_pattern:
         _run_test_pattern(args)
