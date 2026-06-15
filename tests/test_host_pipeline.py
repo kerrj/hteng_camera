@@ -1,9 +1,15 @@
+import asyncio
+import json
+from pathlib import Path
+
 import numpy as np
 import cv2
+import aiohttp
+from aiohttp import web
 
 from vr_passthrough import (
     Mailbox, encode_jpeg, TestPatternSource, EyePipeline, build_calib_payload,
-    choose_url, make_self_signed_cert)
+    choose_url, make_self_signed_cert, build_app)
 
 
 def test_mailbox_newest_wins():
@@ -82,3 +88,42 @@ def test_make_self_signed_cert_writes_files(tmp_path):
     cert, key = make_self_signed_cert(tmp_path)
     assert cert.exists() and key.exists()
     assert cert.read_bytes().startswith(b"-----BEGIN CERTIFICATE-----")
+
+
+def test_server_sends_calib_then_frames():
+    intr = {"model": "fisheye", "image_size": [320, 240],
+            "K": [[200, 0, 160], [0, 200, 120], [0, 0, 1]],
+            "dist": [0, 0, 0, 0]}
+    calib = build_calib_payload(intr, intr, np.eye(3).tolist())
+    left, right = Mailbox(), Mailbox()
+    left.put(b"LEFTJPEG"); right.put(b"RIGHTJPEG")
+
+    async def run():
+        app = build_app(calib=calib, mailboxes={"left": left, "right": right},
+                        web_dir=Path("examples/vr_web"), send_fps=60)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = runner.addresses[0][1]
+        try:
+            async with aiohttp.ClientSession() as s:
+                # static index served
+                async with s.get(f"http://127.0.0.1:{port}/") as r:
+                    assert r.status == 200
+                # ws: first text msg = calib, then binary frames tagged by eye
+                async with s.ws_connect(f"http://127.0.0.1:{port}/ws") as ws:
+                    first = await asyncio.wait_for(ws.receive(), 2)
+                    assert json.loads(first.data)["type"] == "calib"
+                    seen = set()
+                    for _ in range(8):
+                        m = await asyncio.wait_for(ws.receive(), 2)
+                        if m.type == aiohttp.WSMsgType.BINARY:
+                            seen.add(m.data[0])  # 0=left, 1=right
+                        if {0, 1} <= seen:
+                            break
+                    assert {0, 1} <= seen
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())

@@ -3,12 +3,15 @@
 Run:  python examples/vr_passthrough.py
 See docs/superpowers/specs/2026-06-15-vr-passthrough-design.md
 """
+import asyncio
+import json
 import subprocess
 import threading
 from pathlib import Path
 
 import cv2
 import numpy as np
+from aiohttp import web
 
 from hteng_camera import HTCamera, convert
 
@@ -215,3 +218,49 @@ def make_self_signed_cert(out_dir):
         serialization.NoEncryption()))
     cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
     return cert_path, key_path
+
+
+EYE_ID = {"left": 0, "right": 1}
+
+
+def build_app(calib, mailboxes, web_dir, send_fps=30):
+    """aiohttp app: static client at /, frame stream at /ws.
+    Protocol: text calib JSON on connect, then binary [eye_id_byte]+jpeg."""
+    app = web.Application()
+    web_dir = Path(web_dir)
+
+    async def ws_handler(request):
+        ws = web.WebSocketResponse(max_msg_size=0, heartbeat=5.0)
+        await ws.prepare(request)
+        await ws.send_str(json.dumps(calib))
+        period = 1.0 / send_fps
+        last = {"left": None, "right": None}
+
+        async def sender():
+            while not ws.closed:
+                for eye, mb in mailboxes.items():
+                    jpg = mb.get_latest()
+                    if jpg is not None and jpg is not last[eye]:
+                        last[eye] = jpg
+                        await ws.send_bytes(bytes([EYE_ID[eye]]) + bytes(jpg))
+                await asyncio.sleep(period)
+
+        # Run the frame sender alongside draining incoming messages; the
+        # `async for` ends as soon as the client closes, so we never leak the
+        # handler on disconnect (and the heartbeat catches dead connections).
+        task = asyncio.ensure_future(sender())
+        try:
+            async for _ in ws:
+                pass
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        return ws
+
+    async def index(request):
+        return web.FileResponse(web_dir / "index.html")
+
+    app.router.add_get("/", index)
+    app.router.add_get("/ws", ws_handler)
+    app.router.add_static("/", web_dir)  # app.js, shaders.js, vendor/*
+    return app
