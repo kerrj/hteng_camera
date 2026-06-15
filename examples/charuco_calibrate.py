@@ -42,6 +42,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import viser
+from concurrent.futures import ThreadPoolExecutor
 
 from hteng_camera import (
     CameraCalibration, HTCamera, Intrinsics, StereoCalibration,
@@ -392,21 +393,24 @@ def main():
         """Write captured views not yet on disk (incremental, idempotent)."""
         if args.no_save_images:
             return
-        n = 0
+        tasks = []
         for s in SIDES:
             lins = state["intr_cap"][s]["lins"]
             serial = state["serials"][s]
             for i in range(state["png_written"][s], len(lins)):
-                save_capture_png(f"{s}_{serial}_view{i + 1:03d}", lins[i])
-                n += 1
+                tasks.append((f"{s}_{serial}_view{i + 1:03d}", lins[i]))
             state["png_written"][s] = len(lins)
         for i in range(state["png_written"]["stereo"], len(state["stereo_lins"])):
             for s, lin in zip(SIDES, state["stereo_lins"][i]):
-                save_capture_png(f"stereo{i + 1:03d}_{s}_{state['serials'][s]}", lin)
-                n += 1
+                tasks.append((f"stereo{i + 1:03d}_{s}_{state['serials'][s]}", lin))
         state["png_written"]["stereo"] = len(state["stereo_lins"])
-        if n:
-            print(f"[session] wrote {n} capture PNG(s) to {session_dir()}/")
+        if not tasks:
+            return
+        with ThreadPoolExecutor() as pool:
+            futs = [pool.submit(save_capture_png, name, lin) for name, lin in tasks]
+            for f in futs:
+                f.result()
+        print(f"[session] wrote {len(tasks)} capture PNG(s) to {session_dir()}/")
 
     cams = list_cameras()
     cam_opts = [f'{c["serial"]}  ({c["name"]})' for c in cams] or ["<none found>"]
