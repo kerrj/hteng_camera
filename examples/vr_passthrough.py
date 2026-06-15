@@ -3,7 +3,9 @@
 Run:  python examples/vr_passthrough.py
 See docs/superpowers/specs/2026-06-15-vr-passthrough-design.md
 """
+import subprocess
 import threading
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -162,3 +164,54 @@ def build_calib_payload(left_intr, right_intr, stereo_R, max_fov_deg=150.0):
         "R": [float(x) for x in R.ravel()],          # row-major, OpenCV frame
         "maxTheta": float(np.deg2rad(max_fov_deg / 2.0)),
     }
+
+
+def choose_url(tethered, lan_ip, port):
+    """Tethered → http://localhost (secure context, no cert). Wifi → https LAN."""
+    if tethered:
+        return f"http://localhost:{port}"
+    return f"https://{lan_ip}:{port}"
+
+
+def adb_reverse(port):
+    """Forward Quest localhost:port → host localhost:port over USB. Returns
+    True if a device was set up. Never raises (adb absent / no device)."""
+    try:
+        out = subprocess.run(["adb", "devices"], capture_output=True,
+                             text=True, timeout=5).stdout
+        lines = [l for l in out.splitlines()[1:] if l.strip().endswith("device")]
+        if not lines:
+            return False
+        subprocess.run(["adb", "reverse", f"tcp:{port}", f"tcp:{port}"],
+                       check=True, timeout=5)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def make_self_signed_cert(out_dir):
+    """Generate a self-signed cert/key for the wifi/HTTPS fallback.
+    Returns (cert_path, key_path)."""
+    from datetime import datetime, timedelta, timezone
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    out_dir = Path(out_dir)
+    cert_path, key_path = out_dir / "vr_cert.pem", out_dir / "vr_key.pem"
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "hteng-vr")])
+    now = datetime.now(timezone.utc)
+    cert = (x509.CertificateBuilder()
+            .subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=1))
+            .not_valid_after(now + timedelta(days=825))
+            .sign(key, hashes.SHA256()))
+    key_path.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption()))
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    return cert_path, key_path

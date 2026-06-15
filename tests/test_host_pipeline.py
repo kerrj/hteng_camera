@@ -2,7 +2,8 @@ import numpy as np
 import cv2
 
 from vr_passthrough import (
-    Mailbox, encode_jpeg, TestPatternSource, EyePipeline, build_calib_payload)
+    Mailbox, encode_jpeg, TestPatternSource, EyePipeline, build_calib_payload,
+    choose_url, make_self_signed_cert)
 
 
 def test_mailbox_newest_wins():
@@ -64,3 +65,20 @@ def test_build_calib_payload_shape():
         assert e["width"] == 1920 and e["height"] == 1080
     assert abs(payload["maxTheta"] - np.deg2rad(75.0)) < 1e-9  # half of FOV
     assert payload["R"] == [1, 0, 0, 0, 1, 0, 0, 0, 1]  # row-major flat
+
+
+def test_choose_url_tethered_uses_localhost_http():
+    # Tethered (adb reverse active) → localhost is a secure context → plain http.
+    assert choose_url(tethered=True, lan_ip="192.168.1.5", port=8000) == \
+        "http://localhost:8000"
+
+
+def test_choose_url_wifi_uses_https_lan():
+    assert choose_url(tethered=False, lan_ip="192.168.1.5", port=8000) == \
+        "https://192.168.1.5:8000"
+
+
+def test_make_self_signed_cert_writes_files(tmp_path):
+    cert, key = make_self_signed_cert(tmp_path)
+    assert cert.exists() and key.exists()
+    assert cert.read_bytes().startswith(b"-----BEGIN CERTIFICATE-----")
