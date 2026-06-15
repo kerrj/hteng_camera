@@ -5,7 +5,10 @@ See docs/superpowers/specs/2026-06-15-vr-passthrough-design.md
 """
 import threading
 
+import cv2
 import numpy as np
+
+from hteng_camera import HTCamera, convert
 
 try:
     from turbojpeg import TurboJPEG, TJPF_RGB
@@ -63,3 +66,76 @@ def encode_jpeg(rgb, quality=85):
     if not ok:
         raise RuntimeError("cv2.imencode failed")
     return buf.tobytes()
+
+
+def _downscale(rgb, out_width):
+    h, w = rgb.shape[:2]
+    if w == out_width:
+        return rgb
+    out_h = max(1, round(h * out_width / w))
+    return cv2.resize(rgb, (out_width, out_h), interpolation=cv2.INTER_AREA)
+
+
+class TestPatternSource:
+    """Hardware-free source: a lat/long grid with an eye label, so the full
+    host→WS→client path and the projection can be validated without cameras."""
+
+    __test__ = False  # not a pytest test class despite the "Test" prefix
+
+    def __init__(self, width=1280, height=960, eye="left"):
+        self.width, self.height, self.eye = width, height, eye
+        self._img = self._render()
+
+    def _render(self):
+        w, h = self.width, self.height
+        img = np.full((h, w, 3), 20, np.uint8)
+        step = max(16, w // 24)
+        img[::step, :] = (90, 90, 90)
+        img[:, ::step] = (90, 90, 90)
+        cv2.circle(img, (w // 2, h // 2), min(w, h) // 3, (60, 120, 220), 3)
+        color = (60, 220, 120) if self.eye == "left" else (220, 120, 60)
+        cv2.putText(img, self.eye.upper(), (w // 2 - 60, h // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, color, 4)
+        return img
+
+    def read(self):
+        return self._img.copy()
+
+    def close(self):
+        pass
+
+
+class EyePipeline:
+    """One eye: read source → (camera path white-balances/tone-maps) →
+    downscale → JPEG. Sources already return display-ready uint8 RGB."""
+
+    def __init__(self, source, out_width=1280, quality=85):
+        self.source = source
+        self.out_width = out_width
+        self.quality = quality
+
+    def process_once(self):
+        rgb = self.source.read()
+        if rgb is None:
+            return None
+        rgb = _downscale(rgb, self.out_width)
+        return encode_jpeg(rgb, quality=self.quality)
+
+
+class CameraSource:
+    """Live HTENG camera → display-ready uint8 RGB (WB + BT.709 tone map)."""
+
+    def __init__(self, serial):
+        self.cam = HTCamera(serial=serial)
+        self.serial = serial
+
+    def read(self):
+        rgb16, info = self.cam.grab()
+        if rgb16 is None:
+            return None
+        return convert.tonemap_linear(
+            rgb16, wb_gains=self.cam.wb_gains, curve="bt709",
+            out_dtype=np.uint8)
+
+    def close(self):
+        self.cam.close()
