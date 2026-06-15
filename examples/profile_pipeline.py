@@ -37,6 +37,11 @@ def parse():
     p.add_argument("--index", type=int, default=None, help="camera index fallback")
     p.add_argument("--exposure", type=float, default=5.0, help="exposure ms (default 5)")
     p.add_argument("--gain", type=float, default=1.0, help="analog gain x (default 1)")
+    p.add_argument("--frame-speed", choices=["low", "normal", "high", "super"],
+                   default="high", help="sensor transmission speed (default high)")
+    p.add_argument("--crop", type=float, default=0.0,
+                   help="fraction to crop from EACH edge, centered "
+                        "(0.1 = keep central 80%%; default 0 = full frame)")
     p.add_argument("--frames", type=int, default=200, help="frames to time (default 200)")
     p.add_argument("--warmup", type=int, default=15, help="warmup frames (default 15)")
     p.add_argument("--gamma", type=float, default=2.0, help="display gamma (default 2.0=sqrt)")
@@ -56,18 +61,49 @@ def summarize(name, samples_ms, total_cpu_ms):
 def main():
     a = parse()
 
+    speed_map = {
+        "low": enums.FRAME_SPEED_LOW, "normal": enums.FRAME_SPEED_NORMAL,
+        "high": enums.FRAME_SPEED_HIGH, "super": enums.FRAME_SPEED_SUPER,
+    }
+
     with HTCamera(serial=a.serial, index=a.index) as cam:
         cam.set_ae(False)
         cam.set_exposure_ms(a.exposure)
         cam.set_analog_gain(a.gain)
-        cam.set_frame_speed(enums.FRAME_SPEED_HIGH)
+        try:
+            cam.set_frame_speed(speed_map[a.frame_speed])
+        except RuntimeError as e:
+            raise SystemExit(
+                f"[error] camera rejected frame speed {a.frame_speed!r} — it may "
+                f"not support that mode. Try a lower speed.\n  {e}")
+
+        if a.crop > 0:
+            if a.crop >= 0.5:
+                raise SystemExit("[error] --crop must be < 0.5 (it crops each edge).")
+            # Probe full resolution, then center an ROI keeping (1 - 2*crop) of
+            # each axis. Sizes/offsets aligned to 16 px (sensor ROI granularity).
+            probe, _ = cam.grab_bayer12(timeout_ms=2000)
+            if probe is None:
+                raise SystemExit("[error] no frame to probe resolution for --crop.")
+            full_h, full_w = probe.shape[:2]
+            cw = int(full_w * (1 - 2 * a.crop)) // 16 * 16
+            ch = int(full_h * (1 - 2 * a.crop)) // 16 * 16
+            ox = ((full_w - cw) // 2) // 16 * 16
+            oy = ((full_h - ch) // 2) // 16 * 16
+            try:
+                cam.set_roi(cw, ch, ox, oy)
+            except RuntimeError as e:
+                raise SystemExit(f"[error] camera rejected ROI {cw}x{ch}@({ox},{oy}):\n  {e}")
+            print(f"roi    : {full_w}x{full_h} -> {cw}x{ch} @ ({ox},{oy})  "
+                  f"(crop {a.crop:.0%}/edge, {cw*ch/(full_w*full_h):.0%} of frame)")
+
         cam.play()
 
         mt = next((m for m in cam.media_types() if m["code"] == cam._media_code), None)
         print(f"camera : {cam.serial} ({cam.name})")
         print(f"format : {mt['desc'] if mt else '?'}  (0x{cam._media_code:08X})")
-        print(f"config : exposure {a.exposure} ms  gain {a.gain}x  speed High  "
-              f"frames {a.frames} (+{a.warmup} warmup)")
+        print(f"config : exposure {a.exposure} ms  gain {a.gain}x  "
+              f"speed {a.frame_speed}  frames {a.frames} (+{a.warmup} warmup)")
         print(f"display: gamma {a.gamma}{'  [skipped]' if a.no_display else ''}\n")
 
         # per-stage timing buffers
