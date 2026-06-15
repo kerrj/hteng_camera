@@ -9,7 +9,7 @@ from aiohttp import web
 
 from vr_passthrough import (
     Mailbox, encode_jpeg, TestPatternSource, EyePipeline, build_calib_payload,
-    choose_url, make_self_signed_cert, build_app)
+    choose_url, make_self_signed_cert, build_app, opencv_R_to_three_right)
 
 
 def test_mailbox_newest_wins():
@@ -127,3 +127,17 @@ def test_server_sends_calib_then_frames():
             await runner.cleanup()
 
     asyncio.run(run())
+
+
+def test_basis_conversion_identity():
+    out = opencv_R_to_three_right(np.eye(3).ravel().tolist())
+    assert np.allclose(np.array(out).reshape(3, 3), np.eye(3))
+
+
+def test_basis_conversion_known_yaw():
+    # 10 deg yaw about OpenCV y(down) -> Three y(up) flips sign of the angle.
+    a = np.deg2rad(10.0)
+    R = np.array([[np.cos(a), 0, np.sin(a)], [0, 1, 0], [-np.sin(a), 0, np.cos(a)]])
+    out = np.array(opencv_R_to_three_right(R.ravel().tolist())).reshape(3, 3)
+    B = np.diag([1.0, -1.0, -1.0])
+    assert np.allclose(out, B @ R.T @ B)

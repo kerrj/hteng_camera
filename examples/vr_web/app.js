@@ -52,6 +52,23 @@ function applyCalib(calib) {
     u.imgW.value = c.width; u.imgH.value = c.height;
     u.maxTheta.value = calib.maxTheta;
   }
+  // Co-align the right eye: B * R^T * B (B = diag(1,-1,-1)), R row-major OpenCV.
+  const R = calib.R;
+  const Rt = [R[0], R[3], R[6], R[1], R[4], R[7], R[2], R[5], R[8]]; // transpose
+  const b = [1, -1, -1];
+  const m = new THREE.Matrix3();
+  // (B*Rt*B)[i][j] = b[i]*Rt[i][j]*b[j]
+  m.set(
+    b[0]*Rt[0]*b[0], b[0]*Rt[1]*b[1], b[0]*Rt[2]*b[2],
+    b[1]*Rt[3]*b[0], b[1]*Rt[4]*b[1], b[1]*Rt[5]*b[2],
+    b[2]*Rt[6]*b[0], b[2]*Rt[7]*b[1], b[2]*Rt[8]*b[2]);
+  const e = m.elements; // column-major
+  const m4 = new THREE.Matrix4().set(
+    e[0], e[3], e[6], 0,
+    e[1], e[4], e[7], 0,
+    e[2], e[5], e[8], 0,
+    0,    0,    0,    1);
+  eyes.right.mesh.quaternion.setFromRotationMatrix(m4);
 }
 
 function setEyeImage(name, bitmap) {

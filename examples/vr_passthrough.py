@@ -170,6 +170,14 @@ def build_calib_payload(left_intr, right_intr, stereo_R, max_fov_deg=150.0):
     }
 
 
+def opencv_R_to_three_right(R_flat):
+    """OpenCV stereo R (row-major flat 9) → Three.js right-sphere rotation
+    matrix (row-major flat 9): B · Rᵀ · B,  B = diag(1,-1,-1)."""
+    R = np.asarray(R_flat, float).reshape(3, 3)
+    B = np.diag([1.0, -1.0, -1.0])
+    return [float(x) for x in (B @ R.T @ B).ravel()]
+
+
 def choose_url(tethered, lan_ip, port):
     """Tethered → http://localhost (secure context, no cert). Wifi → https LAN."""
     if tethered:
