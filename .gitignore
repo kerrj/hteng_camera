@@ -12,6 +12,7 @@ venv/
 *.png
 snap_*.png
 .DS_Store
+.superpowers/
 
 # Calibration: publish the JSONs in calibrations/ (tracked, image-free), but
 # keep the raw-image provenance bundles (session folders) out of git.
