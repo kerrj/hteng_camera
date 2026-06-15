@@ -112,6 +112,7 @@ a 10-bit+ encoder instead of a uint8 preview.
 | `examples/record.py` | Record to 10-bit HEVC MP4 (NVENC / VideoToolbox / x265). |
 | `examples/make_viewable.py` | Transcode/tone-map a record.py master to a plays-anywhere 8-bit H.264. |
 | `examples/charuco_calibrate.py` | ChArUco intrinsics + stereo cam2cam calibration GUI. |
+| `examples/vr_passthrough.py` | Live stereo VR passthrough to a Quest 3S browser (WebXR). |
 | `examples/profile_pipeline.py` | Per-stage pipeline timing (capture/unpack/demosaic/display). |
 
 ```bash
@@ -122,6 +123,28 @@ A self-contained [viser](https://viser.studio) web GUI: open/close the camera,
 drive exposure / gain / frame-speed, and tune the display tone curve (gamma,
 exposure mult, black/white) live. The camera feed is the scene background;
 snapshots save both the linear-16 source and the tone-mapped preview.
+
+### VR passthrough (Quest 3S)
+
+Live stereo, look-around-the-world passthrough in the headset browser.
+
+```bash
+python examples/vr_passthrough.py            # auto-resolves the calibrated stereo pair
+python examples/vr_passthrough.py --test-pattern   # no hardware: synthetic grid
+```
+
+**Tethered (recommended):** enable Quest developer mode + USB debugging, install
+`adb` (Android platform-tools), connect USB-C. The script runs `adb reverse` and
+prints `http://localhost:<port>` — open it in the Quest browser and tap *Enter VR*.
+`localhost` is a secure context, so no TLS is needed.
+
+**Wifi fallback:** without a tether the script serves HTTPS with a self-signed cert
+on the LAN IP (needs the `cryptography` package); accept the browser warning once.
+Use 5 GHz / Wi-Fi 6.
+
+Requires per-camera fisheye intrinsics (`charuco_calibrate.py`) and, for comfortable
+stereo, the stereo `R` (also from `charuco_calibrate.py`). Knobs: `--width`,
+`--fps`, `--quality`, `--max-fov-deg`, `--port`.
 
 ## Native acceleration (optional)
 
