@@ -289,8 +289,10 @@ def _run_test_pattern(args):
     for n, mb in mailboxes.items():
         mb.put(pipes[n].process_once())
     app = build_app(calib, mailboxes, web_dir, send_fps=args.fps)
-    print(f"\n  Open in your browser:  http://localhost:{args.port}\n"
-          f"  (test pattern; drag to look around)\n")
+    tethered = adb_reverse(args.port)
+    where = ("Quest is USB-tethered — open it in the Quest browser and tap Enter VR"
+             if tethered else "on this Mac (desktop preview); drag to look around")
+    print(f"\n  Open:  http://localhost:{args.port}\n  ({where})\n")
     web.run_app(app, host="0.0.0.0", port=args.port, print=None)
 
 

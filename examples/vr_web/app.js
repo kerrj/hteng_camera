@@ -104,12 +104,13 @@ function connect() {
 }
 connect();
 
-// ---- per-eye layer routing in XR ----
-renderer.xr.addEventListener('sessionstart', () => {
-  const xrCam = renderer.xr.getCamera();
-  xrCam.cameras[0].layers.enable(1);
-  xrCam.cameras[1].layers.enable(2);
-});
+// ---- per-eye routing in XR ----
+// three.js enables layer 1 on the left eye-camera and layer 2 on the right, so
+// the spheres (set to layers 1/2) separate automatically. We must keep the MAIN
+// camera off layer 1 during XR — otherwise its mask leaks layer 1 into the right
+// eye and both spheres overlay. (Layer 1 is re-enabled for the desktop preview.)
+renderer.xr.addEventListener('sessionstart', () => { camera.layers.disable(1); });
+renderer.xr.addEventListener('sessionend', () => { camera.layers.enable(1); });
 
 // ---- keep spheres centered on the head (ignore translation, keep rotation) ----
 const headPos = new THREE.Vector3();
