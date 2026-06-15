@@ -1,7 +1,8 @@
 import numpy as np
 import cv2
 
-from vr_passthrough import Mailbox, encode_jpeg, TestPatternSource, EyePipeline
+from vr_passthrough import (
+    Mailbox, encode_jpeg, TestPatternSource, EyePipeline, build_calib_payload)
 
 
 def test_mailbox_newest_wins():
@@ -43,3 +44,23 @@ def test_eye_pipeline_produces_jpeg():
     bgr = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
     # Downscaled to out_width preserving aspect (640x480 -> 320x240).
     assert bgr.shape == (240, 320, 3)
+
+
+def test_build_calib_payload_shape():
+    intr = {
+        "model": "fisheye",
+        "image_size": [1920, 1080],
+        "K": [[800, 0, 960], [0, 800, 540], [0, 0, 1]],
+        "dist": [-0.02, 0.004, -0.0008, 0.0001],
+    }
+    payload = build_calib_payload(
+        left_intr=intr, right_intr=intr,
+        stereo_R=[[1, 0, 0], [0, 1, 0], [0, 0, 1]], max_fov_deg=150.0)
+    assert payload["type"] == "calib"
+    for eye in ("left", "right"):
+        e = payload[eye]
+        assert e["fx"] == 800 and e["cx"] == 960
+        assert e["dist"] == [-0.02, 0.004, -0.0008, 0.0001]
+        assert e["width"] == 1920 and e["height"] == 1080
+    assert abs(payload["maxTheta"] - np.deg2rad(75.0)) < 1e-9  # half of FOV
+    assert payload["R"] == [1, 0, 0, 0, 1, 0, 0, 0, 1]  # row-major flat

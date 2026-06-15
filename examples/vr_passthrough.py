@@ -139,3 +139,26 @@ class CameraSource:
 
     def close(self):
         self.cam.close()
+
+
+def _eye_calib(intr):
+    K = np.asarray(intr["K"], float).reshape(3, 3)
+    w, h = intr["image_size"]
+    return {
+        "fx": float(K[0, 0]), "fy": float(K[1, 1]),
+        "cx": float(K[0, 2]), "cy": float(K[1, 2]),
+        "dist": [float(x) for x in np.asarray(intr["dist"]).ravel()[:4]],
+        "width": int(w), "height": int(h),
+    }
+
+
+def build_calib_payload(left_intr, right_intr, stereo_R, max_fov_deg=150.0):
+    """JSON-able dict sent once on WS connect → client shader uniforms."""
+    R = np.asarray(stereo_R, float).reshape(3, 3)
+    return {
+        "type": "calib",
+        "left": _eye_calib(left_intr),
+        "right": _eye_calib(right_intr),
+        "R": [float(x) for x in R.ravel()],          # row-major, OpenCV frame
+        "maxTheta": float(np.deg2rad(max_fov_deg / 2.0)),
+    }
