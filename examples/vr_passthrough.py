@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 from aiohttp import web
 
-from hteng_camera import HTCamera, convert
+from hteng_camera import HTCamera, convert, list_cameras, calibration
 
 try:
     from turbojpeg import TurboJPEG, TJPF_RGB
@@ -284,6 +284,103 @@ def _run_test_pattern(args):
     web.run_app(app, host="0.0.0.0", port=args.port)
 
 
+def _resolve_pair(args):
+    """Return (left_serial, right_serial). Explicit flags win; else use the
+    stereo calibration file in ./calibrations; else the two enumerated cams."""
+    if args.left and args.right:
+        return args.left, args.right
+    for d in (Path("calibrations"), Path(".")):
+        for p in (d.glob("stereo_*_*.json") if d.exists() else []):
+            st = calibration.StereoCalibration.load(p)
+            return st.serial_left, st.serial_right
+    cams = list_cameras()
+    if len(cams) == 2:
+        return cams[0]["serial"], cams[1]["serial"]
+    raise SystemExit("specify --left and --right serials (could not auto-resolve)")
+
+
+def _intr_dict(serial):
+    cal = calibration.find(serial)
+    if cal is None or cal.intrinsics is None:
+        raise SystemExit(f"no intrinsics for {serial}: run charuco_calibrate.py first")
+    i = cal.intrinsics
+    return {"model": i.model, "image_size": list(i.image_size),
+            "K": i.K.tolist(), "dist": i.dist.tolist()}
+
+
+def _capture_loop(pipe, mailbox, stop):
+    while not stop.is_set():
+        jpg = pipe.process_once()
+        if jpg is not None:
+            mailbox.put(jpg)
+
+
+def _lan_ip():
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80)); return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def _run_cameras(args):
+    web_dir = Path(__file__).resolve().parent / "vr_web"
+    left_serial, right_serial = _resolve_pair(args)
+    left_intr, right_intr = _intr_dict(left_serial), _intr_dict(right_serial)
+
+    # stereo R: prefer the calibration file; else assume parallel (identity).
+    R = np.eye(3)
+    sp = calibration.StereoCalibration.default_path(left_serial, right_serial, "calibrations")
+    if sp.exists():
+        R = calibration.StereoCalibration.load(sp).R
+    else:
+        print(f"[warn] no stereo calibration for {left_serial}/{right_serial}; assuming parallel")
+    calib = build_calib_payload(left_intr, right_intr, R.tolist(), args.max_fov_deg)
+
+    sources, mailboxes, threads, stop = {}, {}, [], threading.Event()
+    try:
+        for name, serial in (("left", left_serial), ("right", right_serial)):
+            try:
+                sources[name] = CameraSource(serial)
+            except Exception as e:
+                print(f"[warn] could not open {name} camera {serial}: {e}")
+        if not sources:
+            raise SystemExit("no cameras opened")
+        # Degraded: one camera → mono (feed it to both eyes).
+        if len(sources) == 1:
+            only = next(iter(sources.values()))
+            sources = {"left": only, "right": only}
+            print("[warn] one camera only → mono to both eyes")
+        for name in ("left", "right"):
+            mb = Mailbox(); mailboxes[name] = mb
+            pipe = EyePipeline(sources[name], out_width=args.width, quality=args.quality)
+            t = threading.Thread(target=_capture_loop, args=(pipe, mb, stop), daemon=True)
+            t.start(); threads.append(t)
+
+        tethered = adb_reverse(args.port)
+        lan_ip = _lan_ip()
+        url = choose_url(tethered, lan_ip, args.port)
+        print(f"\n  Open in the Quest browser:  {url}\n"
+              f"  ({'USB-tethered (adb reverse)' if tethered else 'wifi — accept the cert warning'})\n")
+
+        app = build_app(calib, mailboxes, web_dir, send_fps=args.fps)
+        if tethered:
+            web.run_app(app, host="127.0.0.1", port=args.port, print=None)
+        else:
+            cert, key = make_self_signed_cert(web_dir.parent)
+            import ssl
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(cert, key)
+            web.run_app(app, host="0.0.0.0", port=args.port, ssl_context=ctx, print=None)
+    finally:
+        stop.set()
+        for s in set(sources.values()):
+            s.close()
+
+
 def main():
     ap = argparse.ArgumentParser(description="HTENG stereo → Quest 3S WebXR passthrough")
     ap.add_argument("--test-pattern", action="store_true",
@@ -293,11 +390,13 @@ def main():
     ap.add_argument("--quality", type=int, default=85)
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--max-fov-deg", type=float, default=150.0)
+    ap.add_argument("--left", help="left camera serial")
+    ap.add_argument("--right", help="right camera serial")
     args = ap.parse_args()
     if args.test_pattern:
         _run_test_pattern(args)
         return
-    raise SystemExit("camera mode lands in Task 9 — use --test-pattern for now")
+    _run_cameras(args)
 
 
 if __name__ == "__main__":
