@@ -5,11 +5,13 @@ from pathlib import Path
 import numpy as np
 import cv2
 import aiohttp
+import pytest
 from aiohttp import web
 
 from vr_passthrough import (
     Mailbox, encode_jpeg, TestPatternSource, EyePipeline, build_calib_payload,
-    choose_url, make_self_signed_cert, build_app, opencv_R_to_three_right)
+    choose_url, make_self_signed_cert, build_app, opencv_R_to_three_right,
+    _intr_dict_from_cal)
 
 
 def test_mailbox_newest_wins():
@@ -141,3 +143,10 @@ def test_basis_conversion_known_yaw():
     out = np.array(opencv_R_to_three_right(R.ravel().tolist())).reshape(3, 3)
     B = np.diag([1.0, -1.0, -1.0])
     assert np.allclose(out, B @ R.T @ B)
+
+
+def test_missing_intrinsics_fails_fast():
+    class _Cal:
+        intrinsics = None
+    with pytest.raises(SystemExit, match="charuco_calibrate"):
+        _intr_dict_from_cal(_Cal(), "SERIAL123")

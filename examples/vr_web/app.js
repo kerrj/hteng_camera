@@ -10,6 +10,18 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 document.body.appendChild(renderer.domElement);
 document.body.appendChild(VRButton.createButton(renderer));
 
+const msg = document.getElementById('msg');
+if (!window.isSecureContext) {
+  msg.textContent = 'Not a secure context — open the tethered http://localhost URL, '
+    + 'or accept the HTTPS cert on the wifi URL. WebXR will not start otherwise.';
+} else if (!navigator.xr) {
+  msg.textContent = 'WebXR not available in this browser.';
+} else {
+  navigator.xr.isSessionSupported('immersive-vr').then((ok) => {
+    if (!ok) msg.textContent = 'immersive-vr not supported on this device.';
+  });
+}
+
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(
   80, window.innerWidth / window.innerHeight, 0.1, 1000);

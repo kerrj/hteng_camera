@@ -307,13 +307,16 @@ def _resolve_pair(args):
     raise SystemExit("specify --left and --right serials (could not auto-resolve)")
 
 
-def _intr_dict(serial):
-    cal = calibration.find(serial)
-    if cal is None or cal.intrinsics is None:
+def _intr_dict_from_cal(cal, serial):
+    if cal is None or getattr(cal, "intrinsics", None) is None:
         raise SystemExit(f"no intrinsics for {serial}: run charuco_calibrate.py first")
     i = cal.intrinsics
     return {"model": i.model, "image_size": list(i.image_size),
             "K": i.K.tolist(), "dist": i.dist.tolist()}
+
+
+def _intr_dict(serial):
+    return _intr_dict_from_cal(calibration.find(serial), serial)
 
 
 def _capture_loop(pipe, mailbox, stop):
