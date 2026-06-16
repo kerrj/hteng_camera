@@ -13,7 +13,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from aiohttp import web
+from aiohttp import web, WSMsgType
 
 from hteng_camera import HTCamera, convert, list_cameras, calibration
 
@@ -120,13 +120,17 @@ class EyePipeline:
         self.source = source
         self.out_width = out_width
         self.quality = quality
+        self.last_encode_ms = 0.0
 
     def process_once(self):
         rgb = self.source.read()
         if rgb is None:
             return None
         rgb = _downscale(rgb, self.out_width)
-        return encode_jpeg(rgb, quality=self.quality)
+        t0 = time.monotonic()
+        jpg = encode_jpeg(rgb, quality=self.quality)
+        self.last_encode_ms = (time.monotonic() - t0) * 1000.0
+        return jpg
 
 
 _FRAME_SPEED = {"low": 0, "normal": 1, "high": 2, "super": 3}
@@ -139,11 +143,19 @@ class CameraSource:
     image and throttles the sensor frame rate (long integration = fewer fps)."""
 
     def __init__(self, serial, exposure_ms=10.0, gain=1.0, auto_exposure=False,
-                 frame_speed="high", demosaic="ea", out_width=None):
-        self.cam = HTCamera(serial=serial, frame_speed=_FRAME_SPEED.get(frame_speed),
-                            demosaic_quality=demosaic)
+                 frame_speed="high", demosaic="ea", out_width=None, roi=None):
+        self.cam = HTCamera(serial=serial, demosaic_quality=demosaic)
         self.serial = serial
         self.out_width = out_width
+        # ROI must be applied first — set_roi can reset exposure/speed, so those
+        # come after. A centered crop reads fewer rows -> higher fps, but trims
+        # the fisheye FOV (peripheral view), so it's opt-in.
+        if roi:
+            rgb, _ = self.cam.grab()                  # one frame to learn full size
+            h0, w0 = rgb.shape[:2]
+            rw, rh = roi
+            self.cam.set_roi(rw, rh, max(0, (w0 - rw) // 2), max(0, (h0 - rh) // 2))
+        self.cam.set_frame_speed(_FRAME_SPEED[frame_speed])
         if auto_exposure:
             self.cam.set_ae(True)
         else:
@@ -292,8 +304,18 @@ def build_app(calib, mailboxes, web_dir, send_fps=30):
         # handler on disconnect (and the heartbeat catches dead connections).
         task = asyncio.ensure_future(sender())
         try:
-            async for _ in ws:
-                pass
+            async for msg in ws:
+                if msg.type != WSMsgType.TEXT:
+                    continue
+                try:
+                    d = json.loads(msg.data)
+                except (ValueError, TypeError):
+                    continue
+                if d.get("type") == "ping":            # transport RTT probe
+                    await ws.send_str(json.dumps({"type": "pong", "t": d.get("t")}))
+                elif d.get("type") == "stats":          # client-measured latency
+                    print(f"[client] {d.get('fps')} f/s, decode {d.get('decode_ms')}ms, "
+                          f"transport rtt {d.get('rtt_ms')}ms", flush=True)
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -357,16 +379,18 @@ def _intr_dict(serial):
 
 
 def _capture_loop(pipe, mailbox, stop, label=""):
-    n, t0 = 0, time.monotonic()
+    n, t0, enc = 0, time.monotonic(), 0.0
     while not stop.is_set():
         jpg = pipe.process_once()
         if jpg is not None:
             mailbox.put(jpg)
             n += 1
+            enc += pipe.last_encode_ms
         now = time.monotonic()
         if now - t0 >= 2.0:
-            print(f"[capture {label}] {n / (now - t0):.1f} fps", flush=True)
-            n, t0 = 0, now
+            print(f"[capture {label}] {n / (now - t0):.1f} fps, "
+                  f"encode {enc / max(n, 1):.1f}ms", flush=True)
+            n, t0, enc = 0, now, 0.0
 
 
 def _lan_ip():
@@ -382,6 +406,10 @@ def _lan_ip():
 
 def _run_cameras(args):
     web_dir = Path(__file__).resolve().parent / "vr_web"
+    roi = None
+    if args.roi:
+        rw, rh = [int(x) for x in args.roi.lower().split("x")]
+        roi = (rw, rh)
     left_serial, right_serial = _resolve_pair(args)
     left_intr, right_intr = _intr_dict(left_serial), _intr_dict(right_serial)
 
@@ -401,7 +429,7 @@ def _run_cameras(args):
                 sources[name] = CameraSource(
                     serial, exposure_ms=args.exposure_ms, gain=args.gain,
                     auto_exposure=args.ae, frame_speed=args.frame_speed,
-                    demosaic=args.demosaic, out_width=args.width)
+                    demosaic=args.demosaic, out_width=args.width, roi=roi)
             except Exception as e:
                 print(f"[warn] could not open {name} camera {serial}: {e}")
         if not sources:
@@ -459,6 +487,8 @@ def main():
                     default="high", help="sensor readout speed")
     ap.add_argument("--demosaic", choices=["ea", "bilinear"], default="ea",
                     help="'bilinear' is faster (slight zipper artifacts)")
+    ap.add_argument("--roi", metavar="WxH",
+                    help="center-crop the sensor (e.g. 1600x1600) for higher fps; trims FOV")
     args = ap.parse_args()
     if args.test_pattern:
         _run_test_pattern(args)

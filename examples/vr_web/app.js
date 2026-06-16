@@ -99,27 +99,44 @@ function setEyeImage(name, bitmap) {
   tex.needsUpdate = true;
 }
 
-// ---- received-frame counter (diagnose delivery rate) ----
-let _frames = 0;
+// ---- metrics: delivery fps, JPEG decode ms, transport RTT (round-trip) ----
+let _frames = 0, _decSum = 0, _decN = 0, _rtt = 0, _sock = null;
 const stats = document.getElementById('stats');
 setInterval(() => {
-  if (stats) stats.textContent = `${_frames} f/s  (${Math.round(_frames / 2)}/eye)`;
-  _frames = 0;
+  const dec = _decN ? _decSum / _decN : 0;
+  if (stats) stats.textContent =
+    `${_frames} f/s (${Math.round(_frames / 2)}/eye) · decode ${dec.toFixed(1)}ms · rtt ${_rtt.toFixed(0)}ms`;
+  // report to the host so the numbers are visible in the terminal while in VR
+  if (_sock && _sock.readyState === 1) {
+    _sock.send(JSON.stringify({ type: 'ping', t: performance.now() }));
+    _sock.send(JSON.stringify({ type: 'stats', fps: _frames,
+      decode_ms: +dec.toFixed(1), rtt_ms: +_rtt.toFixed(0) }));
+  }
+  _frames = 0; _decSum = 0; _decN = 0;
 }, 1000);
 
-// ---- WebSocket: text calib, then [eyeByte]+jpeg binary frames ----
+// ---- WebSocket: text calib/pong, then [eyeByte]+jpeg binary frames ----
 function connect() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
   ws.binaryType = 'arraybuffer';
+  _sock = ws;
   ws.onmessage = async (ev) => {
-    if (typeof ev.data === 'string') { applyCalib(JSON.parse(ev.data)); return; }
+    if (typeof ev.data === 'string') {
+      const d = JSON.parse(ev.data);
+      if (d.type === 'calib') applyCalib(d);
+      else if (d.type === 'pong') _rtt = performance.now() - d.t;
+      return;
+    }
     const bytes = new Uint8Array(ev.data);
     _frames++;
     const name = bytes[0] === 0 ? 'left' : 'right';
     const blob = new Blob([bytes.subarray(1)], { type: 'image/jpeg' });
-    setEyeImage(name, await createImageBitmap(blob));
+    const t0 = performance.now();
+    const bm = await createImageBitmap(blob);
+    _decSum += performance.now() - t0; _decN++;
+    setEyeImage(name, bm);
   };
-  ws.onclose = () => setTimeout(connect, 1000);   // reconnect without restart
+  ws.onclose = () => { _sock = null; setTimeout(connect, 1000); };   // reconnect
 }
 connect();
 
