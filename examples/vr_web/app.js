@@ -80,7 +80,13 @@ function applyCalib(calib) {
     e[1], e[4], e[7], 0,
     e[2], e[5], e[8], 0,
     0,    0,    0,    1);
-  eyes.right.mesh.quaternion.setFromRotationMatrix(m4);
+  // Split the relative rotation symmetrically (like cv2.stereoRectify R1/R2):
+  // each eye rotates by half toward a common middle frame, instead of pinning
+  // the left eye to identity. Relative rotation between the eyes is unchanged.
+  const qFull = new THREE.Quaternion().setFromRotationMatrix(m4);
+  const qHalf = new THREE.Quaternion().slerp(qFull, 0.5);  // identity -> half
+  eyes.right.mesh.quaternion.copy(qHalf);
+  eyes.left.mesh.quaternion.copy(qHalf.clone().invert());
 }
 
 function setEyeImage(name, bitmap) {
