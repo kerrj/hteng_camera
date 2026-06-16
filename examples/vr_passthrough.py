@@ -143,18 +143,10 @@ class CameraSource:
     image and throttles the sensor frame rate (long integration = fewer fps)."""
 
     def __init__(self, serial, exposure_ms=10.0, gain=1.0, auto_exposure=False,
-                 frame_speed="high", demosaic="ea", out_width=None, roi=None):
+                 frame_speed="high", demosaic="ea", out_width=None):
         self.cam = HTCamera(serial=serial, demosaic_quality=demosaic)
         self.serial = serial
         self.out_width = out_width
-        # ROI must be applied first — set_roi can reset exposure/speed, so those
-        # come after. A centered crop reads fewer rows -> higher fps, but trims
-        # the fisheye FOV (peripheral view), so it's opt-in.
-        if roi:
-            rgb, _ = self.cam.grab()                  # one frame to learn full size
-            h0, w0 = rgb.shape[:2]
-            rw, rh = roi
-            self.cam.set_roi(rw, rh, max(0, (w0 - rw) // 2), max(0, (h0 - rh) // 2))
         self.cam.set_frame_speed(_FRAME_SPEED[frame_speed])
         if auto_exposure:
             self.cam.set_ae(True)
@@ -406,10 +398,6 @@ def _lan_ip():
 
 def _run_cameras(args):
     web_dir = Path(__file__).resolve().parent / "vr_web"
-    roi = None
-    if args.roi:
-        rw, rh = [int(x) for x in args.roi.lower().split("x")]
-        roi = (rw, rh)
     left_serial, right_serial = _resolve_pair(args)
     left_intr, right_intr = _intr_dict(left_serial), _intr_dict(right_serial)
 
@@ -429,7 +417,7 @@ def _run_cameras(args):
                 sources[name] = CameraSource(
                     serial, exposure_ms=args.exposure_ms, gain=args.gain,
                     auto_exposure=args.ae, frame_speed=args.frame_speed,
-                    demosaic=args.demosaic, out_width=args.width, roi=roi)
+                    demosaic=args.demosaic, out_width=args.width)
             except Exception as e:
                 print(f"[warn] could not open {name} camera {serial}: {e}")
         if not sources:
@@ -487,8 +475,6 @@ def main():
                     default="high", help="sensor readout speed")
     ap.add_argument("--demosaic", choices=["ea", "bilinear"], default="ea",
                     help="'bilinear' is faster (slight zipper artifacts)")
-    ap.add_argument("--roi", metavar="WxH",
-                    help="center-crop the sensor (e.g. 1600x1600) for higher fps; trims FOV")
     args = ap.parse_args()
     if args.test_pattern:
         _run_test_pattern(args)
