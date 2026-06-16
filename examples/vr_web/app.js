@@ -28,8 +28,12 @@ const camera = new THREE.PerspectiveCamera(
 
 function makeTexture() {
   const t = new THREE.Texture();
-  t.flipY = false;                       // we flip v in the shader
-  t.colorSpace = THREE.SRGBColorSpace;
+  t.flipY = false;                       // image row 0 at v=0 (shader samples v)
+  // Frames are already BT.709-encoded host-side (tonemap_linear curve="bt709"),
+  // so treat the texture as raw display bytes — no GPU sRGB decode. The custom
+  // shader writes gl_FragColor straight out (three.js adds no output encode for
+  // ShaderMaterial), so the encoded bytes reach the framebuffer untouched.
+  t.colorSpace = THREE.NoColorSpace;
   t.minFilter = THREE.LinearFilter;
   t.magFilter = THREE.LinearFilter;
   t.generateMipmaps = false;
