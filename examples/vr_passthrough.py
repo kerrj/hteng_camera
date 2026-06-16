@@ -8,6 +8,7 @@ import asyncio
 import json
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import cv2
@@ -138,10 +139,11 @@ class CameraSource:
     image and throttles the sensor frame rate (long integration = fewer fps)."""
 
     def __init__(self, serial, exposure_ms=10.0, gain=1.0, auto_exposure=False,
-                 frame_speed="high", demosaic="ea"):
+                 frame_speed="high", demosaic="ea", out_width=None):
         self.cam = HTCamera(serial=serial, frame_speed=_FRAME_SPEED.get(frame_speed),
                             demosaic_quality=demosaic)
         self.serial = serial
+        self.out_width = out_width
         if auto_exposure:
             self.cam.set_ae(True)
         else:
@@ -153,6 +155,10 @@ class CameraSource:
         rgb16, info = self.cam.grab()
         if rgb16 is None:
             return None
+        # Downscale in linear light *before* the tone curve: tonemap then touches
+        # far fewer pixels (cheaper), and linear-space resampling is more correct.
+        if self.out_width:
+            rgb16 = _downscale(rgb16, self.out_width)
         return convert.tonemap_linear(
             rgb16, wb_gains=self.cam.wb_gains, curve="bt709",
             out_dtype=np.uint8)
@@ -264,17 +270,22 @@ def build_app(calib, mailboxes, web_dir, send_fps=30):
         ws = web.WebSocketResponse(max_msg_size=0, heartbeat=5.0)
         await ws.prepare(request)
         await ws.send_str(json.dumps(calib))
-        period = 1.0 / send_fps
+        period = (1.0 / send_fps) if send_fps and send_fps > 0 else 0.0
         last = {"left": None, "right": None}
 
         async def sender():
             while not ws.closed:
+                sent_any = False
                 for eye, mb in mailboxes.items():
                     jpg = mb.get_latest()
                     if jpg is not None and jpg is not last[eye]:
                         last[eye] = jpg
                         await ws.send_bytes(bytes([EYE_ID[eye]]) + bytes(jpg))
-                await asyncio.sleep(period)
+                        sent_any = True
+                # capped: tick at 1/fps. uncapped (fps<=0): ship newest as soon as
+                # it's ready — TCP backpressure self-throttles to the link rate and
+                # newest-wins keeps it fresh, so no buffer bloat.
+                await asyncio.sleep(period if period else (0.0 if sent_any else 0.001))
 
         # Run the frame sender alongside draining incoming messages; the
         # `async for` ends as soon as the client closes, so we never leak the
@@ -345,11 +356,17 @@ def _intr_dict(serial):
     return _intr_dict_from_cal(calibration.find(serial), serial)
 
 
-def _capture_loop(pipe, mailbox, stop):
+def _capture_loop(pipe, mailbox, stop, label=""):
+    n, t0 = 0, time.monotonic()
     while not stop.is_set():
         jpg = pipe.process_once()
         if jpg is not None:
             mailbox.put(jpg)
+            n += 1
+        now = time.monotonic()
+        if now - t0 >= 2.0:
+            print(f"[capture {label}] {n / (now - t0):.1f} fps", flush=True)
+            n, t0 = 0, now
 
 
 def _lan_ip():
@@ -384,7 +401,7 @@ def _run_cameras(args):
                 sources[name] = CameraSource(
                     serial, exposure_ms=args.exposure_ms, gain=args.gain,
                     auto_exposure=args.ae, frame_speed=args.frame_speed,
-                    demosaic=args.demosaic)
+                    demosaic=args.demosaic, out_width=args.width)
             except Exception as e:
                 print(f"[warn] could not open {name} camera {serial}: {e}")
         if not sources:
@@ -397,7 +414,7 @@ def _run_cameras(args):
         for name in ("left", "right"):
             mb = Mailbox(); mailboxes[name] = mb
             pipe = EyePipeline(sources[name], out_width=args.width, quality=args.quality)
-            t = threading.Thread(target=_capture_loop, args=(pipe, mb, stop), daemon=True)
+            t = threading.Thread(target=_capture_loop, args=(pipe, mb, stop, name), daemon=True)
             t.start(); threads.append(t)
 
         tethered = adb_reverse(args.port)
@@ -426,7 +443,8 @@ def main():
     ap.add_argument("--test-pattern", action="store_true",
                     help="serve a synthetic grid instead of cameras (no hardware)")
     ap.add_argument("--width", type=int, default=1280)
-    ap.add_argument("--fps", type=int, default=30)
+    ap.add_argument("--fps", type=int, default=0,
+                    help="WS send-rate cap (0 = uncapped: deliver every captured frame)")
     ap.add_argument("--quality", type=int, default=85)
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--max-fov-deg", type=float, default=150.0)
