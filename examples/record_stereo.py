@@ -881,12 +881,6 @@ def main() -> None:
     encoder = _resolve_encoder(args.encoder)
     _preflight_ffmpeg(encoder)
 
-    # Keep the laptop awake (incl. lid closed) for the whole run. Engage now,
-    # while single-threaded, so the one-time sudo prompt is clean. release() is
-    # idempotent and also atexit-registered, so an early sys.exit() still undoes it.
-    awake = _KeepAwake(enabled=not args.no_keep_awake)
-    awake.engage()
-
     frame_interval_ms = 1000.0 / args.fps
     if args.exposure_ms >= frame_interval_ms:
         print(
@@ -940,6 +934,14 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_left = str(out_dir / "left.mp4")
     out_right = str(out_dir / "right.mp4")
+
+    # Keep the laptop awake (incl. lid closed) for the whole run. Engage here —
+    # past all the arg/camera validation, so a trivial error never triggers the
+    # sudo prompt, but before we open cameras or start threads so the one-time
+    # prompt is clean and single-threaded. release() is idempotent and also
+    # atexit/SIGTERM-registered, so every exit path still undoes it.
+    awake = _KeepAwake(enabled=not args.no_keep_awake)
+    awake.engage()
 
     # ── Open + configure both cameras ────────────────────────────────────────
     print(f"[info] Opening cameras  left={serial_left}  right={serial_right} …")
