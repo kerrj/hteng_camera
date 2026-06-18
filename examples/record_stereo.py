@@ -63,8 +63,10 @@ Usage
 """
 
 import argparse
+import atexit
 import csv
 import json
+import os
 import platform
 import shutil
 import signal
@@ -421,6 +423,24 @@ def _copy_calibration(out_dir: Path, serial_left: str, serial_right: str) -> Non
         print(f"[warn] calibration not found (skipped): {', '.join(missing)}")
 
 
+def _find_stereo_for(serials: list[str]):
+    """Load the StereoCalibration whose (left, right) serials are both present,
+    so the recording can adopt the calibration's L/R convention. Returns a
+    StereoCalibration or None. Tries both orderings of the present serials."""
+    for a in serials:
+        for b in serials:
+            if a == b:
+                continue
+            for d in calibration.search_dirs():
+                p = calibration.StereoCalibration.default_path(a, b, d)
+                if p.exists():
+                    try:
+                        return calibration.StereoCalibration.load(p)
+                    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                        pass
+    return None
+
+
 def _side_meta(cam: HTCamera, serial: str, full_wh: tuple[int, int],
                exposure_ms: float, gain_x: float) -> dict:
     """Per-camera manifest entry: the applied ROI (read back from the camera)
@@ -511,11 +531,14 @@ def _report_sync(sync_csv: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def _open_and_configure(serial: str, args, tag: str
-                        ) -> tuple[HTCamera, float, float, tuple[int, int]]:
+                        ) -> tuple[HTCamera, float, float, tuple[int, int], tuple[int, int]]:
     """Open one camera, apply the fixed-exposure / max-throughput config, and
-    *verify it latched*. Returns ``(cam, exposure_ms, gain_x, full_sensor_wh)``
-    with the values the camera actually reports; ``full_sensor_wh`` is the
-    uncropped sensor size (for the recording manifest / intrinsics offset).
+    *verify it latched*. Returns
+    ``(cam, exposure_ms, gain_x, full_sensor_wh, applied_hw)`` — the values the
+    camera actually reports, the uncropped sensor size (for the manifest /
+    intrinsics offset), and the (h, w) of a real delivered frame (for sizing the
+    encoder). We don't declare success until a frame actually arrives, so a cold
+    or wedged stream keeps retrying here instead of failing downstream.
 
     Why the readback loop: control writes go through HTCamera._ctrl, which only
     retries on a non-zero SDK status. This hardware can return 0 (success) from a
@@ -555,30 +578,218 @@ def _open_and_configure(serial: str, args, tag: str
     want_exp, want_gain = args.exposure_ms, args.gain
     exp_tol = max(0.5, 0.1 * want_exp)           # SDK quantises exposure to line-time
     gain_tol = max(0.2, 0.1 * want_gain)         # and gain to a discrete step
-    got_exp = got_gain = float("nan")
-    for attempt in range(5):
-        cam.set_ae(False)                        # fixed exposure -> stable fps
-        cam.set_exposure_ms(want_exp)
-        cam.set_analog_gain(want_gain)
-        cam.grab_bayer12(timeout_ms=2000)        # start streaming so settings latch
-        got_exp = cam.get_exposure_ms()
-        got_gain = cam.get_analog_gain()
-        if abs(got_exp - want_exp) <= exp_tol and abs(got_gain - want_gain) <= gain_tol:
-            return cam, got_exp, got_gain, (full_w, full_h)
+    got_exp = got_gain = None
+    applied_hw = None                            # (h, w) of a real delivered frame
+    last_err = None
+    for attempt in range(8):
+        # The setters route through HTCamera._ctrl, which heals a wedged (-52)
+        # control channel via CameraReConnect. The readback GETTERS don't — they
+        # call the SDK directly — so a -52 on readback (or a setter that exhausts
+        # its own retries) is transient: swallow it and loop, and the next setter
+        # pass reconnects the channel. Don't let it abort the whole recording.
+        try:
+            cam.set_ae(False)                    # fixed exposure -> stable fps
+            cam.set_exposure_ms(want_exp)
+            cam.set_analog_gain(want_gain)
+            frame, _ = cam.grab_bayer12(timeout_ms=2000)   # also starts streaming
+            if frame is not None:
+                applied_hw = frame.shape[:2]
+            got_exp = cam.get_exposure_ms()
+            got_gain = cam.get_analog_gain()
+        except Exception as e:                   # SdkError (-52 wedged channel), etc.
+            last_err = e
+            time.sleep(0.3)
+            continue
+        # Require a real frame AND the latched exposure/gain before success.
+        if (applied_hw is not None
+                and abs(got_exp - want_exp) <= exp_tol
+                and abs(got_gain - want_gain) <= gain_tol):
+            return cam, got_exp, got_gain, (full_w, full_h), applied_hw
         time.sleep(0.15)
 
+    if applied_hw is None:
+        # Opened, but the stream never delivered a frame — a genuinely bad
+        # connection / wedged device. Raise so the caller releases the handle.
+        raise RuntimeError(
+            f"{tag} camera ({serial}) opened but delivered no frames after 8 "
+            f"tries (last error: {last_err}). Unplug/replug and retry.")
+
+    if got_exp is None:
+        # Frames arrive but the control channel stayed wedged for readback. The
+        # set_* commands go through _ctrl and are reliable, so proceed with the
+        # requested values rather than crashing — just unverified.
+        print(
+            f"[warn] {tag} camera ({serial}) control channel stayed wedged; "
+            f"proceeding with requested {want_exp:.1f} ms / {want_gain:.2f}x "
+            f"unverified (last error: {last_err})."
+        )
+        return cam, want_exp, want_gain, (full_w, full_h), applied_hw
+
     print(
-        f"[warn] {tag} camera ({serial}) did not accept exposure/gain after 5 "
+        f"[warn] {tag} camera ({serial}) did not accept exposure/gain after 8 "
         f"tries: asked {want_exp:.1f} ms / {want_gain:.2f}x, got "
         f"{got_exp:.1f} ms / {got_gain:.2f}x. Auto-exposure may be stuck on — "
         "the stereo skew will be large. Try unplug/replug, or rerun."
     )
-    return cam, got_exp, got_gain, (full_w, full_h)
+    return cam, got_exp, got_gain, (full_w, full_h), applied_hw
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+class _KeepAwake:
+    """Keep a Mac awake for the whole recording — including with the lid CLOSED.
+
+    Two layers, because macOS has two independent sleep paths:
+
+      caffeinate -imsuw <pid>   blocks *idle* sleep (system/display/disk). The
+                                -w ties it to our pid so it can't outlive us
+                                (it exits the instant this process does, even on
+                                a crash). This is the part `caffeinate <cmd>`
+                                from the shell already covers.
+      pmset -a disablesleep 1   blocks *clamshell* (lid-close) sleep — the path
+                                caffeinate cannot touch. Without it, shutting
+                                the lid sleeps the Mac, drops USB, and kills the
+                                capture regardless of any caffeinate assertion.
+                                Needs sudo; we save the prior value and restore
+                                it on exit.
+
+    No-op off macOS. Any failure degrades to a warning — the recording still
+    runs, it just isn't guaranteed to survive a lid close.
+    """
+
+    def __init__(self, enabled: bool = True) -> None:
+        self.enabled = enabled and platform.system() == "Darwin"
+        self._caffeinate: Optional[subprocess.Popen] = None
+        self._pmset_prev: Optional[int] = None   # prior SleepDisabled (0/1) to restore
+        self._lid_set = False                    # did WE flip disablesleep -> 1?
+        self._prev_handlers: dict = {}           # SIGTERM/SIGHUP handlers we replaced
+        self._ka_stop: Optional[threading.Event] = None  # sudo keep-alive control
+        self._released = False
+
+    def engage(self) -> None:
+        if not self.enabled:
+            if platform.system() != "Darwin":
+                print("[info] keep-awake: not macOS — relying on the OS / your wrapper.")
+            return
+        # Layer 1 — idle sleep, tied to our pid so it dies with us even on a crash.
+        try:
+            self._caffeinate = subprocess.Popen(
+                ["caffeinate", "-imsuw", str(os.getpid())])
+            print("[info] keep-awake: caffeinate running (blocks idle sleep).")
+        except FileNotFoundError:
+            print("[warn] keep-awake: caffeinate not found — idle sleep NOT blocked.")
+
+        # Layer 2 — lid-close sleep. Needs sudo; prompt once now, while we're
+        # still single-threaded and before any camera is open.
+        self._pmset_prev = self._read_sleep_disabled()
+        if self._set_disablesleep(True, interactive=True):
+            self._lid_set = True
+            self._start_sudo_keepalive()   # keep creds warm so restore never prompts
+            print("[info] keep-awake: pmset disablesleep=1 — safe to close the lid.")
+        else:
+            print("[warn] keep-awake: could NOT disable lid-close sleep (needs sudo).\n"
+                  "       Closing the lid WILL sleep the Mac and kill the recording.\n"
+                  "       Fix: run this script under sudo, or first run\n"
+                  "           sudo pmset -a disablesleep 1\n"
+                  "       (and `sudo pmset -a disablesleep 0` when you're done).")
+
+        # Restore on EVERY exit path: normal return / sys.exit / unhandled
+        # exception are caught by atexit; SIGTERM & SIGHUP would otherwise kill
+        # us before atexit runs, so we trap them and release first. (SIGINT is
+        # owned by main()'s teardown; SIGKILL can't be trapped — caffeinate still
+        # dies via -w, but pmset can't be restored on a -9.)
+        atexit.register(self.release)
+        self._install_signal_restore()
+
+    def _install_signal_restore(self) -> None:
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            try:
+                prev = signal.getsignal(sig)
+            except (ValueError, OSError):
+                continue
+            if prev is signal.SIG_IGN:
+                continue   # already ignored (e.g. launched under nohup) — leave it
+            self._prev_handlers[sig] = prev
+
+            def handler(signum, _frame, _prev=prev):
+                self.release()
+                # Re-raise through whatever was there before (e.g. the library's
+                # camera-uninit handler) and then the default action, so the
+                # signal still does its job instead of being swallowed.
+                signal.signal(signum, _prev if callable(_prev) else signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
+
+    def _start_sudo_keepalive(self) -> None:
+        # `release` uses `sudo -n` (non-interactive) so it never hangs on a
+        # prompt mid-teardown / in a signal handler. But the credential cached
+        # at engage expires (~5 min), which would break restore on a long run.
+        # Refresh it every 60 s so the timestamp stays valid for the whole
+        # recording. No-op when already root.
+        if os.geteuid() == 0:
+            return
+        self._ka_stop = threading.Event()
+
+        def loop():
+            while not self._ka_stop.wait(60):
+                subprocess.run(["sudo", "-n", "-v"], capture_output=True)
+
+        threading.Thread(target=loop, daemon=True, name="sudo-keepalive").start()
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        if self._ka_stop is not None:
+            self._ka_stop.set()                  # stop refreshing sudo creds
+        # Restore lid behaviour first — it's the change that persists till reboot.
+        # Only undo it if WE set it (don't stomp a value the user chose). If we
+        # couldn't read the prior value, fall back to 0 (off) rather than leak a
+        # permanent no-sleep state. Warm credential keeps this from blocking.
+        if self._lid_set:
+            target = self._pmset_prev if self._pmset_prev is not None else 0
+            if not self._set_disablesleep(bool(target), interactive=False):
+                print("[warn] keep-awake: could not restore pmset disablesleep — "
+                      f"run `sudo pmset -a disablesleep {target}` yourself.")
+        if self._caffeinate is not None and self._caffeinate.poll() is None:
+            self._caffeinate.terminate()
+            try:
+                self._caffeinate.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._caffeinate.kill()
+
+    @staticmethod
+    def _read_sleep_disabled() -> Optional[int]:
+        try:
+            out = subprocess.check_output(["pmset", "-g"], text=True)
+        except Exception:
+            return None
+        for line in out.splitlines():
+            if "SleepDisabled" in line:
+                return 1 if line.split()[-1] == "1" else 0
+        return 0   # key absent ⇒ feature off
+
+    @staticmethod
+    def _set_disablesleep(on: bool, interactive: bool) -> bool:
+        cmd = ["pmset", "-a", "disablesleep", "1" if on else "0"]
+        if os.geteuid() != 0:
+            # -n (non-interactive) unless we're allowed to prompt AND have a tty.
+            if interactive and sys.stdin.isatty():
+                print("[info] keep-awake: sudo needed to disable lid-close sleep…")
+                cmd = ["sudo", *cmd]
+            else:
+                cmd = ["sudo", "-n", *cmd]
+        try:
+            return subprocess.run(cmd, capture_output=not interactive).returncode == 0
+        except Exception:
+            return False
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(
@@ -653,6 +864,13 @@ def main() -> None:
              "to choose from but cost ~10 MB each. 8 is plenty when the sensors "
              "run faster than --fps.",
     )
+    ap.add_argument(
+        "--no-keep-awake", action="store_true",
+        help="Don't keep the Mac awake. By default the recording blocks idle "
+             "sleep (caffeinate) AND lid-close sleep (pmset disablesleep, needs "
+             "sudo) so you can shut the laptop and let it run. Both are restored "
+             "on exit. No-op off macOS.",
+    )
     args = ap.parse_args()
 
     if args.sync_buffer < 1:
@@ -662,6 +880,12 @@ def main() -> None:
 
     encoder = _resolve_encoder(args.encoder)
     _preflight_ffmpeg(encoder)
+
+    # Keep the laptop awake (incl. lid closed) for the whole run. Engage now,
+    # while single-threaded, so the one-time sudo prompt is clean. release() is
+    # idempotent and also atexit-registered, so an early sys.exit() still undoes it.
+    awake = _KeepAwake(enabled=not args.no_keep_awake)
+    awake.engage()
 
     frame_interval_ms = 1000.0 / args.fps
     if args.exposure_ms >= frame_interval_ms:
@@ -678,11 +902,39 @@ def main() -> None:
             f"[error] need two cameras for a stereo recording; found "
             f"{len(cams)} ({', '.join(c['serial'] for c in cams) or 'none'})."
         )
-    serial_left = args.left if args.left is not None else cams[0]["serial"]
-    serial_right = args.right if args.right is not None else cams[1]["serial"]
+    # Decide left/right deterministically. USB enumeration order is NOT stable
+    # across runs/replug, so it must not silently pick sides. Priority:
+    #   1. explicit --left/--right
+    #   2. the stereo calibration's serial_left/serial_right (matches the L/R the
+    #      rig was calibrated with — verified physical via the baseline sign)
+    #   3. enumeration order, with a loud warning
+    present = [c["serial"] for c in cams]
+    stereo = _find_stereo_for(present)
+    if stereo is not None:
+        base_left, base_right, side_src = stereo.serial_left, stereo.serial_right, \
+            f"stereo calibration (stereo_{stereo.serial_left}_{stereo.serial_right}.json)"
+    else:
+        base_left, base_right, side_src = present[0], present[1], "USB enumeration order"
+
+    serial_left = args.left if args.left is not None else base_left
+    serial_right = args.right if args.right is not None else base_right
+    if args.left is not None or args.right is not None:
+        side_src = "--left/--right" + (
+            "" if (args.left is not None and args.right is not None)
+            else f" + {side_src}")
+
     if serial_left == serial_right:
-        sys.exit("[error] --left and --right resolved to the same serial "
+        sys.exit("[error] left and right resolved to the same serial "
                  f"({serial_left}). Pass distinct --left/--right serials.")
+    missing = [s for s in (serial_left, serial_right) if s not in present]
+    if missing:
+        sys.exit(f"[error] requested serial(s) {missing} not connected. "
+                 f"Present: {', '.join(present)}.")
+    if stereo is None and args.left is None and args.right is None:
+        print("[warn] left/right assigned by USB enumeration order, which is NOT "
+              "stable across replug/reboot — sides may swap between runs. Pass "
+              "--left/--right, or add a stereo calibration, to pin them.")
+    print(f"[info] sides from {side_src}")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -691,22 +943,31 @@ def main() -> None:
 
     # ── Open + configure both cameras ────────────────────────────────────────
     print(f"[info] Opening cameras  left={serial_left}  right={serial_right} …")
-    cam_left, exp_left, gain_left, full_left = _open_and_configure(serial_left, args, "left")
-    cam_right, exp_right, gain_right, full_right = _open_and_configure(serial_right, args, "right")
+    cam_left = cam_right = None
+    try:
+        cam_left, exp_left, gain_left, full_left, dims_left = \
+            _open_and_configure(serial_left, args, "left")
+        cam_right, exp_right, gain_right, full_right, dims_right = \
+            _open_and_configure(serial_right, args, "right")
+    except BaseException:
+        # If the second camera (or a Ctrl+C mid-open) fails after the first is up,
+        # release the opened handle immediately — a leaked handle comes back as a
+        # wedged (-52) or DEVICE_IS_OPENED (-18) on the next run.
+        for c in (cam_left, cam_right):
+            if c is not None:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+        raise
 
     # Shared hardware time base for the pair (soft sync; see module docstring).
     cam_left.reset_timestamp()
     cam_right.reset_timestamp()
 
-    # Discard the first grab per camera (may pre-date our exposure setting),
-    # then size the encoders from a real frame.
-    dims = {}
-    for tag, cam in (("left", cam_left), ("right", cam_right)):
-        cam.grab_bayer12(timeout_ms=2000)
-        test_frame, _ = cam.grab_bayer12(timeout_ms=2000)
-        if test_frame is None:
-            raise RuntimeError(f"{tag} camera returned no frame — check connection.")
-        dims[tag] = test_frame.shape[:2]
+    # Encoder dims come from the real frame each camera delivered during open
+    # (no extra grab to time out on).
+    dims = {"left": dims_left, "right": dims_right}
     if dims["left"] != dims["right"]:
         print(f"[warn] left {dims['left'][::-1]} and right {dims['right'][::-1]} "
               "resolutions differ — each video uses its own camera's size.")
@@ -771,11 +1032,35 @@ def main() -> None:
     enc_thread.start()
 
     # ── Wait for duration / Ctrl+C ───────────────────────────────────────────
+    # Handle SIGINT ourselves so Ctrl+C tears down in the SAME order as the
+    # duration path: set `stop`, let the capture/encode threads exit, THEN close
+    # the cameras. hteng_camera installs an import-time SIGINT handler that
+    # instead uninits the camera handles immediately — while the capture threads
+    # are still grabbing on them. That both contends with the in-flight grab and
+    # sends the next grab into HTCamera._ctrl's reconnect-retry loop (20 tries x
+    # 0.6 s ≈ 12 s, and it never checks `stop`), which is why an interrupted run
+    # took far longer to exit than a timed one. Overriding the handler keeps
+    # shutdown fast. A second Ctrl+C restores the library's handler, which
+    # uninits the camera handles before exiting — NOT SIG_DFL, which would
+    # hard-kill the process and leave the cameras open (wedging the next run).
+    interrupted = threading.Event()
+
+    def _on_sigint(_signum, _frame):
+        interrupted.set()
+        stop.set()
+        signal.signal(signal.SIGINT, prev_sigint)      # 2nd Ctrl+C: lib cleanup + exit
+
+    prev_sigint = signal.signal(signal.SIGINT, _on_sigint)
+
     stopped_intentionally = False
     try:
         print("[info] Recording… press Ctrl+C to stop.")
         t_end = None if args.duration is None else time.monotonic() + args.duration
         while enc_thread.is_alive():
+            if interrupted.is_set():
+                stopped_intentionally = True
+                print()                                # newline after ^C
+                break
             if t_end is not None and time.monotonic() >= t_end:
                 stopped_intentionally = True
                 break
@@ -783,9 +1068,8 @@ def main() -> None:
                 print("[warn] an ffmpeg exited early — stopping.")
                 break
             time.sleep(0.1)
-    except KeyboardInterrupt:
-        stopped_intentionally = True
-        print()
+    finally:
+        signal.signal(signal.SIGINT, prev_sigint)      # restore for teardown
 
     # ── Tear down ─────────────────────────────────────────────────────────────
     print("[info] Stopping…")
@@ -804,6 +1088,7 @@ def main() -> None:
             rets.append(proc.wait())
     cam_left.close()
     cam_right.close()
+    awake.release()                     # restore sleep settings; stop caffeinate
 
     # ffmpeg exits 255 / -SIGINT on a graceful SIGINT — expected, file is complete.
     def _clean(ret: int) -> bool:
