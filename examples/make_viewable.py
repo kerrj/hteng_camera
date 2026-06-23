@@ -43,6 +43,7 @@ Usage:
 """
 
 import argparse
+import platform
 import subprocess
 import sys
 import threading
@@ -51,6 +52,15 @@ from pathlib import Path
 import numpy as np
 
 from hteng_camera import convert
+
+
+def _h264_enc(crf: int) -> list[str]:
+    """Return ffmpeg H.264 encoder + quality flags. VideoToolbox on macOS, x264 elsewhere."""
+    if platform.system() == "Darwin":
+        # q:v scale is inverted (1=best, 100=worst); map crf roughly: q ≈ crf * 1.5
+        q = max(1, min(100, int(crf * 1.5)))
+        return ["-c:v", "h264_videotoolbox", "-q:v", str(q)]
+    return ["-c:v", "libx264", "-crf", str(crf)]
 
 
 def _probe(path: str, entries: str) -> str:
@@ -103,7 +113,7 @@ def _transcode_bt709(inp: str, out: str, crf: int) -> int:
         "ffmpeg", "-y", "-v", "error", "-i", inp,
         # Bit depth happens via -pix_fmt; this only remaps full->limited levels.
         "-vf", "scale=in_range=full:out_range=tv",
-        "-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p",
+        *_h264_enc(crf), "-pix_fmt", "yuv420p",
         "-colorspace", "bt709", "-color_primaries", "bt709",
         "-color_trc", "bt709", "-color_range", "tv",
         "-movflags", "+faststart", out,
@@ -136,7 +146,7 @@ def _tonemap_linear_master(inp: str, out: str, w: int, h: int, fps: str,
         ["ffmpeg", "-y", "-v", "error",
          "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", fps,
          "-i", "pipe:0",
-         "-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p",
+         *_h264_enc(crf), "-pix_fmt", "yuv420p",
          "-colorspace", "bt709", "-color_primaries", "bt709",
          "-color_trc", "bt709", "-color_range", "tv",
          "-movflags", "+faststart", out],
@@ -258,7 +268,7 @@ def _transcode_stereo(inp_l: str, inp_r: str, out: str,
         ["ffmpeg", "-y", "-v", "error",
          "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w_out}x{h_out}",
          "-r", fps_l, "-i", "pipe:0",
-         "-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p",
+         *_h264_enc(crf), "-pix_fmt", "yuv420p",
          "-colorspace", "bt709", "-color_primaries", "bt709",
          "-color_trc", "bt709", "-color_range", "tv",
          "-movflags", "+faststart", out],
