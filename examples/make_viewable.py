@@ -37,11 +37,15 @@ Usage:
     python make_viewable.py master.mp4 -o viewable.mp4
     # linear master (or force the tone-map path):
     python make_viewable.py --mode tonemap --curve log --param 120 in.mp4
+    # stereo pair (tone-mapped or bt709, both treated the same way):
+    python make_viewable.py left.mp4 right.mp4
+    python make_viewable.py left.mp4 right.mp4 -o stereo.mp4
 """
 
 import argparse
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -163,12 +167,136 @@ def _tonemap_linear_master(inp: str, out: str, w: int, h: int, fps: str,
     return n
 
 
+def _decode_to_rgb24(inp: str, w: int, h: int, fps: str,
+                     mode: str, curve: str, param: float,
+                     ev: float, black: float, white: float) -> subprocess.Popen:
+    """Return an encoder Popen whose stdin receives rgb24 frames.
+
+    For the transcode path, returns a ffmpeg decoder piping yuv->rgb24 directly.
+    For the tonemap path, returns a Popen whose stdin we feed tone-mapped frames.
+    This function is only used by the stereo path; single-file paths are unchanged.
+    """
+    if mode == "transcode":
+        # bt709 master: decode to rgb24, with full->limited level conversion
+        proc = subprocess.Popen(
+            ["ffmpeg", "-v", "error", "-i", inp,
+             "-vf", "scale=in_range=full:out_range=tv",
+             "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"],
+            stdout=subprocess.PIPE,
+        )
+        return proc, None           # (reader, tonemap_thread) -- no thread needed
+
+    # tonemap path: decode linear -> rgb48le, tone-map in Python, write rgb24
+    import io
+    dec = subprocess.Popen(
+        ["ffmpeg", "-v", "error", "-i", inp,
+         "-pix_fmt", "rgb48le", "-f", "rawvideo", "pipe:1"],
+        stdout=subprocess.PIPE,
+    )
+    frame_bytes_in  = w * h * 3 * 2
+    frame_bytes_out = w * h * 3
+
+    # We can't easily pipe through a Python transform and present a simple
+    # stdout to the caller, so we use a thread + os.pipe.
+    import os
+    rfd, wfd = os.pipe()
+    reader = os.fdopen(rfd, "rb")
+    writer = os.fdopen(wfd, "wb")
+
+    def _pump():
+        try:
+            while True:
+                buf = dec.stdout.read(frame_bytes_in)
+                if len(buf) < frame_bytes_in:
+                    break
+                linear = np.frombuffer(buf, dtype="<u2").reshape(h, w, 3)
+                disp = convert.tonemap_linear(
+                    linear, curve=curve, param=param, exposure=ev,
+                    black=black, white=white, max_in=65535.0)
+                writer.write(np.ascontiguousarray(disp).tobytes())
+        finally:
+            writer.close()
+            dec.wait()
+
+    t = threading.Thread(target=_pump, daemon=True)
+    t.start()
+
+    # Wrap the raw read fd in a Popen-like object so the caller can use .stdout
+    class _PipeSource:
+        def __init__(self, r, thread, dec_proc):
+            self.stdout = r
+            self._thread = thread
+            self._dec = dec_proc
+        def wait(self):
+            self._thread.join()
+            return self._dec.returncode
+
+    return _PipeSource(reader, t, dec), t
+
+
+def _transcode_stereo(inp_l: str, inp_r: str, out: str,
+                      mode_l: str, mode_r: str,
+                      w_l: int, h_l: int, fps_l: str,
+                      w_r: int, h_r: int,
+                      crf: int, curve: str, param: float,
+                      ev: float, black: float, white: float) -> int:
+    """Decode both videos to rgb24 frame streams, hstack per-frame, encode."""
+    # Both sides must have the same height; width can differ (hstack handles it).
+    if h_l != h_r:
+        sys.exit(f"[error] stereo videos have different heights ({h_l} vs {h_r}); "
+                 "cannot hstack")
+
+    w_out = w_l + w_r
+    h_out = h_l
+
+    src_l, _ = _decode_to_rgb24(inp_l, w_l, h_l, fps_l,
+                                 mode_l, curve, param, ev, black, white)
+    src_r, _ = _decode_to_rgb24(inp_r, w_r, h_r, fps_l,
+                                 mode_r, curve, param, ev, black, white)
+
+    enc = subprocess.Popen(
+        ["ffmpeg", "-y", "-v", "error",
+         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w_out}x{h_out}",
+         "-r", fps_l, "-i", "pipe:0",
+         "-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p",
+         "-colorspace", "bt709", "-color_primaries", "bt709",
+         "-color_trc", "bt709", "-color_range", "tv",
+         "-movflags", "+faststart", out],
+        stdin=subprocess.PIPE,
+    )
+
+    frame_l = w_l * h_l * 3
+    frame_r = w_r * h_r * 3
+    n = 0
+    try:
+        while True:
+            buf_l = src_l.stdout.read(frame_l)
+            buf_r = src_r.stdout.read(frame_r)
+            if len(buf_l) < frame_l or len(buf_r) < frame_r:
+                break
+            left  = np.frombuffer(buf_l, dtype=np.uint8).reshape(h_l, w_l, 3)
+            right = np.frombuffer(buf_r, dtype=np.uint8).reshape(h_r, w_r, 3)
+            enc.stdin.write(np.ascontiguousarray(np.hstack([left, right])).tobytes())
+            n += 1
+    finally:
+        try:
+            enc.stdin.close()
+        except OSError:
+            pass
+        src_l.wait()
+        src_r.wait()
+        enc.wait()
+    return n
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Make a record.py master viewable (transcode or tone-map).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("input", help="Master .mp4 (from record.py)")
+    ap.add_argument("input2", nargs="?", default=None,
+                    help="Optional second .mp4 for a side-by-side stereo pair")
     ap.add_argument("-o", "--output", default=None,
                     help="Output path (default: input with an '_8bit' suffix)")
     ap.add_argument(
@@ -194,23 +322,38 @@ def main() -> None:
                     help="[tonemap] White level (0.5..1)")
     args = ap.parse_args()
 
-    # Default output: input filename with an '_8bit' suffix (keep the directory
-    # and extension), e.g. /data/master.mp4 -> /data/master_8bit.mp4.
+    # Default output suffix.
     if args.output:
         output = args.output
     else:
         p = Path(args.input)
-        output = str(p.with_name(f"{p.stem}_8bit{p.suffix}"))
+        suffix = "_stereo_8bit" if args.input2 else "_8bit"
+        output = str(p.with_name(f"{p.stem}{suffix}{p.suffix}"))
 
-    # Resolve mode: 'auto' reads the input transfer tag. Anything not explicitly
-    # 'linear' is treated as already display-encoded (bt709) -> transcode.
-    mode = args.mode
-    if mode == "auto":
-        trc = _probe_transfer(args.input)
-        mode = "tonemap" if trc == "linear" else "transcode"
-        print(f"[info] input transfer={trc or 'unset'} -> mode {mode}")
+    # Resolve mode for input 1 (and input2 if present).
+    def _resolve_mode(path: str, label: str) -> str:
+        if args.mode != "auto":
+            return args.mode
+        trc = _probe_transfer(path)
+        m = "tonemap" if trc == "linear" else "transcode"
+        print(f"[info] {label} transfer={trc or 'unset'} -> mode {m}")
+        return m
 
-    if mode == "transcode":
+    mode = _resolve_mode(args.input, "input")
+
+    if args.input2:
+        mode2 = _resolve_mode(args.input2, "input2")
+        w_l, h_l = _probe_size(args.input)
+        w_r, h_r = _probe_size(args.input2)
+        fps = _probe_fps(args.input)
+        n = _transcode_stereo(
+            args.input, args.input2, output,
+            mode, mode2,
+            w_l, h_l, fps,
+            w_r, h_r,
+            args.crf, args.curve, args.param, args.ev, args.black, args.white)
+        print(f"[info] wrote {n} stereo frames -> {output}")
+    elif mode == "transcode":
         rc = _transcode_bt709(args.input, output, args.crf)
         if rc != 0:
             sys.exit(f"[error] ffmpeg transcode failed (code {rc}).")

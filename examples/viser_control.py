@@ -25,7 +25,7 @@ import cv2
 import numpy as np
 import viser
 
-from hteng_camera import HTCamera, list_cameras, convert, enums
+from hteng_camera import HTCamera, list_cameras, convert, enums, AutoExposure
 
 JPEG_QUALITY = 80
 DISPLAY_WIDTH = 1280   # normal preview width; capture is always full-res
@@ -56,7 +56,15 @@ def main():
         "quit": False,
         "full_w": 0,          # native sensor resolution, learned on open
         "full_h": 0,
+        "ae": None,           # AutoExposure controller, built on open
+        "ae_exp": None,       # exact exposure/gain software-AE last applied —
+        "ae_gain": None,      # kept off the sliders so the 0.1-step quantisation
+                              # can't knock exposure off a flicker-free multiple.
     }
+
+    def _flicker_hz(label):
+        """Map the anti-flicker dropdown to a mains frequency (0 = off)."""
+        return {"Off": 0.0, "60 Hz": 60.0, "50 Hz": 50.0}[label]
 
     cams = list_cameras()
     options = [f'{c["serial"]}  ({c["name"]})' for c in cams] or ["<none found>"]
@@ -72,13 +80,51 @@ def main():
 
     # -- Exposure / gain (thin SDK pass-throughs) --------------------------
     with server.gui.add_folder("Exposure / gain"):
-        ae_box = server.gui.add_checkbox("Auto exposure", initial_value=False)
+        ae_box = server.gui.add_checkbox("Auto exposure (SDK)", initial_value=False)
         exp_slider = server.gui.add_slider(
             "Exposure (ms)", min=0.1, max=200.0, step=0.1, initial_value=15.0)
         gain_slider = server.gui.add_slider(
             "Analog gain (x)", min=1.0, max=22.0, step=0.1, initial_value=1.0)
         speed_dropdown = server.gui.add_dropdown(
             "Frame speed", options=("Low", "Mid", "High"), initial_value="High")
+
+    # -- Software AE (the record_stereo controller, testable live here) -----
+    # Gain-first, centre-weighted, EMA-smoothed — the policy we want for the
+    # ego stereo rig: exposure stays pinned short (stable fps / sync), gain does
+    # the work. When on, it drives exp_slider/gain_slider every frame so you can
+    # watch it converge on the same controls. SDK AE above must stay off.
+    with server.gui.add_folder("Software AE (gain-first)"):
+        swae_box = server.gui.add_checkbox(
+            "Enable software AE", initial_value=False,
+            hint="Drive exposure/gain from a centre-weighted meter, gain-first. "
+                 "Keeps exposure at its floor for a stable frame rate.")
+        swae_target = server.gui.add_slider(
+            "Target brightness", min=0.05, max=0.8, step=0.01, initial_value=0.35,
+            hint="Desired centre brightness as a fraction of full scale.")
+        swae_exp_min = server.gui.add_slider(
+            "Exposure floor (ms)", min=1.0, max=33.0, step=0.5, initial_value=5.0,
+            hint="Shortest exposure the loop prefers. With anti-flicker on, the "
+                 "actual exposure snaps to flicker-free multiples within "
+                 "[floor, cap].")
+        swae_exp_max = server.gui.add_slider(
+            "Exposure cap (ms)", min=1.0, max=50.0, step=0.5, initial_value=17.0,
+            hint="Exposure only rises toward this once gain saturates. Keep "
+                 "below 1000/fps for a stable frame rate.")
+        swae_gain_max = server.gui.add_slider(
+            "Gain cap (x)", min=1.0, max=22.0, step=0.1, initial_value=4.0,
+            hint="Max analog gain the loop will use. Lower = less noise, at the "
+                 "cost of needing more exposure/light.")
+        swae_flicker = server.gui.add_dropdown(
+            "Anti-flicker", options=("Off", "60 Hz", "50 Hz"), initial_value="60 Hz",
+            hint="Pin exposure to whole mains-light flicker cycles so indoor "
+                 "lights don't pulse/band. 60 Hz (US) → 8.33/16.67 ms; "
+                 "50 Hz (EU) → 10/20 ms. Gain handles fine brightness.")
+        swae_resp = server.gui.add_slider(
+            "Responsiveness", min=0.05, max=1.0, step=0.05, initial_value=0.25,
+            hint="Loop gain: fraction of the brightness error corrected per "
+                 "frame. Lower = calmer/slower (more damped). 1.0 tries to fully "
+                 "correct each frame and will oscillate — keep ~0.2–0.3.")
+        swae_text = server.gui.add_text("AE meter", initial_value="—", disabled=True)
 
     # -- Sensor ROI (firmware crop -> less USB bandwidth) ------------------
     # set_roi() sets a true sensor-readout window, so only the cropped region
@@ -167,12 +213,16 @@ def main():
     # last-pushed settings, so we only issue control writes on change
     pushed = {"ae": None, "exp": None, "gain": None, "speed": None}
 
-    def apply_settings(cam):
-        """Push only changed settings to the camera (avoids spamming writes)."""
+    def apply_settings(cam, skip_exp_gain=False):
+        """Push only changed settings to the camera (avoids spamming writes).
+
+        ``skip_exp_gain`` leaves exposure/gain alone — software AE drives those
+        directly, bypassing the slider quantisation that would break anti-flicker.
+        """
         if ae_box.value != pushed["ae"]:
             cam.set_ae(ae_box.value)
             pushed["ae"] = ae_box.value
-        if not ae_box.value:
+        if not ae_box.value and not skip_exp_gain:
             if exp_slider.value != pushed["exp"]:
                 cam.set_exposure_ms(exp_slider.value)
                 pushed["exp"] = exp_slider.value
@@ -197,6 +247,13 @@ def main():
             lo, hi, step = cam.gain_range()
             gain_slider.min, gain_slider.max, gain_slider.step = lo, hi, step
             pushed.update(ae=None, exp=None, gain=None, speed=None)  # force re-push
+
+            # Software-AE controller for this camera (full-scale = 12-bit 4095).
+            state["ae"] = AutoExposure(
+                lo, min(hi, swae_gain_max.value),
+                exp_min=swae_exp_min.value, exp_max=swae_exp_max.value,
+                target=swae_target.value, responsiveness=swae_resp.value,
+                flicker_hz=_flicker_hz(swae_flicker.value))
 
             # Learn the native sensor size and set up the ROI sliders at full res.
             res = cam.current_resolution()
@@ -320,11 +377,51 @@ def main():
                 time.sleep(0.05)
                 continue
 
-            apply_settings(cam)
+            # Software AE owns SDK-AE while enabled; it writes exposure/gain to the
+            # camera DIRECTLY (not via the sliders) so the slider's 0.1 ms step
+            # can't snap exposure off a flicker-free multiple (8.333 → 8.3).
+            swae_on = swae_box.value and state["ae"] is not None
+            if swae_box.value:
+                ae_box.value = False              # software and SDK AE are exclusive
+            apply_settings(cam, skip_exp_gain=swae_on)
             lin, _info = cam.grab(timeout_ms=500)   # linear uint16 RGB, GET_NEWEST
             if lin is None:
                 continue
             state["latest_linear"] = lin
+
+            if swae_on:
+                ae = state["ae"]
+                # Track live slider edits into the controller.
+                ae.target = swae_target.value
+                ae.exp_min = swae_exp_min.value
+                ae.exp_max = swae_exp_max.value
+                ae.gain_max = swae_gain_max.value
+                ae.responsiveness = swae_resp.value
+                ae.flicker_hz = _flicker_hz(swae_flicker.value)
+                # Feed the controller the EXACT last-applied values (not the
+                # rounded sliders), so its hysteresis sees the true exposure.
+                cur_exp = state["ae_exp"] if state["ae_exp"] is not None \
+                    else exp_slider.value
+                cur_gain = state["ae_gain"] if state["ae_gain"] is not None \
+                    else gain_slider.value
+                new_exp, new_gain, ae_info = ae.update(lin, cur_exp, cur_gain)
+                # apply() handles the 8↔16 ms step flash-free: it applies the
+                # light-reducing write now and defers the increasing one a couple
+                # of frames (exposure latches slower than gain), so a step-switch
+                # dims briefly instead of flashing bright. Returns the values
+                # actually in effect — feed those back next frame as cur_*.
+                state["ae_exp"], state["ae_gain"] = ae.apply(
+                    cam, new_exp, new_gain, cur_exp, cur_gain)
+                # Sliders/pushed cache follow the camera for display + clean handoff
+                # back to manual control (no spurious re-push when AE turns off).
+                exp_slider.value = round(new_exp, 2)
+                gain_slider.value = round(new_gain, 2)
+                pushed["exp"], pushed["gain"] = new_exp, new_gain
+                swae_text.value = (
+                    f"meas {ae_info['measured']:.3f}  err {ae_info['error']:+.3f}  "
+                    f"→ {new_exp:.3f}ms {new_gain:.2f}x")
+            else:
+                state["ae_exp"] = state["ae_gain"] = None   # reset for next AE run
 
             target_w = LOWRES_WIDTH if lowres_box.value else DISPLAY_WIDTH
             disp_lin = downscale(lin, target_w)

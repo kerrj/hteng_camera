@@ -80,7 +80,42 @@ from typing import Optional
 
 import numpy as np
 
-from hteng_camera import HTCamera, calibration, convert, enums, list_cameras
+from hteng_camera import HTCamera, AutoExposure, calibration, convert, enums, list_cameras
+
+
+# ---------------------------------------------------------------------------
+# Voice notifications (macOS say, no-op elsewhere)
+# ---------------------------------------------------------------------------
+
+def _speak(msg: str) -> None:
+    """Fire-and-forget TTS via macOS `say`. No-op on other platforms."""
+    if platform.system() == "Darwin":
+        subprocess.Popen(["say", msg],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _elapsed_str(seconds: float) -> str:
+    """'30 seconds', '1 minute', '1 minute 30', '2 minutes', etc."""
+    total = int(round(seconds))
+    m, s = divmod(total, 60)
+    if m == 0:
+        return f"{s} seconds"
+    label = "minute" if m == 1 else "minutes"
+    return f"{m} {label}" if s == 0 else f"{m} {label} {s}"
+
+
+def _start_announcer(stop: threading.Event, interval: float = 30.0) -> None:
+    """Daemon thread that speaks the elapsed time every ``interval`` seconds."""
+    t0 = time.monotonic()
+
+    def loop():
+        next_tick = t0 + interval
+        while not stop.wait(timeout=max(0.0, next_tick - time.monotonic())):
+            elapsed = time.monotonic() - t0
+            _speak(_elapsed_str(elapsed))
+            next_tick += interval
+
+    threading.Thread(target=loop, daemon=True, name="hteng-announcer").start()
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +331,7 @@ def _encode_loop_stereo(
     fps: int,
     transfer: str,
     sync_csv: Path,
+    ae: Optional[dict] = None,
 ) -> None:
     """At each 1/fps deadline, encode the freshest LEFT frame and the RIGHT frame
     whose timestamp is nearest to it, writing one frame to each ffmpeg pipe.
@@ -317,6 +353,17 @@ def _encode_loop_stereo(
 
     The timing model (monotonic deadline advanced one interval per tick,
     coarse-sleep + 1 ms spin) is exactly record.py's.
+
+    Auto-exposure
+    ~~~~~~~~~~~~~
+    If ``ae`` is given (``{"ctrl": AutoExposure, "cams": [left_cam, right_cam],
+    "exp": ms, "gain": x}``), each *fresh* left reference frame is metered and the
+    SAME exposure/gain is applied to BOTH cameras via :meth:`AutoExposure.apply`.
+    Metering the master and copying to the slave keeps the pair photometrically
+    matched (essential for stereo), and the anti-flicker exposure makes that match
+    hold even though the two sensors free-run out of phase — a flicker-free
+    exposure integrates whole 120 Hz cycles, so both collect equal light
+    regardless of phase. We meter the raw Bayer plane (cheap, pre-demosaic).
     """
     interval = 1.0 / fps
     deadline = time.monotonic() + interval
@@ -348,6 +395,20 @@ def _encode_loop_stereo(
                 if match is None:
                     continue                     # right not warmed up yet
                 t_right, bayer_right = match
+
+                # Software AE: meter the master's raw Bayer, apply the same
+                # exposure/gain to both cameras (flash-free, anti-flicker on).
+                if ae is not None:
+                    ctrl = ae["ctrl"]
+                    new_exp, new_gain, _ = ctrl.update(
+                        bayer_left, ae["exp"], ae["gain"])
+                    try:
+                        ae["exp"], ae["gain"] = ctrl.apply(
+                            ae["cams"], new_exp, new_gain, ae["exp"], ae["gain"])
+                    except Exception:
+                        pass                     # a wedged control write must not
+                                                 # stall the encode/sync loop
+
                 out_left = _encode(bayer_left, left["cv_code"], transfer, left["wb"])
                 out_right = _encode(bayer_right, right["cv_code"], transfer, right["wb"])
                 last_pair = (out_left, out_right)
@@ -481,6 +542,20 @@ def _write_manifest(out_dir: Path, args, encoder: str, left: dict, right: dict) 
         "transfer": args.transfer,
         "demosaic": args.demosaic,
         "roi_height_fraction": args.roi_height,
+        "auto_exposure": (
+            {
+                "enabled": True,
+                "target": args.ae_target,
+                "exposure_min_ms": args.ae_exp_min,
+                "exposure_max_ms": max(args.ae_exp_max, args.ae_exp_min),
+                "gain_max_x": args.ae_gain_max,
+                "flicker_hz": args.ae_flicker_hz,
+                "note": "Exposure/gain were driven live (metered on LEFT, applied "
+                        "to both). The per-camera exposure_ms/gain_x below are the "
+                        "STARTING values, not constant for the whole recording.",
+            }
+            if args.auto_exposure else {"enabled": False}
+        ),
         "files": {
             "left": "left.mp4",
             "right": "right.mp4",
@@ -823,10 +898,52 @@ def main() -> None:
         "--exposure-ms", type=float, default=5.0,
         help="Exposure time in ms. Must be < 1000/fps or both cameras run below "
              "the target rate and frames are duplicated. A short exposure keeps "
-             "the sensors running fast, which tightens the stereo pairing. AE is "
-             "disabled for stable, matched fps.",
+             "the sensors running fast, which tightens the stereo pairing. With "
+             "auto-exposure (the default) this is the STARTING exposure; with "
+             "--no-auto-exposure it is held fixed.",
     )
     ap.add_argument("--gain", type=float, default=3.0, help="Analog gain multiplier")
+    ap.add_argument(
+        "--no-auto-exposure", dest="auto_exposure", action="store_false",
+        help="Disable software auto-exposure and hold exposure/gain fixed at "
+             "--exposure-ms / --gain for the whole recording. By DEFAULT, AE is "
+             "on: it meters the LEFT (master) frame and applies the SAME "
+             "exposure+gain to BOTH cameras so the pair stays photometrically "
+             "matched, gain-first (keeps exposure low for a stable frame rate) "
+             "with anti-flicker. --exposure-ms / --gain then set the starting "
+             "point and the AE knobs (--ae-*) tune it.",
+    )
+    ap.set_defaults(auto_exposure=True)
+    ap.add_argument(
+        "--ae-target", type=float, default=0.35,
+        help="Software AE target brightness, 0..1 (centre-weighted, fraction of "
+             "full scale). Only used with --auto-exposure.",
+    )
+    ap.add_argument(
+        "--ae-exp-min", type=float, default=5.0,
+        help="Software AE exposure floor (ms). The loop prefers this; with "
+             "anti-flicker it snaps to flicker-free multiples within "
+             "[floor, --ae-exp-max]. Only used with --auto-exposure.",
+    )
+    ap.add_argument(
+        "--ae-exp-max", type=float, default=17.0,
+        help="Software AE exposure cap (ms). The loop only lengthens toward this "
+             "once gain saturates. Default 17 ms spans the 8.33/16.67 ms "
+             "flicker-free steps at 60 Hz. Keep < 1000/fps for a stable frame "
+             "rate. Only used with --auto-exposure.",
+    )
+    ap.add_argument(
+        "--ae-gain-max", type=float, default=4.0,
+        help="Software AE max analog gain (x). Lower = less noise. Only used "
+             "with --auto-exposure.",
+    )
+    ap.add_argument(
+        "--ae-flicker-hz", type=float, default=60.0,
+        help="Mains frequency for anti-flicker (60 US / 50 EU), 0 to disable. "
+             "Pins exposure to whole light-flicker cycles so indoor lights don't "
+             "pulse and the unsynced stereo pair stays matched. Only used with "
+             "--auto-exposure.",
+    )
     ap.add_argument(
         "--demosaic", choices=list(enums.DEMOSAIC_QUALITY), default="ea",
         help="Demosaic algorithm. 'ea' (edge-aware, default) suppresses the "
@@ -987,6 +1104,34 @@ def main() -> None:
         f"(asked {args.exposure_ms:.1f} ms / {args.gain:.2f}x)"
     )
 
+    # ── Software auto-exposure (optional) ────────────────────────────────────
+    # One controller, metering the LEFT master and applying the same exposure/gain
+    # to BOTH cameras so the stereo pair stays photometrically matched. The loop
+    # floors at --ae-exp-min and only lengthens toward --ae-exp-max once gain
+    # saturates. The starting operating point is what the cameras latched on open.
+    ae = None
+    if args.auto_exposure:
+        gain_lo, gain_hi, _ = cam_left.gain_range()
+        exp_cap = max(args.ae_exp_max, args.ae_exp_min)
+        ctrl = AutoExposure(
+            gain_lo, min(gain_hi, args.ae_gain_max),
+            exp_min=args.ae_exp_min, exp_max=exp_cap,
+            target=args.ae_target, flicker_hz=args.ae_flicker_hz,
+        )
+        steps = ctrl._exposure_steps()
+        if args.ae_flicker_hz and len(steps) == 1 and exp_cap < 1000.0 / (2 * args.ae_flicker_hz):
+            print(f"[warn] AE: no flicker-free exposure fits [{args.ae_exp_min:.1f}, "
+                  f"{exp_cap:.1f}] ms at {args.ae_flicker_hz:g} Hz — raise "
+                  f"--exposure-ms to >= {1000.0/(2*args.ae_flicker_hz):.2f} ms to "
+                  f"engage anti-flicker. Running with exposure pinned at the floor.")
+        ae = {"ctrl": ctrl, "cams": [cam_left, cam_right],
+              "exp": exp_left, "gain": gain_left}
+        # Start the slave from the same operating point as the master.
+        ctrl.apply(cam_right, exp_left, gain_left, exp_right, gain_right)
+        print(f"[info] AE on: target {args.ae_target:.2f}, gain ≤ "
+              f"{min(gain_hi, args.ae_gain_max):.1f}x, exposure steps {steps} ms "
+              f"({args.ae_flicker_hz:g} Hz anti-flicker); metering LEFT → both.")
+
     # ── Copy calibration JSONs + write the recording manifest ────────────────
     _copy_calibration(out_dir, serial_left, serial_right)
     _write_manifest(
@@ -1026,12 +1171,14 @@ def main() -> None:
     ]
     enc_thread = threading.Thread(
         target=_encode_loop_stereo,
-        args=(left, right, stop, args.fps, args.transfer, sync_csv),
+        args=(left, right, stop, args.fps, args.transfer, sync_csv, ae),
         name="hteng-encode",
     )
     for t in cap_threads:
         t.start()
     enc_thread.start()
+    _speak("recording")
+    _start_announcer(stop)
 
     # ── Wait for duration / Ctrl+C ───────────────────────────────────────────
     # Handle SIGINT ourselves so Ctrl+C tears down in the SAME order as the
@@ -1062,12 +1209,15 @@ def main() -> None:
             if interrupted.is_set():
                 stopped_intentionally = True
                 print()                                # newline after ^C
+                _speak("stopped")
                 break
             if t_end is not None and time.monotonic() >= t_end:
                 stopped_intentionally = True
+                _speak("done")
                 break
             if proc_left.poll() is not None or proc_right.poll() is not None:
                 print("[warn] an ffmpeg exited early — stopping.")
+                _speak("error")
                 break
             time.sleep(0.1)
     finally:
@@ -1101,8 +1251,10 @@ def main() -> None:
         print(f"[info] Saved → {out_right}")
         print(f"[info] Sync log → {sync_csv}")
         _report_sync(sync_csv)
+        _speak("saved")
     else:
         print(f"[warn] ffmpeg exited with codes {rets} — output may be incomplete.")
+        _speak("save failed")
 
 
 if __name__ == "__main__":
