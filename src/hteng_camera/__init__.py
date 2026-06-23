@@ -24,6 +24,7 @@ Pair their frames in software via ``cam.reset_timestamp()`` + ``info["time"]``.
 """
 
 from . import calibration, convert, enums
+from .auto_exposure import AutoExposure
 from .calibration import (
     CameraCalibration, ColorCalibration, Intrinsics, StereoCalibration,
 )
@@ -37,7 +38,7 @@ from .enums import (
 __version__ = "0.1.0"
 
 __all__ = [
-    "HTCamera", "list_cameras", "calibration", "convert", "enums",
+    "HTCamera", "list_cameras", "AutoExposure", "calibration", "convert", "enums",
     "set_num_threads",
     "CameraCalibration", "Intrinsics", "ColorCalibration", "StereoCalibration",
     "FRAME_SPEED_LOW", "FRAME_SPEED_NORMAL", "FRAME_SPEED_HIGH", "FRAME_SPEED_SUPER",
