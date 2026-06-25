@@ -94,7 +94,7 @@ def main():
         WiLorHandPose3dEstimationPipeline)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32 if args.fp32 else torch.float16
-    pipe = WiLorHandPose3dEstimationPipeline(device=dev, dtype=dtype)
+    pipe = WiLorHandPose3dEstimationPipeline(device=dev, dtype=dtype, verbose=False)
 
     cap = cv2.VideoCapture(args.video)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -121,8 +121,7 @@ def main():
         if not ok:
             print(f"frame {fi}: read failed"); continue
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        outs = pipe.predict(rgb, hand_conf=args.conf) \
-            if "hand_conf" in pipe.predict.__code__.co_varnames else pipe.predict(rgb)
+        outs = pipe.predict(rgb, hand_conf=args.conf)
         hands = [to_record(o) for o in outs]
         jsonl.write(json.dumps({"frame": fi, "width": w, "height": h,
                                 "hands": hands}) + "\n")
