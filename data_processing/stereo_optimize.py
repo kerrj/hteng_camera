@@ -142,9 +142,9 @@ def main():
         confL.append(np.ones(21, np.float32))   # TODO: real per-kp confidence
         confR.append(np.ones(21, np.float32))
     n = len(frames)
-    baseline = rows[0]["hands"][0]["bbox"] and None  # placeholder
+    assert n > 0, "no frames with a detection in range"
     baseline = json.loads(open(args.jsonl).readline())["baseline"]
-    out_size = rows[0]["hands"][0]["out_size"] if rows[0]["hands"] else 256
+    out_size = next((h["out_size"] for d in rows for h in d["hands"]), 256)
     print(f"hand={args.hand}: {n} frames with a detection")
 
     data = {
