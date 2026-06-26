@@ -144,6 +144,16 @@ def run_chunk(pipe, dtype, calib, frames_l_u8, frames_r_u8, frame_idxs,
             "kp_right": kpR.tolist(),
             "keypoints_2d": kpL_fish.tolist(),
             "keypoints_3d": oL["pred_keypoints_3d"][0].tolist(),
+            # MANO params (left-eye estimate) — init + prior for stereo opt.
+            # global_orient/hand_pose are axis-angle in the rectified LEFT-crop
+            # camera frame (postprocess already undid the left-hand flip).
+            "global_orient": np.asarray(oL["global_orient"]).reshape(-1).tolist(),
+            "hand_pose": np.asarray(oL["hand_pose"]).reshape(-1).tolist(),
+            "betas": np.asarray(oL["betas"]).reshape(-1).tolist(),
+            # Rv_l: rectified-crop-cam -> left-fisheye-cam rotation (cols=axes).
+            # Maps each hand's per-frame crop frame into the common left-fisheye
+            # frame for temporal coupling.
+            "Rv_l": geo["Rv_l"].cpu().numpy().tolist(),
         })
 
     for li, fi in enumerate(frame_idxs):
