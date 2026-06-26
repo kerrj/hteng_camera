@@ -221,3 +221,28 @@ can't reproject as the bad-eye mess, so the joint fit (dominated by the good eye
 + temporal smoothing should reject these. Plan: validate optimizer on a
 good-agreement window (~frame 3000) first; use left/right (or
 distance-to-temporal) disagreement as a robust per-frame/per-kp weight.
+
+### Stereo opt — SOLVED (2026-06-25 cont'd)
+
+Single-frame 2-view fit was clean (2px) but the multi-frame solve blew up to
+NaN / 25 m depths. **Cause: outlier detections, not the solver.** Bad per-eye
+WiLoR poses create huge reprojection residuals that dominate the LS cost.
+
+**Fix (in `stereo_optimize.py`):** the crops are stereo-RECTIFIED, so rows are
+epipolar lines — gate each keypoint by `|y_left - y_right|` (`--dy-thresh`,
+default 8px); drop a whole hand if `< --min-inliers` (default 12) survive; init
+triangulation over inliers only; Huber on the rest. Result on frames 2850-3150
+(right hand): 111/256 frames kept (145 dropped, 55% of kps masked — these
+detections are genuinely noisy), **inlier reproj ~2px, depth median 0.543 m
+[0.47,0.66], median frame-to-frame jump 16.6 mm**.
+
+**Solver:** jaxls `conjugate_gradient` (matrix-free block-sparse, the intended
+solver for large problems — see jaxls sparse-matrices design doc). `dense_cholesky`
+only for tiny windows; **do NOT pursue `cholmod`/scikit-sparse** — CG handles the
+sparsity natively and the sksparse install rabbit hole gutted the env once
+(see [[eyeball211-no-conda]]). LM trust region required (plain Gauss-Newton
+diverges to NaN). It IS one joint factor-graph solve over all frames (reproj
+into both eyes + temporal coupling), which is the efficient design.
+
+TODO: firmer temporal weight to suppress the residual ~276mm spikes; run full
+video; lift joints_3d_cam back to a world/head frame; then head pose.
