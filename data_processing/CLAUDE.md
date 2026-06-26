@@ -35,6 +35,44 @@ Stereo fisheye recording. On chungus at `~/hteng_camera/long-test1/`.
 Package: [WiLoR-mini](https://github.com/warmshao/WiLoR-mini), `predict()` API,
 auto-downloads weights + MANO from HuggingFace. See `install_wilor.sh`.
 
+**We use an EDITABLE clone** at `~/WiLoR-mini` on chungus (base commit
+`ebec42f`), `pip install -e . --no-deps`, with `wilor_mini_speedups.patch`
+applied — so we can edit the source. If you `git pull` upstream, reapply the
+patch (or re-export it).
+
+### Performance — what was slow and why (investigated 2026-06-25)
+
+Raw pipeline ran at **3.5 fps with the GPU at 0%** — fully CPU-bound. Profiled:
+
+| stage | time | notes |
+|---|---|---|
+| cv2 decode + cvtColor | ~10 ms | NOT the bottleneck |
+| YOLO detector | ~27 ms | GPU |
+| **skimage `gaussian` (orig)** | **~135 ms/hand** | full-frame blur on the 5MP image, fired on ~96% of hands |
+| WiLoR ViT-Huge backbone | ~53 ms | GPU, compute-dominant |
+| GPU<->CPU transfers | ~1.7 ms | negligible |
+
+Root cause: WiLoR-mini anti-alias-blurs the **entire 2448×2048 frame** once per
+detected hand before cropping (`downsampling_factor > 1.1` → true for our
+large/close hands). **Fix in the patch:** swap skimage's `gaussian` for an
+equivalent `cv2.GaussianBlur` drop-in (same separable-Gaussian math, ~4× faster
+on a 5MP frame). Result: **3.5 → ~11.5 fps** steady-state (full run ~10 min for
+7007 frames).
+
+Things tried that did NOT help (don't redo):
+- **`torch.compile(backbone)`**: *slower* (2.6 fps). Per-frame crop batch size
+  varies (1 vs 2 hands) → constant recompiles. Left as opt-in kwarg
+  `compile_backbone=True` (default off); would need `dynamic=True` or fixed-size
+  padded batches to pay off. Marginal anyway since backbone is already fp16.
+- **torchcodec GPU decode**: *slower* per frame (18 ms vs cv2's 10.6 ms) for our
+  random/sequential access; and decode isn't the limiter (cv2 decodes at 94 fps
+  vs the 11.5 fps pipeline). Only worth revisiting if we go decode-only or batch
+  many frames' crops through the ViT at once.
+- **no_grad**: already handled — `predict`/`predict_with_bboxes` carry
+  `@torch.no_grad()`.
+
+TF32 (`set_float32_matmul_precision('high')`) is enabled in the patch (free).
+
 Installed into `eyeball211` (all `--no-deps`): `wilor_mini` (git), `roma`,
 `yacs`, `smplx==0.1.28`, `ultralytics`; plus `dill` (auto-installed by
 ultralytics to load the YOLO `detector.pt`).
