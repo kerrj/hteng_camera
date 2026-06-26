@@ -77,8 +77,11 @@ def mano_forward(M, global_orient, hand_pose, betas):
     v_h = jnp.concatenate([v_posed, jnp.ones((778, 1))], axis=1)                # (778,4)
     v_skinned = jnp.einsum("vab,vb->va", T, v_h)[:, :3]                         # (778,3)
 
-    # 6) joints: 16 regressed + 5 fingertip vertices, remap to OpenPose 21
-    j16 = M["J_regressor"] @ v_skinned                                          # (16,3)
+    # 6) joints: the 16 MANO joints are the rest-pose joints J carried by the
+    #    LBS transforms G (NOT re-regressed from posed verts); fingertips are
+    #    posed vertices. Remap to OpenPose 21.
+    J_h = jnp.concatenate([J, jnp.ones((16, 1))], axis=1)                       # (16,4)
+    j16 = jnp.einsum("iab,ib->ia", G_rel, J_h)[:, :3]                          # (16,3)
     tips = v_skinned[M["fingertips"]]                                          # (5,3)
     j21 = jnp.concatenate([j16, tips], axis=0)[M["joint_map"]]                  # (21,3)
     # root-relative (wilor pred_keypoints_3d are centred on the wrist joint 0)
