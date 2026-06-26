@@ -189,3 +189,35 @@ undistorted pinhole crops toward each hand.
 
 - Keep all scripts/files for this work under `data_processing/`.
 - Record any new package added to `eyeball211` in `README.md` + here.
+
+### Stereo MANO optimization (step 2) — status + key findings (2026-06-25)
+
+Built: `mano_jax.py` (JAX MANO LBS forward, validated **0.035 mm** vs torch
+smplx), `stereo_optimize.py` (full-track jaxls bundle adjustment),
+`stereo_optimize_oneframe.py` (single-frame before/after viz). jaxls works on
+CPU (jax 0.9.2); toy 2000-var temporal solve in ~1.2 s.
+
+**CAMERA GOTCHA (important):** WiLoR's `pred_keypoints_2d` are produced by
+projecting its 3D joints with a *weak-perspective* focal `scaled_focal_length =
+FOCAL_LENGTH(5000)/IMAGE_SIZE * img_size.max()`. When we postprocess in CROP
+coords (img_size=256) that focal is **5000**, NOT the crop's true pinhole
+`f_px` (~550). The 2D *pixel positions* are still valid in the crop, but the
+implied depth/scale is WiLoR's monocular guess — do not mix WiLoR's
+`pred_cam_t` depth with the true-`f_px` geometry. For the optimizer, project the
+metric MANO hand with the TRUE `f_px` and fit WiLoR's 2D pixels.
+
+**Diagnosis of poor one-frame fits — it's detection quality, not geometry.**
+Verified per-frame by the epipolar disagreement of WiLoR's own keypoints
+(|dy| between the two rectified crops; images are rectified so |dy| should be
+~0):
+  - frame 3000: |dy| ~3-7 px → depths 0.48/0.56 m (clean, sensible).
+  - ORB *image-feature* disparity is always clean (|dy|~7px → 0.89 m), proving
+    the rectification/rendering is correct.
+  - frames 4850/5500/6750: WiLoR keypoint |dy| = 32-53 px → nonsense depths
+    (44/80/99 m). Visual: one eye's crop is well-framed but WiLoR poses it
+    collapsed/wrong. Pure monocular ViT pose noise on individual crops.
+So the stereo+temporal+Huber optimization is exactly the fix: a single 3D hand
+can't reproject as the bad-eye mess, so the joint fit (dominated by the good eye)
++ temporal smoothing should reject these. Plan: validate optimizer on a
+good-agreement window (~frame 3000) first; use left/right (or
+distance-to-temporal) disagreement as a robust per-frame/per-kp weight.
