@@ -114,6 +114,8 @@ def main():
     ap.add_argument("--w-temporal", type=float, default=10.0)
     ap.add_argument("--huber-px", type=float, default=10.0)
     ap.add_argument("--iters", type=int, default=30)
+    ap.add_argument("--frame-min", type=int, default=None)
+    ap.add_argument("--frame-max", type=int, default=None)
     args = ap.parse_args()
 
     M = MJ.load_mano(args.mano)
@@ -123,6 +125,10 @@ def main():
     rows = [json.loads(l) for l in open(args.jsonl)]
     frames, pose0, beta0, kpL, kpR, fpx, confL, confR = ([] for _ in range(8))
     for d in rows:
+        if args.frame_min is not None and d["frame"] < args.frame_min:
+            continue
+        if args.frame_max is not None and d["frame"] > args.frame_max:
+            continue
         cand = [h for h in d["hands"] if h["is_right"] == want_right]
         if not cand:
             continue
@@ -179,6 +185,24 @@ def main():
     print(f"solved {n} frames in {time.time()-t:.1f}s")
 
     pose = np.array(sol[PoseVar]); beta = np.array(sol[BetaVar]); trans = np.array(sol[TransVar])
+
+    # before/after reprojection error against WiLoR's 2D, in BOTH eyes
+    def reproj_px(pose_i, beta_i, t_i, fpx_i, bx):
+        j = np.array(MJ.mano_forward(M, jnp.asarray(pose_i[:3]),
+                                     jnp.asarray(pose_i[3:]), jnp.asarray(beta_i)))
+        cam = j + t_i[None] - np.array([bx, 0, 0])[None]
+        c = (out_size - 1) / 2.0
+        return np.stack([fpx_i * cam[:, 0] / cam[:, 2] + c,
+                         fpx_i * cam[:, 1] / cam[:, 2] + c], 1)
+    errL = errR = 0.0
+    kpL_np = np.array(data["kpL"]); kpR_np = np.array(data["kpR"]); fpx_np = np.array(fpx)
+    for i in range(n):
+        pL = reproj_px(pose[i], beta[i], trans[i], fpx_np[i], 0.0)
+        pR = reproj_px(pose[i], beta[i], trans[i], fpx_np[i], baseline)
+        errL += np.linalg.norm(pL - kpL_np[i], axis=1).mean()
+        errR += np.linalg.norm(pR - kpR_np[i], axis=1).mean()
+    print(f"AFTER reproj err (true f_px): L={errL/n:.2f}px  R={errR/n:.2f}px")
+
     with open(args.out, "w") as f:
         for i, fr in enumerate(frames):
             joints = np.array(MJ.mano_forward(M, jnp.asarray(pose[i][:3]),
@@ -190,7 +214,9 @@ def main():
                 "trans": trans[i].tolist(), "depth_m": float(trans[i][2]),
                 "joints_3d_cam": j_world.tolist(),  # rectified-left-crop frame
             }) + "\n")
-    print(f"wrote {args.out}; median depth = {np.median(trans[:,2]):.3f} m")
+    d_arr = trans[:, 2]
+    print(f"wrote {args.out}; depth median={np.median(d_arr):.3f}m "
+          f"10-90%=[{np.percentile(d_arr,10):.3f},{np.percentile(d_arr,90):.3f}]m")
 
 
 if __name__ == "__main__":
