@@ -17,3 +17,6 @@ snap_*.png
 # keep the raw-image provenance bundles (session folders) out of git.
 calib_session_*/
 wb_measurement_*
+
+# WiLoR hand-pose outputs (large, regenerable on chungus)
+data_processing/out/

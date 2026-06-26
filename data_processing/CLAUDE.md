@@ -73,6 +73,46 @@ Things tried that did NOT help (don't redo):
 
 TF32 (`set_float32_matmul_precision('high')`) is enabled in the patch (free).
 
+### Batched, fully-on-GPU pipeline — `wilor_hands_batched.py` (~20x total)
+
+`wilor_hands.py` (per-frame) tops out at ~11.5 fps. `wilor_hands_batched.py`
+reaches **~72 fps single-eye / ~55 fps both-eyes** (full 7006-frame video, both
+eyes, in ~126 s) by keeping everything on the GPU:
+
+- **Decode**: torchcodec `VideoDecoder(device="cuda")` on the **8-bit stereo**
+  `left_stereo_8bit.mp4` (HEVC 8-bit decodes on NVDEC at ~217 fps; the 10-bit
+  per-eye files do NOT — yuv420p10le falls off the fast path, ~55 fps). One
+  decode yields both eyes (slice halves on-GPU).
+- **Detect**: YOLO on a **GPU tensor batch** (`detect_gpu`). ultralytics
+  letterboxes numpy/list inputs on CPU (~30 ms/frame — was the bottleneck);
+  feeding a pre-resized GPU tensor (dims multiple of 32, pad 114/255) is
+  ~2.8 ms/frame. Boxes come back in letterbox coords → divide by scale.
+- **Crop**: `gpu_crop` — batched `grid_sample`/`TF.resize(antialias=True)`
+  instead of WiLoR's per-hand full-frame cv2 blur+warp (~0.4 ms vs ~31 ms).
+- **ViT**: gather ALL crops across the 64-frame chunk → run at batch 16-32
+  (~16x faster per crop than batch 1).
+
+Per-stage (single eye): decode 4.8 + yolo 5.4 + crop 0.4 + vit ~4 ms.
+
+**Accuracy notes / caveats:**
+- GPU crop vs CPU patch: <2 mm 3D-keypoint agreement, except extreme close-ups
+  (~9 mm; pinhole crops will supersede these anyway).
+- GPU-YOLO vs numpy-YOLO: identical on clear hands; differs only on
+  marginal/distorted peripheral hands (visually inspected + user-approved).
+- Detector sometimes returns 3-5 "hands" (false positives) though there's one
+  person — filter to max-2 / higher conf downstream.
+
+Output: `data_processing/out/stereo/{left,right}/hands.jsonl` (same schema).
+Detection coverage on long-test1 left: 64% of frames ≥1 hand, 31% both,
+median bbox ~262 px (~11% of frame width).
+
+### Viz — `render_hands_video.py`
+
+Renders an annotated overlay mp4 from a `hands.jsonl` + source video (slices a
+stereo half with `--eye`). Output uses mp4v; re-encode with ffmpeg
+(`~/miniconda3/envs/eyeball211/bin/ffmpeg -i in.mp4 -c:v libx264 -crf 23 ...`)
+before transferring — mp4v is ~2.5x larger than h264.
+
 Installed into `eyeball211` (all `--no-deps`): `wilor_mini` (git), `roma`,
 `yacs`, `smplx==0.1.28`, `ultralytics`; plus `dill` (auto-installed by
 ultralytics to load the YOLO `detector.pt`).
