@@ -246,3 +246,16 @@ into both eyes + temporal coupling), which is the efficient design.
 
 TODO: firmer temporal weight to suppress the residual ~276mm spikes; run full
 video; lift joints_3d_cam back to a world/head frame; then head pose.
+
+### Before/after + outlier viz — `render_stereo_compare.py`
+
+2x2 panel video (L/R eyes x BEFORE/AFTER). BEFORE = WiLoR raw kp (epipolar
+outliers, |dy|>thresh, drawn RED); AFTER = optimized 3D MANO reprojected into
+both eyes (consistent by construction) with depth label; "REJECTED (n inl)"
+banner on dropped frames. Reads pinhole hands.jsonl (geometry+kp) + stereo3d
+hands3d.jsonl (optimized joints_3d_cam); re-renders crops from video.
+First-30s results: LEFT hand 276/432 kept @0.67m, RIGHT 173/563 kept @0.53m
+(right is noisier). Outlier rejection visibly correct — motion-blurred/oof
+hands drop to ~6 inliers and are rejected. NOTE the optimizer can run two hands
+in one shell but chaining two `nohup ... &` after one `conda activate` fails for
+the 2nd (subshell loses activation) — launch separately.
