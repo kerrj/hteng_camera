@@ -118,14 +118,26 @@ def main():
     ap.add_argument("--frame-max", type=int, default=None)
     ap.add_argument("--linear", default="conjugate_gradient",
                     help="jaxls linear solver: conjugate_gradient | dense_cholesky | cholmod")
+    ap.add_argument("--dy-thresh", type=float, default=8.0,
+                    help="max |y_left-y_right| (px) for a keypoint to be an inlier")
+    ap.add_argument("--min-inliers", type=int, default=12,
+                    help="drop a hand if fewer than this many keypoints survive")
     args = ap.parse_args()
 
     M = MJ.load_mano(args.mano)
     want_right = 1 if args.hand == "right" else 0
 
-    # Gather the single-best hand of the requested handedness per frame.
+    # Gather the single-best hand of the requested handedness per frame, and
+    # build robustness masks. The crops are stereo-RECTIFIED, so rows are
+    # epipolar lines: a keypoint whose left/right y disagree by more than
+    # --dy-thresh px is a bad cross-eye match → mask it out. Frames with fewer
+    # than --min-inliers surviving keypoints are dropped entirely (one eye's
+    # detection failed). This is the key fix for outliers blowing up the solve.
     rows = [json.loads(l) for l in open(args.jsonl)]
-    frames, pose0, beta0, kpL, kpR, fpx, confL, confR = ([] for _ in range(8))
+    frames, pose0, beta0, kpL, kpR, fpx, valid = ([] for _ in range(7))
+    n_dropped_frame = 0
+    n_masked_kp = 0
+    n_kp_total = 0
     for d in rows:
         if args.frame_min is not None and d["frame"] < args.frame_min:
             continue
@@ -135,16 +147,29 @@ def main():
         if not cand:
             continue
         h = max(cand, key=lambda x: (x["bbox"][2] - x["bbox"][0]))  # largest bbox
+        kL = np.array(h["kp_left"], np.float32)
+        kR = np.array(h["kp_right"], np.float32)
+        dy = np.abs(kL[:, 1] - kR[:, 1])           # epipolar deviation per kp
+        disp = kL[:, 0] - kR[:, 0]                 # must be positive (left of right)
+        v = (dy < args.dy_thresh) & (disp > 0.5)   # per-keypoint inlier mask
+        n_kp_total += 21
+        n_masked_kp += int(21 - v.sum())
+        if v.sum() < args.min_inliers:             # whole-hand detection failure
+            n_dropped_frame += 1
+            continue
         frames.append(d["frame"])
         pose0.append(np.array(h["global_orient"] + h["hand_pose"], np.float32))
         beta0.append(np.array(h["betas"], np.float32))
-        kpL.append(np.array(h["kp_left"], np.float32))
-        kpR.append(np.array(h["kp_right"], np.float32))
+        kpL.append(kL)
+        kpR.append(kR)
         fpx.append(h["f_px"])
-        confL.append(np.ones(21, np.float32))   # TODO: real per-kp confidence
-        confR.append(np.ones(21, np.float32))
+        valid.append(v.astype(np.float32))
     n = len(frames)
-    assert n > 0, "no frames with a detection in range"
+    assert n > 0, "no frames survived robust filtering"
+    confL = confR = [np.ones(21, np.float32)] * n  # placeholder per-kp confidence
+    print(f"hand={args.hand}: {n} frames kept; dropped {n_dropped_frame} "
+          f"(too few inliers); masked {n_masked_kp}/{n_kp_total} keypoints "
+          f"(|dy|>{args.dy_thresh}px)")
     baseline = json.loads(open(args.jsonl).readline())["baseline"]
     out_size = next((h["out_size"] for d in rows for h in d["hands"]), 256)
     print(f"hand={args.hand}: {n} frames with a detection")
@@ -154,8 +179,8 @@ def main():
         "beta0": jnp.asarray(np.stack(beta0)),
         "kpL": jnp.asarray(np.stack(kpL)),
         "kpR": jnp.asarray(np.stack(kpR)),
-        "validL": jnp.ones((n, 21)),
-        "validR": jnp.ones((n, 21)),
+        "validL": jnp.asarray(np.stack(valid)),
+        "validR": jnp.asarray(np.stack(valid)),
         "confL": jnp.asarray(np.stack(confL)),
         "confR": jnp.asarray(np.stack(confR)),
         "f_px": jnp.asarray(np.array(fpx, np.float32)),
@@ -166,10 +191,14 @@ def main():
     costs, fids = make_costs(M, data, args.w_prior_pose, args.w_prior_beta,
                              args.w_temporal, args.huber_px)
 
-    # init: WiLoR pose/betas; translation from per-frame median triangulation
-    disp = (data["kpL"][:, :, 0] - data["kpR"][:, :, 0])
-    disp = jnp.clip(disp, 1.0, None)
-    z0 = jnp.median(data["f_px"][:, None] * baseline / disp, axis=1)  # (n,)
+    # init: WiLoR pose/betas; translation from per-frame triangulation over the
+    # INLIER keypoints only (masked disparities skew the median otherwise).
+    disp = jnp.clip(data["kpL"][:, :, 0] - data["kpR"][:, :, 0], 1.0, None)
+    z_per_kp = data["f_px"][:, None] * baseline / disp           # (n,21)
+    vmask = data["validL"] > 0.5
+    z_masked = jnp.where(vmask, z_per_kp, jnp.nan)
+    z0 = jnp.nanmedian(z_masked, axis=1)                        # (n,)
+    z0 = jnp.nan_to_num(z0, nan=0.5)
     # back-project the crop centre at z0 → x,y (centre ray is ~optical axis)
     t_init = jnp.stack([jnp.zeros(n), jnp.zeros(n), z0], axis=1)
 
