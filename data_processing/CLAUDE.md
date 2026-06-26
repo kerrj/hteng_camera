@@ -171,8 +171,12 @@ undistorted pinhole crops toward each hand.
    GOTCHA: WiLoR flips LEFT hands to look right-handed — flip the crop before the
    ViT, and `postprocess` already un-flips the output. Do NOT also manually
    un-flip the keypoints (double-flip corrupts left hands only).
-   TODO: wire into the batched runner (batch all hands' crops through one ViT
-   call) + decide a policy (always pinhole? only for peripheral hands?).
+   **Batched runner DONE**: `wilor_hands_pinhole.py` — detect on left eye, render
+   the rectified L+R pinhole pair per hand, batch BOTH eyes through one ViT,
+   ~32 fps (2x ViT for stereo; full video ~4 min). Output `hands.jsonl` adds
+   `kp_left`/`kp_right` (rectified crop px), `f_px`, `out_size`, `baseline`.
+   Quality vs raw crop for *hand pose*: ~the same (user verdict) — the point of
+   pinhole is the rectified views for depth, not better keypoints.
 2. **Stereo depth for hands** — match hands across left/right and recover metric
    depth. User's preferred approach: a **mesh/pose optimization** that optimizes
    the hand's 3D position (and pose) to fit *both* sets of 2D keypoints given
