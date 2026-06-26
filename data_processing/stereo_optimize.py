@@ -116,6 +116,8 @@ def main():
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--frame-min", type=int, default=None)
     ap.add_argument("--frame-max", type=int, default=None)
+    ap.add_argument("--linear", default="conjugate_gradient",
+                    help="jaxls linear solver: conjugate_gradient | dense_cholesky | cholmod")
     args = ap.parse_args()
 
     M = MJ.load_mano(args.mano)
@@ -184,7 +186,7 @@ def main():
     # NaN here, and the default CG linear solver fits poorly; LM + direct solve
     # converges to ~2px reprojection.
     sol = problem.solve(init, trust_region=jaxls.TrustRegionConfig(),
-                        linear_solver="dense_cholesky",
+                        linear_solver=args.linear,
                         termination=jaxls.TerminationConfig(max_iterations=args.iters),
                         verbose=True)
     print(f"solved {n} frames in {time.time()-t:.1f}s")
