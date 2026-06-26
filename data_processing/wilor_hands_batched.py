@@ -24,7 +24,6 @@ import json
 import os
 import time
 
-import cv2
 import numpy as np
 import torch
 import torch.nn.functional as Fn
@@ -84,6 +83,37 @@ def gpu_crop(frame_chw, center, bbox_size, flip, IMG):
     return TF.resize(sub.unsqueeze(0), [IMG, IMG], antialias=True).squeeze(0)
 
 
+def detect_gpu(detector, frames_gpu, conf, imgsz=640):
+    """Run the YOLO hand detector on a GPU uint8 batch, fully on-GPU.
+
+    ultralytics letterboxes numpy/list inputs on the CPU (~25 ms per 5MP frame —
+    the dominant cost). Passing a pre-processed GPU tensor (BCHW float 0-1, dims
+    multiple of 32) skips that path: ~2.8 ms/frame. We aspect-preserve-resize and
+    pad with 114/255 (ultralytics' pad value), then rescale boxes back to the
+    original frame. Detections match the numpy path on clear hands; they differ
+    only on marginal/distorted peripheral hands (visually inspected).
+
+    frames_gpu: (n, 3, H, W) uint8 cuda. Returns list[ (k,6) np arrays ] of
+    [x1,y1,x2,y2,conf,cls] in ORIGINAL-frame pixel coords.
+    """
+    n, c, H, W = frames_gpu.shape
+    s = min(imgsz / H, imgsz / W)
+    nh, nw = int(round(H * s)), int(round(W * s))
+    r = Fn.interpolate(frames_gpu.float() / 255.0, size=(nh, nw),
+                       mode="bilinear", align_corners=False)
+    side = ((imgsz + 31) // 32) * 32
+    inp = torch.full((n, c, side, side), 114 / 255.0, device=frames_gpu.device)
+    inp[:, :, :nh, :nw] = r
+    results = detector(inp, conf=conf, verbose=False)
+    out = []
+    for res in results:
+        b = res.boxes.data.detach().cpu().numpy().copy()  # (k,6) in letterbox coords
+        if len(b):
+            b[:, :4] /= s
+        out.append(b)
+    return out
+
+
 def postprocess(out_i, center, bbox_size, img_size, is_right, pipe):
     """Per-hand post-processing (handedness flip, cam-to-full, 2D reprojection).
 
@@ -126,32 +156,29 @@ def record(out_i, bbox, is_right):
     }
 
 
-def run_eye_chunk(pipe, dtype, frames_gpu, frames_np, frame_idxs, conf, vit_batch,
+def run_eye_chunk(pipe, dtype, frames_gpu, frame_idxs, conf, vit_batch,
                   writers, eye):
     """Detect + pose a chunk of one eye's frames; write JSONL via writers[eye].
 
-    frames_gpu: (n, 3, H, W) float on cuda (cropping stays on GPU).
-    frames_np:  list of (H, W, 3) uint8 numpy RGB (only for YOLO's letterbox).
+    frames_gpu: (n, 3, H, W) uint8 on cuda. Detection + cropping both on GPU.
     """
     IMG = pipe.IMAGE_SIZE
     n, _, H, W = frames_gpu.shape
-    # 1) batched detection over the whole chunk
-    dets = pipe.hand_detector(frames_np, conf=conf, verbose=False)
+    frames_f = frames_gpu.float()  # for cropping/grid_sample
+    # 1) batched detection over the whole chunk, fully on GPU
+    dets = detect_gpu(pipe.hand_detector, frames_gpu, conf)
 
     # 2) gather every crop across the chunk — cropping on GPU
     patches, meta = [], []   # meta: (local_idx, bbox, is_right, center, bbox_size, img_size)
     per_frame_hands = [[] for _ in range(n)]
     img_size = np.array([W, H])
-    for li, det in enumerate(dets):
-        if not len(det.boxes):
-            continue
-        boxes = det.boxes.data.detach().cpu().numpy()  # (k, 6) one .cpu per frame
+    for li, boxes in enumerate(dets):
         for b in boxes:
             bbox = b[:4]
             is_right = int(round(float(b[5])))
             center = (bbox[2:4] + bbox[0:2]) / 2.0
             bbox_size = (2.5 * (bbox[2:4] - bbox[0:2])).max()
-            patch = gpu_crop(frames_gpu[li], center, bbox_size, is_right == 0, IMG)
+            patch = gpu_crop(frames_f[li], center, bbox_size, is_right == 0, IMG)
             patches.append(patch)
             meta.append((li, bbox, is_right, center, bbox_size, img_size))
 
@@ -215,10 +242,8 @@ def main():
         data = data[sel]
         for e in eyes:
             sub = data[:, :, :, :half] if e == "left" else data[:, :, :, half:]
-            sub = sub.contiguous()
-            frames_gpu = sub.float()                         # (n,3,H,W) cuda, for GPU crop
-            frames_np = [f.permute(1, 2, 0).cpu().numpy() for f in sub]  # for YOLO letterbox
-            run_eye_chunk(pipe, dtype, frames_gpu, frames_np, chunk_idxs, args.conf,
+            frames_gpu = sub.contiguous()                    # (n,3,H,W) uint8 cuda
+            run_eye_chunk(pipe, dtype, frames_gpu, chunk_idxs, args.conf,
                           args.vit_batch, writers, e)
         done += len(chunk_idxs)
         el = time.time() - t0
