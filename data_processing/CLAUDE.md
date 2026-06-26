@@ -156,14 +156,29 @@ undistorted pinhole crops toward each hand.
 
 ## Roadmap (user's stated intentions)
 
-1. **Pinhole-crop refinement** — detect hand on fisheye (or undistorted full
-   frame), render an undistorted pinhole view *aimed at the hand* via
-   `undistort_maps`, re-run WiLoR there for precise localization. Use
-   `predict_with_bboxes`. **TBD / not yet built.**
+1. **Pinhole-crop refinement** — **renderer DONE** (`fisheye_pinhole.py`),
+   keypoint round-trip validated. Per hand: unproject the YOLO bbox-centre pixel
+   to a gaze ray, render a virtual pinhole crop aimed at it, run the WiLoR ViT on
+   that (de-warped) crop, map crop keypoints back to fisheye px with
+   `crop_px_to_fisheye`. **Stereo-rectified**: left/right virtual cams share a
+   world orientation with x along the baseline (`baseline_aligned_R`, after
+   lab42 eye/stereo.py) so rows are epipolar lines — disparity is purely
+   horizontal (validated |dy|~1-5px vs disparity dx~20-50px). Rejected the
+   "identity + off-centre cx,cy" rectification: breaks for off-axis hands (KB/tan
+   blows up near 90°). **Quality vs raw crop (visual):** pinhole clearly helps on
+   peripheral/distorted hands (e.g. fingers stay separated), neutral-to-slightly
+   worse on near-central hands (resampling blur; net trained on natural crops).
+   GOTCHA: WiLoR flips LEFT hands to look right-handed — flip the crop before the
+   ViT, and `postprocess` already un-flips the output. Do NOT also manually
+   un-flip the keypoints (double-flip corrupts left hands only).
+   TODO: wire into the batched runner (batch all hands' crops through one ViT
+   call) + decide a policy (always pinhole? only for peripheral hands?).
 2. **Stereo depth for hands** — match hands across left/right and recover metric
    depth. User's preferred approach: a **mesh/pose optimization** that optimizes
    the hand's 3D position (and pose) to fit *both* sets of 2D keypoints given
-   the known stereo disparity/extrinsics — not naive triangulation. **TBD.**
+   the known stereo disparity/extrinsics — not naive triangulation. The
+   rectified pinhole pair from step 1 (`render_stereo_crop` returns both crops +
+   `Rv_l`/`Rv_r`/`f_px`/`g` geometry) is the input. **Not yet built.**
 3. **Head pose** — separate pipeline, after hands.
 
 ## Conventions
