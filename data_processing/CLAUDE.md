@@ -42,6 +42,22 @@ patch (or re-export it).
 
 ### Performance — what was slow and why (investigated 2026-06-25)
 
+**TL;DR — ~20x speedup, 3.5 → ~72 fps** (single eye; both eyes ~55 fps, full
+7006-frame video in ~126 s). Each win, in order:
+
+| change | fps | why |
+|---|---|---|
+| baseline (per-frame, `wilor_hands.py`) | 3.5 | GPU at 0%, fully CPU-bound |
+| skimage→cv2 blur drop-in | 11.5 | killed full-frame Gaussian (~135 ms/hand) |
+| batched ViT (crops across a 64-frame chunk, B=16-32) | — | 16x faster *per crop* than B=1 |
+| GPU crop (torchvision `resize`) vs CPU cv2 warp | 21 | 31 → 0.4 ms/frame |
+| GPU-tensor YOLO vs CPU numpy/letterbox | **72** | 30 → 2.8 ms/frame |
+| + torchcodec GPU decode on the **8-bit** stereo file | (enables above) | NVDEC, both eyes/decode |
+
+Tried and rejected (don't redo): `torch.compile` (recompiles on varying crop
+count → slower), torchcodec on the **10-bit** per-eye files (yuv420p10le isn't
+NVDEC-fast, ~55 fps vs 217 on 8-bit). Details below.
+
 Raw pipeline ran at **3.5 fps with the GPU at 0%** — fully CPU-bound. Profiled:
 
 | stage | time | notes |
