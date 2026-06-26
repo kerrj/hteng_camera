@@ -55,8 +55,10 @@ def mano_forward(M, global_orient, hand_pose, betas):
     pose_feat = (R[1:] - jnp.eye(3)).reshape(-1)                                # (135,)
     v_posed = v_shaped + jnp.einsum("vck,k->vc", M["posedirs"], pose_feat)      # (778,3)
 
-    # 3) global rigid transforms per joint along the kinematic tree
-    parents = M["parents"]
+    # 3) global rigid transforms per joint along the kinematic tree.
+    #    parents indexes a Python list during graph construction, so it must be
+    #    static ints (not traced jnp values) — pull to a host list once.
+    parents = [int(p) for p in np.asarray(M["parents"])]
     G = []
     # root
     G0 = jnp.eye(4).at[:3, :3].set(R[0]).at[:3, 3].set(J[0])
