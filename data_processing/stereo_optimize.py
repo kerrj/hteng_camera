@@ -180,7 +180,12 @@ def main():
         costs, [PoseVar(fids), BetaVar(fids), TransVar(fids)]).analyze()
     import time
     t = time.time()
-    sol = problem.solve(init, termination=jaxls.TerminationConfig(max_iterations=args.iters),
+    # LM + dense Cholesky: plain Gauss-Newton (trust_region=None) diverges to
+    # NaN here, and the default CG linear solver fits poorly; LM + direct solve
+    # converges to ~2px reprojection.
+    sol = problem.solve(init, trust_region=jaxls.TrustRegionConfig(),
+                        linear_solver="dense_cholesky",
+                        termination=jaxls.TerminationConfig(max_iterations=args.iters),
                         verbose=True)
     print(f"solved {n} frames in {time.time()-t:.1f}s")
 
