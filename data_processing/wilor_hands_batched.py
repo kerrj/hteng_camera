@@ -27,6 +27,8 @@ import time
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as Fn
+import torchvision.transforms.v2.functional as TF
 
 # 21-joint skeleton for viz (MANO/OpenPose order)
 _BONES = [(0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
@@ -60,28 +62,26 @@ def build_pipeline(fp32):
     return WiLorHandPose3dEstimationPipeline(device=dev, dtype=dtype, verbose=False), dev, dtype
 
 
-def extract_crop(pipe, image, bbox, is_right):
-    """One hand crop + its geometry, using WiLoR's exact patch logic.
+def gpu_crop(frame_chw, center, bbox_size, flip, IMG):
+    """Extract one 256x256 hand patch from a GPU frame, on GPU.
 
-    Returns (patch HWC uint8-ish float, center(2,), bbox_size scalar, img_size(2,)).
+    Equivalent to WiLoR's generate_image_patch_cv2 (scale=1, rot=0): take the
+    square of side ``bbox_size`` centred at ``center``, optionally h-flip, and
+    resize to IMG. Uses torchvision ``resize(antialias=True)`` for the
+    downsample anti-aliasing WiLoR did with a Gaussian pre-blur — validated to
+    <2mm 3D-keypoint agreement vs the CPU path (one extreme close-up ~9mm, a
+    case the pinhole crops will supersede). Returns (3, IMG, IMG) float.
     """
-    from wilor_mini.utils import utils
-    from wilor_mini.pipelines.wilor_hand_pose3d_estimation_pipeline import gaussian
-    IMG = pipe.IMAGE_SIZE
-    center = (bbox[2:4] + bbox[0:2]) / 2.0
-    scale = 2.5 * (bbox[2:4] - bbox[0:2])
-    bbox_size = scale.max()
-    flip = is_right == 0
-    cvimg = image
-    downsampling_factor = (bbox_size / IMG) / 2.0
-    if downsampling_factor > 1.1:
-        cvimg = gaussian(image, sigma=(downsampling_factor - 1) / 2,
-                         channel_axis=2, preserve_range=True)
-    img_size = np.array([cvimg.shape[1], cvimg.shape[0]])
-    patch, _ = utils.generate_image_patch_cv2(
-        cvimg, center[0], center[1], bbox_size, bbox_size, IMG, IMG,
-        flip, 1.0, 0, border_mode=cv2.BORDER_CONSTANT)
-    return patch, center, bbox_size, img_size
+    C, H, W = frame_chw.shape
+    s = int(round(float(bbox_size)))
+    x0 = int(round(float(center[0]) - s / 2))
+    y0 = int(round(float(center[1]) - s / 2))
+    pad = s  # pad by a full side so any off-image box still yields a full square
+    fp = Fn.pad(frame_chw.unsqueeze(0), (pad, pad, pad, pad)).squeeze(0)
+    sub = fp[:, y0 + pad:y0 + pad + s, x0 + pad:x0 + pad + s]
+    if flip:
+        sub = torch.flip(sub, dims=[2])
+    return TF.resize(sub.unsqueeze(0), [IMG, IMG], antialias=True).squeeze(0)
 
 
 def postprocess(out_i, center, bbox_size, img_size, is_right, pipe):
@@ -126,47 +126,57 @@ def record(out_i, bbox, is_right):
     }
 
 
-def run_eye_chunk(pipe, dtype, frames_rgb, frame_idxs, conf, vit_batch, writers, eye):
-    """Detect + pose a chunk of one eye's frames; write JSONL via writers[eye]."""
-    # 1) batched detection over the whole chunk (list of HWC uint8 numpy)
-    dets = pipe.hand_detector(frames_rgb, conf=conf, verbose=False)
+def run_eye_chunk(pipe, dtype, frames_gpu, frames_np, frame_idxs, conf, vit_batch,
+                  writers, eye):
+    """Detect + pose a chunk of one eye's frames; write JSONL via writers[eye].
 
-    # 2) gather every crop across the chunk
-    crops, meta = [], []   # meta: (local_frame_idx, bbox, is_right, center, bbox_size, img_size)
-    per_frame_hands = [[] for _ in frames_rgb]
-    for li, (img, det) in enumerate(zip(frames_rgb, dets)):
-        for d in det:
-            b = d.boxes.data.cpu().numpy().squeeze()
+    frames_gpu: (n, 3, H, W) float on cuda (cropping stays on GPU).
+    frames_np:  list of (H, W, 3) uint8 numpy RGB (only for YOLO's letterbox).
+    """
+    IMG = pipe.IMAGE_SIZE
+    n, _, H, W = frames_gpu.shape
+    # 1) batched detection over the whole chunk
+    dets = pipe.hand_detector(frames_np, conf=conf, verbose=False)
+
+    # 2) gather every crop across the chunk — cropping on GPU
+    patches, meta = [], []   # meta: (local_idx, bbox, is_right, center, bbox_size, img_size)
+    per_frame_hands = [[] for _ in range(n)]
+    img_size = np.array([W, H])
+    for li, det in enumerate(dets):
+        if not len(det.boxes):
+            continue
+        boxes = det.boxes.data.detach().cpu().numpy()  # (k, 6) one .cpu per frame
+        for b in boxes:
             bbox = b[:4]
-            is_right = int(round(float(d.boxes.cls.cpu().item())))
-            patch, center, bbox_size, img_size = extract_crop(pipe, img, bbox, is_right)
-            crops.append(patch)
+            is_right = int(round(float(b[5])))
+            center = (bbox[2:4] + bbox[0:2]) / 2.0
+            bbox_size = (2.5 * (bbox[2:4] - bbox[0:2])).max()
+            patch = gpu_crop(frames_gpu[li], center, bbox_size, is_right == 0, IMG)
+            patches.append(patch)
             meta.append((li, bbox, is_right, center, bbox_size, img_size))
 
-    # 3) run the ViT in big batches
-    if crops:
-        crops_t = torch.from_numpy(np.stack(crops)).to(pipe.device, dtype)
+    # 3) run the ViT in big batches (model wants NHWC)
+    if patches:
+        crops_t = torch.stack(patches).permute(0, 2, 3, 1).to(pipe.device, dtype)
         outs = {}
-        for s in range(0, len(crops), vit_batch):
-            chunk = crops_t[s:s + vit_batch]
+        for s in range(0, len(patches), vit_batch):
             with torch.no_grad():
-                o = pipe.wilor_model(chunk)
+                o = pipe.wilor_model(crops_t[s:s + vit_batch])
             o = {k: v.detach().cpu().float().numpy() for k, v in o.items()}
             for k, v in o.items():
                 outs.setdefault(k, []).append(v)
         outs = {k: np.concatenate(v, 0) for k, v in outs.items()}
 
         # 4) scatter + post-process per hand
-        for j, (li, bbox, is_right, center, bbox_size, img_size) in enumerate(meta):
+        for j, (li, bbox, is_right, center, bbox_size, isz) in enumerate(meta):
             out_i = {k: v[[j]] for k, v in outs.items()}
-            out_i = postprocess(out_i, center, bbox_size, img_size, is_right, pipe)
+            out_i = postprocess(out_i, center, bbox_size, isz, is_right, pipe)
             per_frame_hands[li].append(record(out_i, bbox, is_right))
 
     # 5) emit one JSON line per frame (preserves frame order)
-    h, w = frames_rgb[0].shape[:2]
     for li, fi in enumerate(frame_idxs):
         writers[eye].write(json.dumps(
-            {"frame": int(fi), "width": w, "height": h,
+            {"frame": int(fi), "width": W, "height": H,
              "hands": per_frame_hands[li]}) + "\n")
 
 
@@ -205,8 +215,10 @@ def main():
         data = data[sel]
         for e in eyes:
             sub = data[:, :, :, :half] if e == "left" else data[:, :, :, half:]
-            frames_rgb = [f.permute(1, 2, 0).cpu().numpy() for f in sub]  # HWC RGB uint8
-            run_eye_chunk(pipe, dtype, frames_rgb, chunk_idxs, args.conf,
+            sub = sub.contiguous()
+            frames_gpu = sub.float()                         # (n,3,H,W) cuda, for GPU crop
+            frames_np = [f.permute(1, 2, 0).cpu().numpy() for f in sub]  # for YOLO letterbox
+            run_eye_chunk(pipe, dtype, frames_gpu, frames_np, chunk_idxs, args.conf,
                           args.vit_batch, writers, e)
         done += len(chunk_idxs)
         el = time.time() - t0
