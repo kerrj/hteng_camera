@@ -68,7 +68,7 @@ def make_costs(M, data, w_prior_pose, w_prior_beta, w_temporal, huber_px):
         joints = MJ.mano_forward(M, vals[pose_v][:3], vals[pose_v][3:], vals[beta_v])
         cam = joints + vals[t_v][None, :] - jnp.array([baseline_x, 0.0, 0.0])[None, :]
         proj = project(cam, f_px, data["out_size"])
-        res = (proj - obs2d) * valid[:, None] * conf
+        res = (proj - obs2d) * valid[:, None] * conf[:, None]
         return (res * jnp.sqrt(huber_w(res))).ravel()
 
     @jaxls.Cost.factory
