@@ -119,6 +119,39 @@ def sample_fisheye(frame, rays_cam, K, dist, theta_max):
     return sampled.masked_fill(~valid.unsqueeze(0), float("nan"))
 
 
+def fisheye_project(rays_cam, K, dist):
+    """Project camera-frame rays → fisheye pixels (cv2 KB forward model).
+
+    rays_cam: (..., 3). Returns (..., 2) pixel coords. (Same math as
+    sample_fisheye's px/py, exposed for mapping keypoints back to the frame.)
+    """
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    k1, k2, k3, k4 = dist[0], dist[1], dist[2], dist[3]
+    x, y, z = rays_cam[..., 0], rays_cam[..., 1], rays_cam[..., 2]
+    xy_radius = torch.sqrt(x * x + y * y)
+    theta = torch.atan2(xy_radius, z)
+    t2 = theta * theta
+    theta_d = theta * (1.0 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4))))
+    inv_r = torch.where(xy_radius > 1e-9, 1.0 / xy_radius, torch.zeros_like(xy_radius))
+    px = fx * theta_d * x * inv_r + cx
+    py = fy * theta_d * y * inv_r + cy
+    return torch.stack([px, py], dim=-1)
+
+
+def crop_px_to_fisheye(uv, f_px, out_size, Rv, K, dist):
+    """Map pinhole-crop pixel(s) → fisheye pixel(s).
+
+    uv: (..., 2) crop pixels. f_px/out_size define the crop pinhole; Rv is the
+    virtual-cam→fisheye-cam rotation (cols = axes). Returns (..., 2) fisheye px.
+    """
+    c = (out_size - 1) / 2.0
+    u, v = uv[..., 0], uv[..., 1]
+    rays = torch.stack([(u - c) / f_px, (v - c) / f_px, torch.ones_like(u)], -1)
+    rays = rays / torch.linalg.norm(rays, dim=-1, keepdim=True)
+    rays_cam = rays @ Rv.T
+    return fisheye_project(rays_cam, K, dist)
+
+
 def fov_focal(bbox, g, K, dist, out_size, fov_scale=2.2):
     """Focal (px) so the (expanded) bbox angular extent fills out_size.
 
