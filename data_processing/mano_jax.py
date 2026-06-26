@@ -66,11 +66,11 @@ def mano_forward(M, global_orient, hand_pose, betas):
         G.append(G[parents[i]] @ local)
     G = jnp.stack(G, axis=0)                                                    # (16,4,4)
 
-    # 4) remove the rest-pose offset so identity pose → no transform
-    J_h = jnp.concatenate([J, jnp.ones((16, 1))], axis=1)                       # (16,4)
-    G_rel = G - jnp.einsum("ijk,ik->ij", G, J_h)[..., None] * jnp.eye(4)[None, :, 3]
-    # (above subtracts G@[J,0] from the translation column)
-    G_rel = G.at[:, :3, 3].add(-jnp.einsum("ijk,ik->ij", G, J_h)[:, :3])
+    # 4) remove the rest-pose offset so identity pose → no transform:
+    #    G_rel_i = G_i - [0 | G_i @ [J_i; 0]] (subtract from translation column).
+    J0 = jnp.concatenate([J, jnp.zeros((16, 1))], axis=1)                       # (16,4)
+    offset = jnp.einsum("iab,ib->ia", G, J0)[:, :3]                            # (16,3)
+    G_rel = G.at[:, :3, 3].add(-offset)
 
     # 5) skin vertices
     T = jnp.einsum("vj,jab->vab", M["weights"], G_rel)                          # (778,4,4)
