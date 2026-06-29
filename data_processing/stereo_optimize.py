@@ -250,7 +250,15 @@ def main():
     out_size = next((h["out_size"] for d in rows for h in d["hands"]), 256)
     print(f"hand={args.hand}: {n} frames with a detection")
 
-    pose0_arr = jnp.asarray(np.stack(pose0))                     # (n,48) axis-angle
+    pose0_arr = np.stack(pose0).reshape(n, 16, 3)                # (n,16,3) axis-angle
+    # WiLoR stores left-hand pose in a MIRRORED convention (negate axis-angle
+    # comps 1,2 — a reflection conjugation R->S R S). mano_jax is MANO_RIGHT, so
+    # un-mirror the init back to right-hand rotation space; the FK output is then
+    # x-negated (the `mirror` term) to place the left hand. Both halves of the
+    # reflection are needed: comps 1,2 here + output-x in the cost.
+    if not want_right:
+        pose0_arr[:, :, 1:3] *= -1.0
+    pose0_arr = jnp.asarray(pose0_arr.reshape(n, 48))
     # convert WiLoR axis-angle init -> per-joint quats (n,16,4) wxyz
     quat0 = jax.vmap(lambda p: jaxlie.SO3.exp(p.reshape(16, 3)).wxyz)(pose0_arr)
     data = {
