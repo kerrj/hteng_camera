@@ -12,11 +12,17 @@ left translated by ``-baseline`` along x. We optimize, per frame:
     betas      (10,) shape — FROZEN to WiLoR's per-frame estimate
     t          (3,)  MANO-root translation in the rectified LEFT-crop frame
 
-against four factor types:
+against three factor types:
   - left reprojection:  project MANO joints (at t) into the left pinhole
   - right reprojection: project (joints at t, shifted -baseline x) into right
-  - prior:              pose/betas pulled toward WiLoR's per-frame estimate
   - temporal:           smoothness on (pose, t) between consecutive frames
+
+Reprojection is weighted PER KEYPOINT GROUP (wrist/mcp/pip/tip): the wrist is
+root-relative (0,0,0) so it constrains only t (letting stereo disparity fix
+metric depth), while fingertips — single skinned verts, noisiest + most
+pose-sensitive — are down-weighted. There is NO pose prior: stereo disparity
+gives strictly better depth/pose than WiLoR's monocular regression, so pulling
+back toward it would only fight the signal we trust. betas stay frozen to WiLoR.
 
 This resolves WiLoR's monocular depth ambiguity (the right-eye term pins down t)
 and MANO's anatomical model regularizes per-keypoint disparity noise.
@@ -64,7 +70,30 @@ def project(joints_cam, f_px, out_size):
     return jnp.stack([x, y], axis=-1)
 
 
-def make_costs(M, data, w_prior_pose, w_prior_beta, w_temporal, huber_px):
+# OpenPose-21 keypoint groups (after joint_map remap). Used to build the
+# per-keypoint reprojection weight vector. Wrist is root-relative (0,0,0) in the
+# MANO frame, so its reproj depends ONLY on translation t — weighting it up is
+# how we let stereo disparity pin down metric depth. Tips are single skinned
+# verts at the chain ends: noisiest in detection + most pose-sensitive, so we
+# weight them DOWN, not up.
+KP_GROUPS = {
+    "wrist": [0],
+    "mcp":   [1, 5, 9, 13, 17],          # finger base joints
+    "pip":   [2, 3, 6, 7, 10, 11, 14, 15, 18, 19],  # intermediate (PIP/DIP)
+    "tip":   [4, 8, 12, 16, 20],         # fingertips (skinned verts)
+}
+
+
+def kp_weights(w_wrist, w_mcp, w_pip, w_tip):
+    """Build a (21,) per-keypoint weight vector from the four group weights."""
+    w = np.ones(21, np.float32)
+    for name, val in (("wrist", w_wrist), ("mcp", w_mcp),
+                      ("pip", w_pip), ("tip", w_tip)):
+        w[KP_GROUPS[name]] = val
+    return jnp.asarray(w)
+
+
+def make_costs(M, data, w_temporal, huber_px):
     """Build batched jaxls costs from the per-frame stacked arrays in ``data``."""
     n = data["pose0"].shape[0]
     fids = jnp.arange(n)
@@ -93,14 +122,9 @@ def make_costs(M, data, w_prior_pose, w_prior_beta, w_temporal, huber_px):
         joints = MJ.mano_forward_R(M, R, beta_fixed)
         cam = joints + vals[t_v][None, :] - jnp.array([baseline_x, 0.0, 0.0])[None, :]
         proj = project(cam, f_px, data["out_size"])
+        # conf carries the per-keypoint group weight (wrist/mcp/pip/tip).
         res = (proj - obs2d) / norm * valid[:, None] * conf[:, None]
         return (res * jnp.sqrt(huber_w(res))).ravel()
-
-    @jaxls.Cost.factory
-    def prior_pose(vals, pose_v, q0):
-        # geodesic residual to WiLoR's per-frame pose, per joint (16*3,)
-        res = (jaxlie.SO3(q0).inverse() @ jaxlie.SO3(vals[pose_v])).log()
-        return w_prior_pose * res.reshape(-1)
 
     @jaxls.Cost.factory
     def temporal_pose(vals, a, b, w):
@@ -121,7 +145,6 @@ def make_costs(M, data, w_prior_pose, w_prior_beta, w_temporal, huber_px):
     costs.append(reproj(PoseVar(fids), TransVar(fids), data["beta0"],
                         data["kpR"], data["validR"], data["f_px"],
                         data["baseline"], data["confR"]))
-    costs.append(prior_pose(PoseVar(fids), data["quat0"]))
     # temporal on consecutive frames of the SAME track (only when enabled).
     # NB: couples adjacent KEPT frames; if frames were dropped these aren't
     # adjacent in real time — fine while w_temporal is small, revisit later.
@@ -140,9 +163,14 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--hand", choices=["left", "right"], default="right",
                     help="which hand track (is_right) to optimize")
-    ap.add_argument("--w-prior-pose", type=float, default=2.0)
-    ap.add_argument("--w-prior-beta", type=float, default=5.0)
     ap.add_argument("--w-temporal", type=float, default=10.0)
+    # per-keypoint reprojection group weights (residual-space; cost ∝ w²).
+    # wrist high: it's root-relative (0,0,0) so it only constrains translation
+    # → lets stereo disparity fix metric depth. tips low: noisy + pose-sensitive.
+    ap.add_argument("--w-wrist", type=float, default=2.0)
+    ap.add_argument("--w-mcp", type=float, default=1.0)
+    ap.add_argument("--w-pip", type=float, default=1.0)
+    ap.add_argument("--w-tip", type=float, default=0.5)
     ap.add_argument("--huber-px", type=float, default=10.0)
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--frame-min", type=int, default=None)
@@ -197,7 +225,9 @@ def main():
         valid.append(v.astype(np.float32))
     n = len(frames)
     assert n > 0, "no frames survived robust filtering"
-    confL = confR = [np.ones(21, np.float32)] * n  # placeholder per-kp confidence
+    # per-keypoint group weight vector (wrist/mcp/pip/tip), same for both eyes.
+    kpw = kp_weights(args.w_wrist, args.w_mcp, args.w_pip, args.w_tip)
+    confL = confR = np.broadcast_to(np.array(kpw), (n, 21)).copy()
     print(f"hand={args.hand}: {n} frames kept; dropped {n_dropped_frame} "
           f"(too few inliers); masked {n_masked_kp}/{n_kp_total} keypoints "
           f"(|dy|>{args.dy_thresh}px)")
@@ -216,15 +246,14 @@ def main():
         "kpR": jnp.asarray(np.stack(kpR)),
         "validL": jnp.asarray(np.stack(valid)),
         "validR": jnp.asarray(np.stack(valid)),
-        "confL": jnp.asarray(np.stack(confL)),
-        "confR": jnp.asarray(np.stack(confR)),
+        "confL": jnp.asarray(confL),
+        "confR": jnp.asarray(confR),
         "f_px": jnp.asarray(np.array(fpx, np.float32)),
         "baseline": jnp.full(n, baseline, jnp.float32),
         "out_size": out_size,
     }
 
-    costs, fids = make_costs(M, data, args.w_prior_pose, args.w_prior_beta,
-                             args.w_temporal, args.huber_px)
+    costs, fids = make_costs(M, data, args.w_temporal, args.huber_px)
 
     # init: WiLoR pose/betas; translation from per-frame triangulation over the
     # INLIER keypoints only (masked disparities skew the median otherwise).
@@ -297,8 +326,9 @@ def main():
         return "  ".join(f"p{p}={np.percentile(a,p):.2f}" for p in ps)
     print("\n================ OPTIMIZATION DIAGNOSTICS ================")
     print(f"frames solved: {n}   iters: {args.iters}   linear: {args.linear}")
-    print(f"weights: prior_pose={args.w_prior_pose} temporal={args.w_temporal} "
-          f"huber_px={args.huber_px}  (beta FROZEN to WiLoR)")
+    print(f"weights: temporal={args.w_temporal} huber_px={args.huber_px}  "
+          f"kp[wrist={args.w_wrist} mcp={args.w_mcp} pip={args.w_pip} "
+          f"tip={args.w_tip}]  (NO pose prior; beta FROZEN to WiLoR)")
     print(f"\nREPROJ ERR inliers (px, {len(perkp_in)} kp): "
           f"mean={perkp_in.mean():.2f}  {pct(perkp_in)}")
     if len(perkp_out):
