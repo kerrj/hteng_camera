@@ -177,6 +177,10 @@ def main():
     ap.add_argument("--w-tip", type=float, default=1.0)
     ap.add_argument("--huber-px", type=float, default=10.0)
     ap.add_argument("--iters", type=int, default=30)
+    ap.add_argument("--chunk", type=int, default=500,
+                    help="solve in fixed-size frame chunks (0 = all at once). "
+                         "Exact when temporal is off; keeps each CG system small "
+                         "and lets jaxls reuse one compiled solve.")
     ap.add_argument("--frame-min", type=int, default=None)
     ap.add_argument("--frame-max", type=int, default=None)
     ap.add_argument("--linear", default="conjugate_gradient",
@@ -257,8 +261,6 @@ def main():
         "out_size": out_size,
     }
 
-    costs, fids = make_costs(M, data, args.w_temporal, args.huber_px)
-
     # init: WiLoR pose/betas; translation from per-frame triangulation over the
     # INLIER keypoints only (masked disparities skew the median otherwise).
     disp = jnp.clip(data["kpL"][:, :, 0] - data["kpR"][:, :, 0], 1.0, None)
@@ -270,24 +272,42 @@ def main():
     # back-project the crop centre at z0 → x,y (centre ray is ~optical axis)
     t_init = jnp.stack([jnp.zeros(n), jnp.zeros(n), z0], axis=1)
 
-    init = jaxls.VarValues.make([
-        PoseVar(fids).with_value(data["quat0"]),
-        TransVar(fids).with_value(t_init),
-    ])
-    problem = jaxls.LeastSquaresProblem(
-        costs, [PoseVar(fids), TransVar(fids)]).analyze()
     import time
+    # Solve in fixed-size CHUNKS. With temporal off, frames are independent, so
+    # one giant CG solve over all n frames gives no coupling benefit but a huge,
+    # ill-conditioned linear system (CG iters scale superlinearly) — 4808 frames
+    # ran >30 min and didn't finish. Chunking is exact here and keeps each CG
+    # system small; fixed chunk shape → jaxls compiles the solve ONCE and reuses
+    # it for every chunk (only the ragged last chunk recompiles). With temporal
+    # on, chunk boundaries drop one smoothness edge each — negligible for the
+    # chunk sizes here; revisit with overlap if temporal weight gets large.
+    chunk = args.chunk if args.chunk > 0 else n
+    quat = np.empty((n, 16, 4), np.float32)
+    trans = np.empty((n, 3), np.float32)
     t = time.time()
-    # LM + dense Cholesky: plain Gauss-Newton (trust_region=None) diverges to
-    # NaN here, and the default CG linear solver fits poorly; LM + direct solve
-    # converges to ~2px reprojection.
-    sol = problem.solve(init, trust_region=jaxls.TrustRegionConfig(),
-                        linear_solver=args.linear,
-                        termination=jaxls.TerminationConfig(max_iterations=args.iters),
-                        verbose=True)
+    for s in range(0, n, chunk):
+        e = min(s + chunk, n)
+        cn = e - s
+        cfids = jnp.arange(cn)
+        cdata = {k: (v[s:e] if hasattr(v, "shape") and getattr(v, "ndim", 0) >= 1
+                     else v) for k, v in data.items()}
+        ccosts, _ = make_costs(M, cdata, args.w_temporal, args.huber_px)
+        cinit = jaxls.VarValues.make([
+            PoseVar(cfids).with_value(cdata["quat0"]),
+            TransVar(cfids).with_value(t_init[s:e]),
+        ])
+        prob = jaxls.LeastSquaresProblem(
+            ccosts, [PoseVar(cfids), TransVar(cfids)]).analyze()
+        # LM trust region required (plain Gauss-Newton diverges to NaN here).
+        csol = prob.solve(cinit, trust_region=jaxls.TrustRegionConfig(),
+                          linear_solver=args.linear,
+                          termination=jaxls.TerminationConfig(max_iterations=args.iters),
+                          verbose=False)
+        quat[s:e] = np.array(csol[PoseVar])
+        trans[s:e] = np.array(csol[TransVar])
+        print(f"  chunk [{s}:{e}] / {n} solved ({time.time()-t:.1f}s elapsed)", flush=True)
     print(f"solved {n} frames in {time.time()-t:.1f}s")
 
-    quat = np.array(sol[PoseVar]); trans = np.array(sol[TransVar])  # quat (n,16,4)
     quat0_np = np.array(data["quat0"])
     beta = np.array(data["beta0"])  # frozen to WiLoR's estimate
     valid_np = np.array(data["validL"])  # (n,21) inlier mask
