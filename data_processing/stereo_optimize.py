@@ -55,9 +55,17 @@ def make_costs(M, data, w_prior_pose, w_prior_beta, w_temporal, huber_px):
     n = data["pose0"].shape[0]
     fids = jnp.arange(n)
 
+    # Residuals are normalized to image fractions by dividing pixel error by
+    # max(w,h) = out_size. This keeps the reprojection residual O(0.01-0.1)
+    # instead of O(10-100) px, so squared costs stay O(1) (numerically stable)
+    # and sit on the same scale as the pose prior (radians). The Huber knee is
+    # given in px and normalized to match.
+    norm = float(data["out_size"])
+    huber_n = huber_px / norm
+
     def huber_w(res):
         a = jnp.abs(res) + 1e-8
-        return jax.lax.stop_gradient(jnp.where(a > huber_px, huber_px / a, 1.0))
+        return jax.lax.stop_gradient(jnp.where(a > huber_n, huber_n / a, 1.0))
 
     # beta (MANO shape) is FROZEN to WiLoR's per-frame estimate — passed as a
     # constant into the projection, not a variable. Hand shape shouldn't vary
@@ -68,7 +76,7 @@ def make_costs(M, data, w_prior_pose, w_prior_beta, w_temporal, huber_px):
         joints = MJ.mano_forward(M, vals[pose_v][:3], vals[pose_v][3:], beta_fixed)
         cam = joints + vals[t_v][None, :] - jnp.array([baseline_x, 0.0, 0.0])[None, :]
         proj = project(cam, f_px, data["out_size"])
-        res = (proj - obs2d) * valid[:, None] * conf[:, None]
+        res = (proj - obs2d) / norm * valid[:, None] * conf[:, None]
         return (res * jnp.sqrt(huber_w(res))).ravel()
 
     @jaxls.Cost.factory
