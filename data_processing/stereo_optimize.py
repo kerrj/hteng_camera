@@ -71,7 +71,9 @@ def make_costs(M, data, w_prior_pose, w_prior_beta, w_temporal, huber_px):
     # constant into the projection, not a variable. Hand shape shouldn't vary
     # per frame and isn't useful to fit at this stage, so dropping it removes
     # 10 vars/frame and the competing beta prior.
-    @jaxls.Cost.factory
+    # forward-mode AD: the residual has few inputs (51 tangent dims) relative to
+    # outputs, and jacfwd benchmarked ~2x faster than jacrev on the MANO chain.
+    @jaxls.Cost.factory(jac_mode="forward")
     def reproj(vals, pose_v, t_v, beta_fixed, obs2d, valid, f_px, baseline_x, conf):
         joints = MJ.mano_forward(M, vals[pose_v][:3], vals[pose_v][3:], beta_fixed)
         cam = joints + vals[t_v][None, :] - jnp.array([baseline_x, 0.0, 0.0])[None, :]
