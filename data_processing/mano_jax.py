@@ -46,7 +46,7 @@ def axis_angle_to_matrix(aa):
 
 
 def mano_forward(M, global_orient, hand_pose, betas):
-    """MANO LBS forward for ONE hand.
+    """MANO LBS forward for ONE hand, from axis-angle pose.
 
     Args:
         M: dict from load_mano.
@@ -58,14 +58,33 @@ def mano_forward(M, global_orient, hand_pose, betas):
         joints21: (21, 3) joints in MANO root frame (root-relative, metres),
             OpenPose order, matching wilor_mini's pred_keypoints_3d convention.
     """
+    full_pose = jnp.concatenate([global_orient, hand_pose], axis=0).reshape(16, 3)
+    R = axis_angle_to_matrix(full_pose)                                         # (16,3,3)
+    return mano_forward_R(M, R, betas)
+
+
+def mano_forward_R(M, R, betas):
+    """MANO LBS forward for ONE hand, from rotation matrices.
+
+    Representation-agnostic core: takes the 16 per-joint rotation matrices
+    directly (wrist + 15 fingers), so the optimizer can carry pose as SO(3)
+    manifold variables (quaternions) instead of axis-angle and convert to R
+    here via jaxlie.
+
+    Args:
+        M: dict from load_mano.
+        R: (16, 3, 3) per-joint rotation matrices, joint 0 = wrist/global.
+        betas: (10,) shape coeffs.
+
+    Returns:
+        joints21: (21, 3) root-relative joints, OpenPose order.
+    """
     # 1) rest-pose joints from shape, as a precomputed affine in betas (no
     #    778-vertex blend). Fingertip verts are shape-blended directly in step 5.
     J = M["J_tmpl"] + jnp.einsum("jck,k->jc", M["J_shapedirs"], betas)           # (16,3)
 
-    # 2) pose: 16 joint rotations (wrist + 15). pose feature = (R - I) for the
-    #    15 non-root joints, flattened (135,), drives posedirs.
-    full_pose = jnp.concatenate([global_orient, hand_pose], axis=0).reshape(16, 3)
-    R = axis_angle_to_matrix(full_pose)                                         # (16,3,3)
+    # 2) pose feature = (R - I) for the 15 non-root joints, flattened (135,),
+    #    drives posedirs.
     pose_feat = (R[1:] - jnp.eye(3)).reshape(-1)                                # (135,)
 
     # 3) global rigid transforms per joint along the kinematic tree.

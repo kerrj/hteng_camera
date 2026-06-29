@@ -6,8 +6,10 @@ per-eye 2D keypoints in two *rectified* pinhole crops (left/right) that share a
 virtual orientation with x along the stereo baseline, so the right camera is the
 left translated by ``-baseline`` along x. We optimize, per frame:
 
-    pose       (48,) axis-angle  global_orient(3) + hand_pose(45)
-    betas      (10,) shape
+    pose       (16,4) per-joint unit quats (wxyz) on the SO(3) manifold;
+                      joint 0 = global_orient, 1..15 = finger joints. The
+                      optimizer retracts tangent steps via SO3.exp (egoallo style).
+    betas      (10,) shape — FROZEN to WiLoR's per-frame estimate
     t          (3,)  MANO-root translation in the rectified LEFT-crop frame
 
 against four factor types:
@@ -27,6 +29,7 @@ import json
 
 import jax
 import jax.numpy as jnp
+import jaxlie
 import numpy as np
 
 import jaxls
@@ -34,8 +37,19 @@ import mano_jax as MJ
 
 
 # ---- variables -------------------------------------------------------------
-class PoseVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.zeros(48)):
-    """global_orient(3) + hand_pose(45) axis-angle, in rectified-left frame."""
+# Pose is carried as 16 per-joint quaternions (wxyz) on the SO(3) manifold, à la
+# egoallo: the optimizer's tangent step is an SO(3).exp retraction, so updates
+# stay on the rotation manifold (no axis-angle singularity / non-uniform metric).
+# tangent_dim = 16*3, the variable value is (16,4) unit quats.
+class PoseVar(
+    jaxls.Var[jax.Array],
+    default_factory=lambda: jnp.tile(jnp.array([1.0, 0.0, 0.0, 0.0]), (16, 1)),
+    retract_fn=lambda val, delta: (
+        jaxlie.SO3(val) @ jaxlie.SO3.exp(delta.reshape(16, 3))
+    ).wxyz,
+    tangent_dim=16 * 3,
+):
+    """16 per-joint rotations (global + 15 fingers) as wxyz quats, left frame."""
 
 
 class TransVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.array([0., 0., 0.5])):
@@ -75,15 +89,24 @@ def make_costs(M, data, w_prior_pose, w_prior_beta, w_temporal, huber_px):
     # outputs, and jacfwd benchmarked ~2x faster than jacrev on the MANO chain.
     @jaxls.Cost.factory(jac_mode="forward")
     def reproj(vals, pose_v, t_v, beta_fixed, obs2d, valid, f_px, baseline_x, conf):
-        joints = MJ.mano_forward(M, vals[pose_v][:3], vals[pose_v][3:], beta_fixed)
+        R = jaxlie.SO3(vals[pose_v]).as_matrix()           # (16,4)quat -> (16,3,3)
+        joints = MJ.mano_forward_R(M, R, beta_fixed)
         cam = joints + vals[t_v][None, :] - jnp.array([baseline_x, 0.0, 0.0])[None, :]
         proj = project(cam, f_px, data["out_size"])
         res = (proj - obs2d) / norm * valid[:, None] * conf[:, None]
         return (res * jnp.sqrt(huber_w(res))).ravel()
 
     @jaxls.Cost.factory
-    def prior_pose(vals, pose_v, pose0):
-        return w_prior_pose * (vals[pose_v] - pose0)
+    def prior_pose(vals, pose_v, q0):
+        # geodesic residual to WiLoR's per-frame pose, per joint (16*3,)
+        res = (jaxlie.SO3(q0).inverse() @ jaxlie.SO3(vals[pose_v])).log()
+        return w_prior_pose * res.reshape(-1)
+
+    @jaxls.Cost.factory
+    def temporal_pose(vals, a, b, w):
+        # geodesic difference between consecutive frames' per-joint rotations
+        res = (jaxlie.SO3(vals[a]).inverse() @ jaxlie.SO3(vals[b])).log()
+        return w * res.reshape(-1)
 
     @jaxls.Cost.factory
     def temporal(vals, a, b, w):
@@ -98,13 +121,13 @@ def make_costs(M, data, w_prior_pose, w_prior_beta, w_temporal, huber_px):
     costs.append(reproj(PoseVar(fids), TransVar(fids), data["beta0"],
                         data["kpR"], data["validR"], data["f_px"],
                         data["baseline"], data["confR"]))
-    costs.append(prior_pose(PoseVar(fids), data["pose0"]))
+    costs.append(prior_pose(PoseVar(fids), data["quat0"]))
     # temporal on consecutive frames of the SAME track (only when enabled).
     # NB: couples adjacent KEPT frames; if frames were dropped these aren't
     # adjacent in real time — fine while w_temporal is small, revisit later.
     if w_temporal > 0:
         a, b = jnp.arange(n - 1), jnp.arange(1, n)
-        costs.append(temporal(PoseVar(a), PoseVar(b), w_temporal))
+        costs.append(temporal_pose(PoseVar(a), PoseVar(b), w_temporal))
         costs.append(temporal(TransVar(a), TransVar(b), w_temporal * 5.0))
     return costs, fids
 
@@ -182,8 +205,12 @@ def main():
     out_size = next((h["out_size"] for d in rows for h in d["hands"]), 256)
     print(f"hand={args.hand}: {n} frames with a detection")
 
+    pose0_arr = jnp.asarray(np.stack(pose0))                     # (n,48) axis-angle
+    # convert WiLoR axis-angle init -> per-joint quats (n,16,4) wxyz
+    quat0 = jax.vmap(lambda p: jaxlie.SO3.exp(p.reshape(16, 3)).wxyz)(pose0_arr)
     data = {
-        "pose0": jnp.asarray(np.stack(pose0)),
+        "pose0": pose0_arr,
+        "quat0": quat0,
         "beta0": jnp.asarray(np.stack(beta0)),
         "kpL": jnp.asarray(np.stack(kpL)),
         "kpR": jnp.asarray(np.stack(kpR)),
@@ -211,7 +238,7 @@ def main():
     t_init = jnp.stack([jnp.zeros(n), jnp.zeros(n), z0], axis=1)
 
     init = jaxls.VarValues.make([
-        PoseVar(fids).with_value(data["pose0"]),
+        PoseVar(fids).with_value(data["quat0"]),
         TransVar(fids).with_value(t_init),
     ])
     problem = jaxls.LeastSquaresProblem(
@@ -227,15 +254,18 @@ def main():
                         verbose=True)
     print(f"solved {n} frames in {time.time()-t:.1f}s")
 
-    pose = np.array(sol[PoseVar]); trans = np.array(sol[TransVar])
+    quat = np.array(sol[PoseVar]); trans = np.array(sol[TransVar])  # quat (n,16,4)
+    quat0_np = np.array(data["quat0"])
     beta = np.array(data["beta0"])  # frozen to WiLoR's estimate
-    pose0_np = np.array(data["pose0"])
     valid_np = np.array(data["validL"])  # (n,21) inlier mask
     kpL_np = np.array(data["kpL"]); kpR_np = np.array(data["kpR"]); fpx_np = np.array(fpx)
 
-    def reproj_px(pose_i, beta_i, t_i, fpx_i, bx):
-        j = np.array(MJ.mano_forward(M, jnp.asarray(pose_i[:3]),
-                                     jnp.asarray(pose_i[3:]), jnp.asarray(beta_i)))
+    def fk_R(quat_i, beta_i):
+        R = np.array(jaxlie.SO3(jnp.asarray(quat_i)).as_matrix())   # (16,3,3)
+        return np.array(MJ.mano_forward_R(M, jnp.asarray(R), jnp.asarray(beta_i)))
+
+    def reproj_px(quat_i, beta_i, t_i, fpx_i, bx):
+        j = fk_R(quat_i, beta_i)
         cam = j + t_i[None] - np.array([bx, 0, 0])[None]
         c = (out_size - 1) / 2.0
         return np.stack([fpx_i * cam[:, 0] / cam[:, 2] + c,
@@ -246,8 +276,8 @@ def main():
     perkp_in, perkp_out = [], []
     frame_med_in = []
     for i in range(n):
-        pL = reproj_px(pose[i], beta[i], trans[i], fpx_np[i], 0.0)
-        pR = reproj_px(pose[i], beta[i], trans[i], fpx_np[i], baseline)
+        pL = reproj_px(quat[i], beta[i], trans[i], fpx_np[i], 0.0)
+        pR = reproj_px(quat[i], beta[i], trans[i], fpx_np[i], baseline)
         eL = np.linalg.norm(pL - kpL_np[i], axis=1)
         eR = np.linalg.norm(pR - kpR_np[i], axis=1)
         m = valid_np[i] > 0.5
@@ -258,7 +288,10 @@ def main():
     perkp_in = np.array(perkp_in); perkp_out = np.array(perkp_out)
     fmi = np.array(frame_med_in)
     d_arr = trans[:, 2]
-    dpose = np.linalg.norm(pose - pose0_np, axis=1)       # rad, per frame
+    # geodesic drift from WiLoR init: per-frame RMS of per-joint rotation angles
+    rel = jax.vmap(lambda a, b: (jaxlie.SO3(a).inverse() @ jaxlie.SO3(b)).log())(
+        jnp.asarray(quat0_np), jnp.asarray(quat))         # (n,16,3)
+    dpose = np.array(jnp.linalg.norm(rel.reshape(rel.shape[0], -1), axis=1))  # rad
 
     def pct(a, ps=(50, 90, 99)):
         return "  ".join(f"p{p}={np.percentile(a,p):.2f}" for p in ps)
@@ -288,9 +321,7 @@ def main():
 
     with open(args.out, "w") as f:
         for i, fr in enumerate(frames):
-            joints = np.array(MJ.mano_forward(M, jnp.asarray(pose[i][:3]),
-                                              jnp.asarray(pose[i][3:]),
-                                              jnp.asarray(beta[i])))
+            joints = fk_R(quat[i], beta[i])
             j_world = joints + trans[i][None]
             f.write(json.dumps({
                 "frame": int(fr), "is_right": want_right,
