@@ -14,7 +14,21 @@ import numpy as np
 
 def load_mano(npz_path):
     z = np.load(npz_path)
-    return {k: jnp.asarray(z[k]) for k in z.files}
+    M = {k: jnp.asarray(z[k]) for k in z.files}
+    # Precompute fingertip-only slices so the fast forward skins just the 5
+    # fingertip vertices instead of all 778 (we never use the other 773).
+    tips = np.asarray(z["fingertips"])                       # (5,)
+    M["tip_v_template"] = jnp.asarray(z["v_template"][tips])         # (5,3)
+    M["tip_shapedirs"] = jnp.asarray(z["shapedirs"][tips])          # (5,3,10)
+    M["tip_posedirs"] = jnp.asarray(z["posedirs"][tips])           # (5,3,135)
+    M["tip_weights"] = jnp.asarray(z["weights"][tips])            # (5,16)
+    # Rest-pose joints as a tiny affine in betas: J = J_tmpl + J_shapedirs·beta,
+    # so we never form all 778 shaped vertices just to regress 16 joints.
+    Jr = np.asarray(z["J_regressor"])                                # (16,778)
+    M["J_tmpl"] = jnp.asarray(Jr @ np.asarray(z["v_template"]))      # (16,3)
+    M["J_shapedirs"] = jnp.asarray(
+        np.einsum("jv,vck->jck", Jr, np.asarray(z["shapedirs"])))    # (16,3,10)
+    return M
 
 
 def axis_angle_to_matrix(aa):
@@ -44,16 +58,15 @@ def mano_forward(M, global_orient, hand_pose, betas):
         joints21: (21, 3) joints in MANO root frame (root-relative, metres),
             OpenPose order, matching wilor_mini's pred_keypoints_3d convention.
     """
-    # 1) shape-blended template + per-shape joint locations
-    v_shaped = M["v_template"] + jnp.einsum("vck,k->vc", M["shapedirs"], betas)  # (778,3)
-    J = M["J_regressor"] @ v_shaped                                              # (16,3)
+    # 1) rest-pose joints from shape, as a precomputed affine in betas (no
+    #    778-vertex blend). Fingertip verts are shape-blended directly in step 5.
+    J = M["J_tmpl"] + jnp.einsum("jck,k->jc", M["J_shapedirs"], betas)           # (16,3)
 
     # 2) pose: 16 joint rotations (wrist + 15). pose feature = (R - I) for the
     #    15 non-root joints, flattened (135,), drives posedirs.
     full_pose = jnp.concatenate([global_orient, hand_pose], axis=0).reshape(16, 3)
     R = axis_angle_to_matrix(full_pose)                                         # (16,3,3)
     pose_feat = (R[1:] - jnp.eye(3)).reshape(-1)                                # (135,)
-    v_posed = v_shaped + jnp.einsum("vck,k->vc", M["posedirs"], pose_feat)      # (778,3)
 
     # 3) global rigid transforms per joint along the kinematic tree.
     #    parents indexes a Python list during graph construction, so it must be
@@ -74,17 +87,19 @@ def mano_forward(M, global_orient, hand_pose, betas):
     offset = jnp.einsum("iab,ib->ia", G, J0)[:, :3]                            # (16,3)
     G_rel = G.at[:, :3, 3].add(-offset)
 
-    # 5) skin vertices
-    T = jnp.einsum("vj,jab->vab", M["weights"], G_rel)                          # (778,4,4)
-    v_h = jnp.concatenate([v_posed, jnp.ones((778, 1))], axis=1)                # (778,4)
-    v_skinned = jnp.einsum("vab,vb->va", T, v_h)[:, :3]                         # (778,3)
+    # 5) skin ONLY the 5 fingertip vertices (not all 778 — we discard the rest).
+    tip_posed = (M["tip_v_template"]
+                 + jnp.einsum("vck,k->vc", M["tip_shapedirs"], betas)
+                 + jnp.einsum("vck,k->vc", M["tip_posedirs"], pose_feat))       # (5,3)
+    T = jnp.einsum("vj,jab->vab", M["tip_weights"], G_rel)                      # (5,4,4)
+    v_h = jnp.concatenate([tip_posed, jnp.ones((5, 1))], axis=1)                # (5,4)
+    tips = jnp.einsum("vab,vb->va", T, v_h)[:, :3]                              # (5,3)
 
     # 6) joints: the 16 MANO joints are the rest-pose joints J carried by the
-    #    LBS transforms G (NOT re-regressed from posed verts); fingertips are
-    #    posed vertices. Remap to OpenPose 21.
+    #    LBS transforms G (no skinning); fingertips are the skinned verts above.
+    #    Remap to OpenPose 21.
     J_h = jnp.concatenate([J, jnp.ones((16, 1))], axis=1)                       # (16,4)
     j16 = jnp.einsum("iab,ib->ia", G_rel, J_h)[:, :3]                          # (16,3)
-    tips = v_skinned[M["fingertips"]]                                          # (5,3)
     j21 = jnp.concatenate([j16, tips], axis=0)[M["joint_map"]]                  # (21,3)
     # root-relative (wilor pred_keypoints_3d are centred on the wrist joint 0)
     return j21 - j21[0]
