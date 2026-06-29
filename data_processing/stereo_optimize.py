@@ -38,10 +38,6 @@ class PoseVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.zeros(48)):
     """global_orient(3) + hand_pose(45) axis-angle, in rectified-left frame."""
 
 
-class BetaVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.zeros(10)):
-    """MANO shape."""
-
-
 class TransVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.array([0., 0., 0.5])):
     """MANO-root translation in the rectified-left-crop camera frame (metres)."""
 
@@ -63,9 +59,13 @@ def make_costs(M, data, w_prior_pose, w_prior_beta, w_temporal, huber_px):
         a = jnp.abs(res) + 1e-8
         return jax.lax.stop_gradient(jnp.where(a > huber_px, huber_px / a, 1.0))
 
+    # beta (MANO shape) is FROZEN to WiLoR's per-frame estimate — passed as a
+    # constant into the projection, not a variable. Hand shape shouldn't vary
+    # per frame and isn't useful to fit at this stage, so dropping it removes
+    # 10 vars/frame and the competing beta prior.
     @jaxls.Cost.factory
-    def reproj(vals, pose_v, beta_v, t_v, obs2d, valid, f_px, baseline_x, conf):
-        joints = MJ.mano_forward(M, vals[pose_v][:3], vals[pose_v][3:], vals[beta_v])
+    def reproj(vals, pose_v, t_v, beta_fixed, obs2d, valid, f_px, baseline_x, conf):
+        joints = MJ.mano_forward(M, vals[pose_v][:3], vals[pose_v][3:], beta_fixed)
         cam = joints + vals[t_v][None, :] - jnp.array([baseline_x, 0.0, 0.0])[None, :]
         proj = project(cam, f_px, data["out_size"])
         res = (proj - obs2d) * valid[:, None] * conf[:, None]
@@ -76,24 +76,19 @@ def make_costs(M, data, w_prior_pose, w_prior_beta, w_temporal, huber_px):
         return w_prior_pose * (vals[pose_v] - pose0)
 
     @jaxls.Cost.factory
-    def prior_beta(vals, beta_v, beta0):
-        return w_prior_beta * (vals[beta_v] - beta0)
-
-    @jaxls.Cost.factory
     def temporal(vals, a, b, w):
         return w * (vals[a] - vals[b])
 
     costs = []
     # left eye: baseline_x = 0 (left camera is the reference frame)
-    costs.append(reproj(PoseVar(fids), BetaVar(fids), TransVar(fids),
+    costs.append(reproj(PoseVar(fids), TransVar(fids), data["beta0"],
                         data["kpL"], data["validL"], data["f_px"],
                         jnp.zeros(n), data["confL"]))
     # right eye: shift by +baseline along x (point moves to right-cam frame)
-    costs.append(reproj(PoseVar(fids), BetaVar(fids), TransVar(fids),
+    costs.append(reproj(PoseVar(fids), TransVar(fids), data["beta0"],
                         data["kpR"], data["validR"], data["f_px"],
                         data["baseline"], data["confR"]))
     costs.append(prior_pose(PoseVar(fids), data["pose0"]))
-    costs.append(prior_beta(BetaVar(fids), data["beta0"]))
     # temporal on consecutive frames of the SAME track (only when enabled).
     # NB: couples adjacent KEPT frames; if frames were dropped these aren't
     # adjacent in real time — fine while w_temporal is small, revisit later.
@@ -207,11 +202,10 @@ def main():
 
     init = jaxls.VarValues.make([
         PoseVar(fids).with_value(data["pose0"]),
-        BetaVar(fids).with_value(data["beta0"]),
         TransVar(fids).with_value(t_init),
     ])
     problem = jaxls.LeastSquaresProblem(
-        costs, [PoseVar(fids), BetaVar(fids), TransVar(fids)]).analyze()
+        costs, [PoseVar(fids), TransVar(fids)]).analyze()
     import time
     t = time.time()
     # LM + dense Cholesky: plain Gauss-Newton (trust_region=None) diverges to
@@ -223,8 +217,9 @@ def main():
                         verbose=True)
     print(f"solved {n} frames in {time.time()-t:.1f}s")
 
-    pose = np.array(sol[PoseVar]); beta = np.array(sol[BetaVar]); trans = np.array(sol[TransVar])
-    pose0_np = np.array(data["pose0"]); beta0_np = np.array(data["beta0"])
+    pose = np.array(sol[PoseVar]); trans = np.array(sol[TransVar])
+    beta = np.array(data["beta0"])  # frozen to WiLoR's estimate
+    pose0_np = np.array(data["pose0"])
     valid_np = np.array(data["validL"])  # (n,21) inlier mask
     kpL_np = np.array(data["kpL"]); kpR_np = np.array(data["kpR"]); fpx_np = np.array(fpx)
 
@@ -254,14 +249,13 @@ def main():
     fmi = np.array(frame_med_in)
     d_arr = trans[:, 2]
     dpose = np.linalg.norm(pose - pose0_np, axis=1)       # rad, per frame
-    dbeta = np.linalg.norm(beta - beta0_np, axis=1)
 
     def pct(a, ps=(50, 90, 99)):
         return "  ".join(f"p{p}={np.percentile(a,p):.2f}" for p in ps)
     print("\n================ OPTIMIZATION DIAGNOSTICS ================")
     print(f"frames solved: {n}   iters: {args.iters}   linear: {args.linear}")
-    print(f"weights: prior_pose={args.w_prior_pose} prior_beta={args.w_prior_beta} "
-          f"temporal={args.w_temporal} huber_px={args.huber_px}")
+    print(f"weights: prior_pose={args.w_prior_pose} temporal={args.w_temporal} "
+          f"huber_px={args.huber_px}  (beta FROZEN to WiLoR)")
     print(f"\nREPROJ ERR inliers (px, {len(perkp_in)} kp): "
           f"mean={perkp_in.mean():.2f}  {pct(perkp_in)}")
     if len(perkp_out):
@@ -273,7 +267,6 @@ def main():
     print(f"  depth percentiles: {pct(d_arr,(5,50,95))}")
     print(f"\nPARAM DRIFT from WiLoR init:")
     print(f"  |Δpose| (rad): mean={dpose.mean():.3f} {pct(dpose)}  (15 joints+global)")
-    print(f"  |Δbeta|: mean={dbeta.mean():.3f} {pct(dbeta)}")
     print(f"  trans xy spread (m): x[{trans[:,0].min():.2f},{trans[:,0].max():.2f}] "
           f"y[{trans[:,1].min():.2f},{trans[:,1].max():.2f}]")
     # temporal jitter (consecutive KEPT frames; gap-agnostic)
