@@ -167,10 +167,14 @@ def main():
     # per-keypoint reprojection group weights (residual-space; cost ∝ w²).
     # wrist high: it's root-relative (0,0,0) so it only constrains translation
     # → lets stereo disparity fix metric depth. tips low: noisy + pose-sensitive.
-    ap.add_argument("--w-wrist", type=float, default=2.0)
+    # Default uniform: a sweep (2026-06-29) showed asymmetric group weights only
+    # hurt — down-weighting tips let fingers curl into bad minima (p50 2.9→5.6px)
+    # and up-weighting the wrist (root-relative → only constrains t) did nothing.
+    # Kept tunable as the hook for future per-frame detector confidence.
+    ap.add_argument("--w-wrist", type=float, default=1.0)
     ap.add_argument("--w-mcp", type=float, default=1.0)
     ap.add_argument("--w-pip", type=float, default=1.0)
-    ap.add_argument("--w-tip", type=float, default=0.5)
+    ap.add_argument("--w-tip", type=float, default=1.0)
     ap.add_argument("--huber-px", type=float, default=10.0)
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--frame-min", type=int, default=None)
