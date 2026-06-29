@@ -94,10 +94,13 @@ def make_costs(M, data, w_prior_pose, w_prior_beta, w_temporal, huber_px):
                         data["baseline"], data["confR"]))
     costs.append(prior_pose(PoseVar(fids), data["pose0"]))
     costs.append(prior_beta(BetaVar(fids), data["beta0"]))
-    # temporal on consecutive frames of the SAME track
-    a, b = jnp.arange(n - 1), jnp.arange(1, n)
-    costs.append(temporal(PoseVar(a), PoseVar(b), w_temporal))
-    costs.append(temporal(TransVar(a), TransVar(b), w_temporal * 5.0))
+    # temporal on consecutive frames of the SAME track (only when enabled).
+    # NB: couples adjacent KEPT frames; if frames were dropped these aren't
+    # adjacent in real time — fine while w_temporal is small, revisit later.
+    if w_temporal > 0:
+        a, b = jnp.arange(n - 1), jnp.arange(1, n)
+        costs.append(temporal(PoseVar(a), PoseVar(b), w_temporal))
+        costs.append(temporal(TransVar(a), TransVar(b), w_temporal * 5.0))
     return costs, fids
 
 
@@ -221,8 +224,10 @@ def main():
     print(f"solved {n} frames in {time.time()-t:.1f}s")
 
     pose = np.array(sol[PoseVar]); beta = np.array(sol[BetaVar]); trans = np.array(sol[TransVar])
+    pose0_np = np.array(data["pose0"]); beta0_np = np.array(data["beta0"])
+    valid_np = np.array(data["validL"])  # (n,21) inlier mask
+    kpL_np = np.array(data["kpL"]); kpR_np = np.array(data["kpR"]); fpx_np = np.array(fpx)
 
-    # before/after reprojection error against WiLoR's 2D, in BOTH eyes
     def reproj_px(pose_i, beta_i, t_i, fpx_i, bx):
         j = np.array(MJ.mano_forward(M, jnp.asarray(pose_i[:3]),
                                      jnp.asarray(pose_i[3:]), jnp.asarray(beta_i)))
@@ -230,14 +235,53 @@ def main():
         c = (out_size - 1) / 2.0
         return np.stack([fpx_i * cam[:, 0] / cam[:, 2] + c,
                          fpx_i * cam[:, 1] / cam[:, 2] + c], 1)
-    errL = errR = 0.0
-    kpL_np = np.array(data["kpL"]); kpR_np = np.array(data["kpR"]); fpx_np = np.array(fpx)
+
+    # --- detailed diagnostics --------------------------------------------
+    # per-keypoint reproj error, split inlier vs outlier, both eyes
+    perkp_in, perkp_out = [], []
+    frame_med_in = []
     for i in range(n):
         pL = reproj_px(pose[i], beta[i], trans[i], fpx_np[i], 0.0)
         pR = reproj_px(pose[i], beta[i], trans[i], fpx_np[i], baseline)
-        errL += np.linalg.norm(pL - kpL_np[i], axis=1).mean()
-        errR += np.linalg.norm(pR - kpR_np[i], axis=1).mean()
-    print(f"AFTER reproj err (true f_px): L={errL/n:.2f}px  R={errR/n:.2f}px")
+        eL = np.linalg.norm(pL - kpL_np[i], axis=1)
+        eR = np.linalg.norm(pR - kpR_np[i], axis=1)
+        m = valid_np[i] > 0.5
+        perkp_in += eL[m].tolist() + eR[m].tolist()
+        perkp_out += eL[~m].tolist() + eR[~m].tolist()
+        if m.any():
+            frame_med_in.append(np.concatenate([eL[m], eR[m]]).mean())
+    perkp_in = np.array(perkp_in); perkp_out = np.array(perkp_out)
+    fmi = np.array(frame_med_in)
+    d_arr = trans[:, 2]
+    dpose = np.linalg.norm(pose - pose0_np, axis=1)       # rad, per frame
+    dbeta = np.linalg.norm(beta - beta0_np, axis=1)
+
+    def pct(a, ps=(50, 90, 99)):
+        return "  ".join(f"p{p}={np.percentile(a,p):.2f}" for p in ps)
+    print("\n================ OPTIMIZATION DIAGNOSTICS ================")
+    print(f"frames solved: {n}   iters: {args.iters}   linear: {args.linear}")
+    print(f"weights: prior_pose={args.w_prior_pose} prior_beta={args.w_prior_beta} "
+          f"temporal={args.w_temporal} huber_px={args.huber_px}")
+    print(f"\nREPROJ ERR inliers (px, {len(perkp_in)} kp): "
+          f"mean={perkp_in.mean():.2f}  {pct(perkp_in)}")
+    if len(perkp_out):
+        print(f"REPROJ ERR outliers(px, {len(perkp_out)} kp): "
+              f"mean={perkp_out.mean():.2f}  {pct(perkp_out)}  (masked, not fit)")
+    print(f"per-frame mean inlier err: mean={fmi.mean():.2f}  {pct(fmi)}")
+    print(f"\nDEPTH (m): median={np.median(d_arr):.3f} mean={d_arr.mean():.3f} "
+          f"std={d_arr.std():.3f}  range=[{d_arr.min():.3f},{d_arr.max():.3f}]")
+    print(f"  depth percentiles: {pct(d_arr,(5,50,95))}")
+    print(f"\nPARAM DRIFT from WiLoR init:")
+    print(f"  |Δpose| (rad): mean={dpose.mean():.3f} {pct(dpose)}  (15 joints+global)")
+    print(f"  |Δbeta|: mean={dbeta.mean():.3f} {pct(dbeta)}")
+    print(f"  trans xy spread (m): x[{trans[:,0].min():.2f},{trans[:,0].max():.2f}] "
+          f"y[{trans[:,1].min():.2f},{trans[:,1].max():.2f}]")
+    # temporal jitter (consecutive KEPT frames; gap-agnostic)
+    if n > 1:
+        dj = np.abs(np.diff(d_arr)) * 1000
+        print(f"\nTEMPORAL (consecutive kept frames):")
+        print(f"  depth jump (mm): median={np.median(dj):.1f} {pct(dj,(50,90,99)).replace('p','p')}")
+    print("==========================================================\n")
 
     with open(args.out, "w") as f:
         for i, fr in enumerate(frames):
@@ -250,9 +294,7 @@ def main():
                 "trans": trans[i].tolist(), "depth_m": float(trans[i][2]),
                 "joints_3d_cam": j_world.tolist(),  # rectified-left-crop frame
             }) + "\n")
-    d_arr = trans[:, 2]
-    print(f"wrote {args.out}; depth median={np.median(d_arr):.3f}m "
-          f"10-90%=[{np.percentile(d_arr,10):.3f},{np.percentile(d_arr,90):.3f}]m")
+    print(f"wrote {args.out}")
 
 
 if __name__ == "__main__":
