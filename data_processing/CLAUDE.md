@@ -259,3 +259,28 @@ First-30s results: LEFT hand 276/432 kept @0.67m, RIGHT 173/563 kept @0.53m
 hands drop to ~6 inliers and are rejected. NOTE the optimizer can run two hands
 in one shell but chaining two `nohup ... &` after one `conda activate` fails for
 the 2nd (subshell loses activation) — launch separately.
+
+### Stereo opt — conditioning + speed fixes (2026-06-29)
+
+**Normalization was the key stability fix.** Reproj residuals in raw pixels
+(O(10-100)) made total cost O(1e6) and badly conditioned vs the radian-scale
+pose prior; CG wandered to 38m / 2991-rad garbage. **Fix: divide reproj error by
+max(w,h)=out_size** → image-fraction residual O(0.01-0.1), cost O(1). Now the
+baseline (NO prior, NO temporal) is stable: reproj inliers p50=2.9px, depth
+median 0.52m range[0.24,0.74], depth jump median 15mm. |Δpose| from WiLoR ~3.9
+rad (a light pose prior should tame this).
+
+**Beta frozen** to WiLoR (not a variable) — removed 10 vars/frame + beta prior.
+
+**Speed:** MANO forward skinned all 778 verts but uses 5 fingertips (+16 tree
+joints, no skinning needed). Now skins only the 5 tips + precomputes the
+rest-joint affine in betas → no 778-vertex op. jacfwd ~2x faster than jacrev on
+the MANO chain → set `@jaxls.Cost.factory(jac_mode="forward")`. Early LM steps
+~0.15s; later steps slow (~2.5s) only because Eisenstat-Walker CG tightens its
+inner tolerance near convergence — NOT recompilation (verified). Converges in a
+few steps anyway, so high --iters is unnecessary.
+
+Reference: brentyi/egoallo uses jaxls for SMPL-H/MANO exactly like this — FK-only
+(never LBS) inside costs, CG solver, one batched Var per timestep with
+jnp.arange(T) ids, betas mean-pooled & fixed, `max_iters` as Static[int] so LM
+unrolls. Temporal smoothness there is SO3-log of relative quats (1st + 2nd order).
