@@ -116,10 +116,17 @@ def make_costs(M, data, w_temporal, huber_px):
     # 10 vars/frame and the competing beta prior.
     # forward-mode AD: the residual has few inputs (51 tangent dims) relative to
     # outputs, and jacfwd benchmarked ~2x faster than jacrev on the MANO chain.
+    # mirror: +1 for right hand, -1 for left. mano_jax is MANO_RIGHT; WiLoR
+    # mirrors left hands by negating joint x (and axis-angle comps 1,2), so its
+    # stored left-hand pose only matches the keypoints after we x-negate the
+    # forward-kinematics output — the canonical MANO left-from-right trick.
+    mirror = float(data["mirror"])
+
     @jaxls.Cost.factory(jac_mode="forward")
     def reproj(vals, pose_v, t_v, beta_fixed, obs2d, valid, f_px, baseline_x, conf):
         R = jaxlie.SO3(vals[pose_v]).as_matrix()           # (16,4)quat -> (16,3,3)
         joints = MJ.mano_forward_R(M, R, beta_fixed)
+        joints = joints.at[:, 0].multiply(mirror)          # left-hand x-mirror
         cam = joints + vals[t_v][None, :] - jnp.array([baseline_x, 0.0, 0.0])[None, :]
         proj = project(cam, f_px, data["out_size"])
         # conf carries the per-keypoint group weight (wrist/mcp/pip/tip).
@@ -259,6 +266,7 @@ def main():
         "f_px": jnp.asarray(np.array(fpx, np.float32)),
         "baseline": jnp.full(n, baseline, jnp.float32),
         "out_size": out_size,
+        "mirror": 1.0 if want_right else -1.0,   # left-hand x-mirror (MANO_RIGHT)
     }
 
     # init: WiLoR pose/betas; translation from per-frame triangulation over the
@@ -313,9 +321,12 @@ def main():
     valid_np = np.array(data["validL"])  # (n,21) inlier mask
     kpL_np = np.array(data["kpL"]); kpR_np = np.array(data["kpR"]); fpx_np = np.array(fpx)
 
+    mirror = 1.0 if want_right else -1.0
     def fk_R(quat_i, beta_i):
         R = np.array(jaxlie.SO3(jnp.asarray(quat_i)).as_matrix())   # (16,3,3)
-        return np.array(MJ.mano_forward_R(M, jnp.asarray(R), jnp.asarray(beta_i)))
+        j = np.array(MJ.mano_forward_R(M, jnp.asarray(R), jnp.asarray(beta_i)))
+        j[:, 0] *= mirror                                            # left-hand x-mirror
+        return j
 
     def reproj_px(quat_i, beta_i, t_i, fpx_i, bx):
         j = fk_R(quat_i, beta_i)
