@@ -197,110 +197,43 @@ def make_costs(M, data, w_temporal, huber_px, w_shape):
     return costs, fids
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--jsonl", required=True)
-    ap.add_argument("--mano", default="/tmp/mano_jax.npz")
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--calib-dir", default="../long-test1")
-    ap.add_argument("--left-serial", default="046060323008")
-    ap.add_argument("--right-serial", default="046060323001")
-    ap.add_argument("--hand", choices=["left", "right"], default="right",
-                    help="which hand track (is_right) to optimize")
-    ap.add_argument("--w-temporal", type=float, default=10.0)
-    ap.add_argument("--w-shape", type=float, default=0.1,
-                    help="weight pulling internal finger pose toward the two-eye "
-                         "geodesic-mean shape (radians-scale geodesic residual). "
-                         "Sweep (2026-06-29): 0->54px reproj p99 & 6rad pose drift; "
-                         "0.1 -> 1.9px p50 / 10px p99 / 0.3rad drift; 1.0 over-"
-                         "constrains. 0.1 is the knee.")
-    # per-keypoint reprojection group weights (residual-space; cost ∝ w²).
-    # wrist high: it's root-relative (0,0,0) so it only constrains translation
-    # → lets stereo disparity fix metric depth. tips low: noisy + pose-sensitive.
-    # Default uniform: a sweep (2026-06-29) showed asymmetric group weights only
-    # hurt — down-weighting tips let fingers curl into bad minima (p50 2.9→5.6px)
-    # and up-weighting the wrist (root-relative → only constrains t) did nothing.
-    # Kept tunable as the hook for future per-frame detector confidence.
-    ap.add_argument("--w-wrist", type=float, default=1.0)
-    ap.add_argument("--w-mcp", type=float, default=1.0)
-    ap.add_argument("--w-pip", type=float, default=1.0)
-    ap.add_argument("--w-tip", type=float, default=1.0)
-    ap.add_argument("--huber-px", type=float, default=5.0,
-                    help="Huber knee in PIXELS (cost is quadratic within, linear "
-                         "beyond). With the shape prior, inlier reproj is p90~4.5px, "
-                         "so 5px robustifies the noisy mid-tail; was 10px (barely "
-                         "active). Normalized internally to match residual scale.")
-    ap.add_argument("--iters", type=int, default=30)
-    ap.add_argument("--chunk", type=int, default=500,
-                    help="solve in fixed-size frame chunks (0 = all at once). "
-                         "Exact when temporal is off; keeps each CG system small "
-                         "and lets jaxls reuse one compiled solve.")
-    ap.add_argument("--frame-min", type=int, default=None)
-    ap.add_argument("--frame-max", type=int, default=None)
-    ap.add_argument("--linear", default="conjugate_gradient",
-                    help="jaxls linear solver: conjugate_gradient | dense_cholesky | cholmod")
-    ap.add_argument("--dy-thresh", type=float, default=8.0,
-                    help="max |y_left-y_right| (px) for a keypoint to be an inlier")
-    ap.add_argument("--min-inliers", type=int, default=12,
-                    help="drop a hand if fewer than this many keypoints survive")
-    args = ap.parse_args()
+def build_data(jsonl, calib_dir, left_serial, right_serial, hand,
+               frame_min=None, frame_max=None,
+               w_wrist=1.0, w_mcp=1.0, w_pip=1.0, w_tip=1.0):
+    """Gather per-frame arrays + precompute the optimizer's ``data`` dict.
 
-    M = MJ.load_mano(args.mano)
-    want_right = 1 if args.hand == "right" else 0
-
-    # Gather the single-best hand of the requested handedness per frame, and
-    # build robustness masks. The crops are stereo-RECTIFIED, so rows are
-    # epipolar lines: a keypoint whose left/right y disagree by more than
-    # --dy-thresh px is a bad cross-eye match → mask it out. Frames with fewer
-    # than --min-inliers surviving keypoints are dropped entirely (one eye's
-    # detection failed). This is the key fix for outliers blowing up the solve.
-    # stereo extrinsics (X_right = Rs @ X_left + ts), needed for the verged
-    # per-eye projection transforms R_lr, t_lr.
-    ls, rs = args.left_serial, args.right_serial
-    st = json.load(open(f"{args.calib_dir}/stereo_{ls}_{rs}.json"))
+    Returns (data, t_init, frames, Rvl_arr, want_right). No outlier rejection —
+    every detected hand's 21 keypoints in both eyes are kept.
+    """
+    want_right = 1 if hand == "right" else 0
+    # stereo extrinsics (X_right = Rs @ X_left + ts), for the verged per-eye
+    # projection transforms R_lr, t_lr.
+    st = json.load(open(f"{calib_dir}/stereo_{left_serial}_{right_serial}.json"))
     Rs = np.array(st["R"], np.float32)
     ts = np.array(st["t"], np.float32).reshape(3)
 
-    rows = [json.loads(l) for l in open(args.jsonl)]
-    frames, pose0, beta0, kpL, kpR, fpx, valid = ([] for _ in range(7))
+    rows = [json.loads(l) for l in open(jsonl)]
+    frames, pose0, beta0, kpL, kpR, fpx = ([] for _ in range(6))
     Rvl, Parr = [], []
     R_lr, t_lr = [], []
     hp_left, hp_right = [], []     # per-eye 15-joint internal pose (axis-angle)
-    n_dropped_frame = 0
-    n_masked_kp = 0
-    n_kp_total = 0
     for d in rows:
-        if args.frame_min is not None and d["frame"] < args.frame_min:
+        if frame_min is not None and d["frame"] < frame_min:
             continue
-        if args.frame_max is not None and d["frame"] > args.frame_max:
+        if frame_max is not None and d["frame"] > frame_max:
             continue
         cand = [h for h in d["hands"] if h["is_right"] == want_right]
         if not cand:
             continue
         h = max(cand, key=lambda x: (x["bbox"][2] - x["bbox"][0]))  # largest bbox
-        kL = np.array(h["kp_left"], np.float32)
-        kR = np.array(h["kp_right"], np.float32)
-        # crops are baseline-aligned (rows are epipolar) even though the optical
-        # axes verge on the hand → keep the |dy| inlier gate. Drop the old
-        # disparity-sign test: both eyes are aimed at P, so the hand sits near
-        # both crop centres and per-keypoint disparity is small / un-signed.
-        dy = np.abs(kL[:, 1] - kR[:, 1])           # epipolar deviation per kp
-        v = (dy < args.dy_thresh)                  # per-keypoint inlier mask
-        n_kp_total += 21
-        n_masked_kp += int(21 - v.sum())
-        if v.sum() < args.min_inliers:             # whole-hand detection failure
-            n_dropped_frame += 1
-            continue
         Rv_l = np.array(h["Rv_l"], np.float32)
         Rv_r = np.array(h["Rv_r"], np.float32)
         frames.append(d["frame"])
         pose0.append(np.array(h["global_orient"] + h["hand_pose"], np.float32))
         beta0.append(np.array(h["betas"], np.float32))
-        kpL.append(kL)
-        kpR.append(kR)
+        kpL.append(np.array(h["kp_left"], np.float32))
+        kpR.append(np.array(h["kp_right"], np.float32))
         fpx.append(h["f_px"])
-        valid.append(v.astype(np.float32))
         Rvl.append(Rv_l)
         Parr.append(np.array(h["P"], np.float32))
         R_lr.append(Rv_r.T @ Rs @ Rv_l)            # left-virtual → right-virtual
@@ -308,15 +241,13 @@ def main():
         hp_left.append(np.array(h["hand_pose"], np.float32))        # (45,)
         hp_right.append(np.array(h["hand_pose_right"], np.float32))  # (45,)
     n = len(frames)
-    assert n > 0, "no frames survived robust filtering"
-    # per-keypoint group weight vector (wrist/mcp/pip/tip), same for both eyes.
-    kpw = kp_weights(args.w_wrist, args.w_mcp, args.w_pip, args.w_tip)
+    assert n > 0, "no frames with a detection of the requested hand"
+    # all keypoints valid (no rejection); per-keypoint group weight (uniform).
+    valid = [np.ones(21, np.float32)] * n
+    kpw = kp_weights(w_wrist, w_mcp, w_pip, w_tip)
     confL = confR = np.broadcast_to(np.array(kpw), (n, 21)).copy()
-    print(f"hand={args.hand}: {n} frames kept; dropped {n_dropped_frame} "
-          f"(too few inliers); masked {n_masked_kp}/{n_kp_total} keypoints "
-          f"(|dy|>{args.dy_thresh}px)")
     out_size = next((h["out_size"] for d in rows for h in d["hands"]), 256)
-    print(f"hand={args.hand}: {n} frames with a detection")
+    print(f"hand={hand}: {n} frames with a detection (no filtering)")
 
     pose0_arr = np.stack(pose0).reshape(n, 16, 3)                # (n,16,3) axis-angle
     # WiLoR stores left-hand pose in a MIRRORED convention (negate axis-angle
@@ -374,6 +305,61 @@ def main():
     # is wrist-centred and root-relative, so placing the root at P (≈ hand centre)
     # is a good start. Far cleaner than the old z-from-disparity init.
     t_init = jnp.asarray(np.einsum("nij,nj->ni", Rvl_arr.transpose(0, 2, 1), P_arr))
+    return data, t_init, frames, Rvl_arr, want_right
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--jsonl", required=True)
+    ap.add_argument("--mano", default="/tmp/mano_jax.npz")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--calib-dir", default="../long-test1")
+    ap.add_argument("--left-serial", default="046060323008")
+    ap.add_argument("--right-serial", default="046060323001")
+    ap.add_argument("--hand", choices=["left", "right"], default="right",
+                    help="which hand track (is_right) to optimize")
+    ap.add_argument("--w-temporal", type=float, default=10.0)
+    ap.add_argument("--w-shape", type=float, default=0.1,
+                    help="weight pulling internal finger pose toward the two-eye "
+                         "geodesic-mean shape (radians-scale geodesic residual). "
+                         "Sweep (2026-06-29): 0->54px reproj p99 & 6rad pose drift; "
+                         "0.1 -> 1.9px p50 / 10px p99 / 0.3rad drift; 1.0 over-"
+                         "constrains. 0.1 is the knee.")
+    # per-keypoint reprojection group weights (residual-space; cost ∝ w²).
+    # wrist high: it's root-relative (0,0,0) so it only constrains translation
+    # → lets stereo disparity fix metric depth. tips low: noisy + pose-sensitive.
+    # Default uniform: a sweep (2026-06-29) showed asymmetric group weights only
+    # hurt — down-weighting tips let fingers curl into bad minima (p50 2.9→5.6px)
+    # and up-weighting the wrist (root-relative → only constrains t) did nothing.
+    # Kept tunable as the hook for future per-frame detector confidence.
+    ap.add_argument("--w-wrist", type=float, default=1.0)
+    ap.add_argument("--w-mcp", type=float, default=1.0)
+    ap.add_argument("--w-pip", type=float, default=1.0)
+    ap.add_argument("--w-tip", type=float, default=1.0)
+    ap.add_argument("--huber-px", type=float, default=5.0,
+                    help="Huber knee in PIXELS (cost is quadratic within, linear "
+                         "beyond). With the shape prior, inlier reproj is p90~4.5px, "
+                         "so 5px robustifies the noisy mid-tail; was 10px (barely "
+                         "active). Normalized internally to match residual scale.")
+    ap.add_argument("--iters", type=int, default=30)
+    ap.add_argument("--chunk", type=int, default=500,
+                    help="solve in fixed-size frame chunks (0 = all at once). "
+                         "Exact when temporal is off; keeps each CG system small "
+                         "and lets jaxls reuse one compiled solve.")
+    ap.add_argument("--frame-min", type=int, default=None)
+    ap.add_argument("--frame-max", type=int, default=None)
+    ap.add_argument("--linear", default="conjugate_gradient",
+                    help="jaxls linear solver: conjugate_gradient | dense_cholesky | cholmod")
+    args = ap.parse_args()
+
+    M = MJ.load_mano(args.mano)
+    data, t_init, frames, Rvl_arr, want_right = build_data(
+        args.jsonl, args.calib_dir, args.left_serial, args.right_serial,
+        args.hand, args.frame_min, args.frame_max,
+        args.w_wrist, args.w_mcp, args.w_pip, args.w_tip)
+    n = len(frames)
+    out_size = data["out_size"]
 
     import time
     # Solve in fixed-size CHUNKS. With temporal off, frames are independent, so
