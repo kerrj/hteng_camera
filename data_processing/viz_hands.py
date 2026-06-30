@@ -99,7 +99,7 @@ def main():
     fmin, fmax = all_frames[0], all_frames[-1]
 
     server = viser.ViserServer(port=args.port)
-    server.scene.world_axes.visible = True
+    server.scene.world_axes.visible = False
 
     # camera frustum at origin (left-fisheye cam: +z forward, +y down in cv2).
     # viser is +z up by convention; we just draw a marker frame + a small frustum.
