@@ -352,10 +352,10 @@ def main():
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--frame-min", type=int, default=None)
     ap.add_argument("--frame-max", type=int, default=None)
-    ap.add_argument("--linear", default="dense_cholesky",
+    ap.add_argument("--linear", default="conjugate_gradient",
                     help="jaxls linear solver for the Schur-reduced system: "
-                         "dense_cholesky (default; fast+deterministic) | "
-                         "conjugate_gradient | cholmod")
+                         "conjugate_gradient (default; fastest here once singular "
+                         "frames are rejected) | dense_cholesky | cholmod")
     args = ap.parse_args()
 
     M = MJ.load_mano(args.mano)
