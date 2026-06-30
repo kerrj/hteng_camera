@@ -71,19 +71,27 @@ def main():
     # eyeball211; use torchcodec to match the rest of the pipeline.
     left_frame = None
     if args.video:
+        import threading
         import cv2
         from torchcodec.decoders import VideoDecoder
         _dec = VideoDecoder(args.video, device="cpu")
         _half = _dec.metadata.width // 2
+        _dec_lock = threading.Lock()   # torchcodec decoder is NOT thread-safe:
+        # the play loop and the scrub callback run on different threads, and a
+        # backward seek racing a forward decode segfaults. Serialize all access.
 
-        @functools.lru_cache(maxsize=256)
-        def left_frame(fr):
-            f = _dec.get_frames_in_range(start=fr, stop=fr + 1).data[0]   # (3,H,W) rgb
+        @functools.lru_cache(maxsize=512)
+        def _decode(fr):
+            with _dec_lock:
+                f = _dec.get_frames_in_range(start=fr, stop=fr + 1).data[0]  # (3,H,W)
             img = f[:, :, :_half].permute(1, 2, 0).numpy().astype(np.uint8)
             h, w = img.shape[:2]
             tw = args.thumb_w
-            img = cv2.resize(img, (tw, int(h * tw / w)), interpolation=cv2.INTER_AREA)
-            return img
+            return cv2.resize(img, (tw, int(h * tw / w)),
+                              interpolation=cv2.INTER_AREA)
+
+        def left_frame(fr):
+            return _decode(int(fr))
 
     M = MJ.load_mano(args.mano)
     faces = np.asarray(M["faces"])
@@ -135,26 +143,33 @@ def main():
         return (meta["beta_opt"] if gui_beta.value == "optimized"
                 else meta["beta_wilor_mean"])
 
+    # the play loop and scrub/dropdown callbacks fire on different threads;
+    # serialize the whole render so two updates can't interleave on the shared
+    # scene handles / decoder.
+    import threading
+    _update_lock = threading.Lock()
+
     def update(_=None):
-        fr = int(gui_frame.value)
-        lines = [f"frame {fr}"]
-        for name, (meta, frames, color) in tracks.items():
-            h = frames.get(fr)
-            if h is None:
-                mesh_h[name].visible = False
-                continue
-            v = mesh_verts(M, faces, h["quat"], h["trans_virtual"], h["Rv_l"],
-                           beta_for(meta), meta["mirror"])
-            mesh_h[name].vertices = v.astype(np.float32)   # update in place
-            mesh_h[name].visible = True
-            dist = float(np.linalg.norm(h["trans"]))   # from camera origin
-            lines.append(f"  {name}: dist {dist:.2f}m")
-        gui_info.value = "\n".join(lines)
-        # left-eye frame → frustum image plane + sidebar (update in place)
-        if left_frame is not None:
-            img = left_frame(fr)
-            frustum_h.image = img
-            gui_img.image = img
+        with _update_lock:
+            fr = int(gui_frame.value)
+            lines = [f"frame {fr}"]
+            for name, (meta, frames, color) in tracks.items():
+                h = frames.get(fr)
+                if h is None:
+                    mesh_h[name].visible = False
+                    continue
+                v = mesh_verts(M, faces, h["quat"], h["trans_virtual"], h["Rv_l"],
+                               beta_for(meta), meta["mirror"])
+                mesh_h[name].vertices = v.astype(np.float32)   # update in place
+                mesh_h[name].visible = True
+                dist = float(np.linalg.norm(h["trans"]))   # from camera origin
+                lines.append(f"  {name}: dist {dist:.2f}m")
+            gui_info.value = "\n".join(lines)
+            # left-eye frame → frustum image plane + sidebar (update in place)
+            if left_frame is not None:
+                img = left_frame(fr)
+                frustum_h.image = img
+                gui_img.image = img
 
     gui_frame.on_update(update)
     gui_beta.on_update(update)
