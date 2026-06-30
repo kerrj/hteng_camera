@@ -183,16 +183,22 @@ def make_costs(M, data, huber_px, w_shape,
     # difference of consecutive log-relative-rotations, per joint. Weighted per
     # joint: INTERNAL fingers (1..15) smoothed STRONGLY (articulation changes
     # slowly), GLOBAL wrist (joint 0) more weakly (the whole hand can rotate fast).
-    @jaxls.Cost.factory
-    def accel_pose(vals, a, b, c, wj):
-        # wj: (16,1) per-joint weight (global vs internal)
-        v0 = (jaxlie.SO3(vals[a]).inverse() @ jaxlie.SO3(vals[b])).log()  # (16,3)
-        v1 = (jaxlie.SO3(vals[b]).inverse() @ jaxlie.SO3(vals[c])).log()
-        return (wj * (v1 - v0)).reshape(-1)
+    # per-joint accel weight (16,1): joint 0 global (weaker), 1..15 internal.
+    # Closed over (a compile-time constant) rather than passed as a cost arg, so
+    # jaxls doesn't try to broadcast it along the per-triple batch axis.
+    wj_accel = jnp.concatenate([
+        jnp.full((1, 1), w_accel_pose_global),
+        jnp.full((15, 1), w_accel_pose)], axis=0)
 
     @jaxls.Cost.factory
-    def accel_trans(vals, a, b, c, w):
-        return w * (vals[a] - 2.0 * vals[b] + vals[c])
+    def accel_pose(vals, a, b, c):
+        v0 = (jaxlie.SO3(vals[a]).inverse() @ jaxlie.SO3(vals[b])).log()  # (16,3)
+        v1 = (jaxlie.SO3(vals[b]).inverse() @ jaxlie.SO3(vals[c])).log()
+        return (wj_accel * (v1 - v0)).reshape(-1)
+
+    @jaxls.Cost.factory
+    def accel_trans(vals, a, b, c):
+        return w_accel_trans * (vals[a] - 2.0 * vals[b] + vals[c])
 
     costs = []
     eye_I = jnp.broadcast_to(jnp.eye(3), (n, 3, 3))     # left-virtual cam = identity
@@ -212,14 +218,9 @@ def make_costs(M, data, huber_px, w_shape,
     i0, i1, i2 = data["accel_i0"], data["accel_i1"], data["accel_i2"]
     if (w_accel_pose > 0 or w_accel_trans > 0) and i0.shape[0] > 0:
         if w_accel_pose > 0:
-            # per-joint: joint 0 (global) weaker, joints 1..15 (internal) stronger
-            wj = jnp.concatenate([
-                jnp.full((1, 1), w_accel_pose_global),
-                jnp.full((15, 1), w_accel_pose)], axis=0)             # (16,1)
-            costs.append(accel_pose(PoseVar(i0), PoseVar(i1), PoseVar(i2), wj))
+            costs.append(accel_pose(PoseVar(i0), PoseVar(i1), PoseVar(i2)))
         if w_accel_trans > 0:
-            costs.append(accel_trans(TransVar(i0), TransVar(i1), TransVar(i2),
-                                     w_accel_trans))
+            costs.append(accel_trans(TransVar(i0), TransVar(i1), TransVar(i2)))
     return costs, fids
 
 
