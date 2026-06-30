@@ -401,36 +401,40 @@ def main():
     R_lr_np = np.array(data["R_lr"]); t_lr_np = np.array(data["t_lr"])
 
     mirror = 1.0 if want_right else -1.0
-    def fk_R(quat_i, beta_i):
-        R = np.array(jaxlie.SO3(jnp.asarray(quat_i)).as_matrix())   # (16,3,3)
-        j = np.array(MJ.mano_forward_R(M, jnp.asarray(R), jnp.asarray(beta_i)))
-        j[:, 0] *= mirror                                            # left-hand x-mirror
-        return j
 
-    def reproj_px(quat_i, beta_i, t_i, fpx_i, R_e, t_e):
-        x = fk_R(quat_i, beta_i) + t_i[None]            # left-virtual frame
-        cam = x @ R_e.T + t_e[None]                     # → this eye's frame
+    def fk_R_batched(quat_b, beta_b):
+        """Vmapped MANO FK over all frames → (n,21,3) left-virtual joints."""
+        R = jax.vmap(lambda q: jaxlie.SO3(q).as_matrix())(quat_b)   # (n,16,3,3)
+        j = jax.vmap(lambda Ri, bi: MJ.mano_forward_R(M, Ri, bi))(R, beta_b)
+        return j.at[:, :, 0].multiply(mirror)                       # left-hand x-mirror
+
+    @jax.jit
+    def reproj_all(quat_b, beta_b, trans_b, fpx_b, R_lr_b, t_lr_b):
+        """Both-eye reprojected pixels for ALL frames in one call → (n,21,2)x2."""
+        joints = fk_R_batched(quat_b, beta_b)                       # (n,21,3)
+        x = joints + trans_b[:, None, :]                            # left-virtual
         c = (out_size - 1) / 2.0
-        return np.stack([fpx_i * cam[:, 0] / cam[:, 2] + c,
-                         fpx_i * cam[:, 1] / cam[:, 2] + c], 1)
+        def proj(cam, f):
+            return jnp.stack([f[:, None] * cam[:, :, 0] / cam[:, :, 2] + c,
+                              f[:, None] * cam[:, :, 1] / cam[:, :, 2] + c], -1)
+        pL = proj(x, fpx_b)                                         # left eye (I,0)
+        camR = jnp.einsum("nkc,ndc->nkd", x, R_lr_b) + t_lr_b[:, None, :]
+        pR = proj(camR, fpx_b)
+        return pL, pR
 
-    # --- detailed diagnostics --------------------------------------------
-    # per-keypoint reproj error, split inlier vs outlier, both eyes
-    I3 = np.eye(3); z3 = np.zeros(3)
-    perkp_in, perkp_out = [], []
-    frame_med_in = []
-    for i in range(n):
-        pL = reproj_px(quat[i], beta[i], trans[i], fpx_np[i], I3, z3)
-        pR = reproj_px(quat[i], beta[i], trans[i], fpx_np[i], R_lr_np[i], t_lr_np[i])
-        eL = np.linalg.norm(pL - kpL_np[i], axis=1)
-        eR = np.linalg.norm(pR - kpR_np[i], axis=1)
-        m = valid_np[i] > 0.5
-        perkp_in += eL[m].tolist() + eR[m].tolist()
-        perkp_out += eL[~m].tolist() + eR[~m].tolist()
-        if m.any():
-            frame_med_in.append(np.concatenate([eL[m], eR[m]]).mean())
-    perkp_in = np.array(perkp_in); perkp_out = np.array(perkp_out)
-    fmi = np.array(frame_med_in)
+    # --- detailed diagnostics (vectorized) -------------------------------
+    # ~9000 un-jitted per-frame JAX calls -> one jitted vmap over all frames.
+    pL, pR = reproj_all(jnp.asarray(quat), jnp.asarray(beta), jnp.asarray(trans),
+                        jnp.asarray(fpx_np), jnp.asarray(R_lr_np),
+                        jnp.asarray(t_lr_np))
+    pL = np.array(pL); pR = np.array(pR)
+    eL = np.linalg.norm(pL - kpL_np, axis=2)                        # (n,21)
+    eR = np.linalg.norm(pR - kpR_np, axis=2)
+    m = valid_np > 0.5                                              # (n,21) all-True now
+    perkp_in = np.concatenate([eL[m], eR[m]])
+    perkp_out = np.concatenate([eL[~m], eR[~m]])
+    fmi = np.array([np.concatenate([eL[i][m[i]], eR[i][m[i]]]).mean()
+                    for i in range(n) if m[i].any()])
     # report depth in the LEFT-FISHEYE frame (optical-axis z), not the per-frame
     # left-virtual z whose axis is tilted toward the hand. j_fish below uses the
     # same Rv_l transform.
@@ -475,20 +479,23 @@ def main():
     # ready for temporal/world lifting:
     #   joints_fish = Rv_l @ (joints_virtual + t)
     #   global_orient_fish = Rv_l @ R_global   (rotate the wrist rotation in too)
+    # vectorized: FK + frame conversion for ALL frames at once (no per-frame
+    # un-jitted JAX calls).
+    joints_v_all = np.array(fk_R_batched(jnp.asarray(quat), jnp.asarray(beta)))
+    joints_v_all = joints_v_all + trans[:, None, :]                 # (n,21,3) left-virtual
+    j_fish_all = np.einsum("nkc,ndc->nkd", joints_v_all, Rvl_arr)   # Rv_l @ j → fisheye
+    R_glob_v_all = np.array(jax.vmap(lambda q: jaxlie.SO3(q).as_matrix())(
+        jnp.asarray(quat[:, 0])))                                   # (n,3,3)
+    R_glob_fish_all = np.einsum("nij,njk->nik", Rvl_arr, R_glob_v_all)
     with open(args.out, "w") as f:
         for i, fr in enumerate(frames):
-            joints_v = fk_R(quat[i], beta[i]) + trans[i][None]      # left-virtual
-            j_fish = joints_v @ Rvl_arr[i].T                        # → left-fisheye
-            # wrist (global) rotation carried into the fisheye frame
-            R_glob_v = np.array(jaxlie.SO3(jnp.asarray(quat[i][0])).as_matrix())
-            R_glob_fish = Rvl_arr[i] @ R_glob_v
             f.write(json.dumps({
                 "frame": int(fr), "is_right": want_right,
                 "trans": root_fish[i].tolist(),          # root in left-fisheye frame
                 "depth_m": float(root_fish[i][2]),       # optical-axis depth
-                "joints_3d_cam": j_fish.tolist(),        # LEFT-FISHEYE frame
+                "joints_3d_cam": j_fish_all[i].tolist(),  # LEFT-FISHEYE frame
                 "Rv_l": Rvl_arr[i].tolist(),             # virtual→fisheye (for ref)
-                "global_orient_R": R_glob_fish.tolist(),  # wrist rot in fisheye frame
+                "global_orient_R": R_glob_fish_all[i].tolist(),  # wrist rot, fisheye frame
             }) + "\n")
     print(f"wrote {args.out}")
 
