@@ -136,21 +136,30 @@ def make_costs(M, data, w_temporal, huber_px, w_shape):
     #         R_lr = Rv_r^T Rs Rv_l,  t_lr = Rv_r^T ts  (precomputed per frame)
     # Both eyes share f_px and principal point = crop centre. Verified to machine
     # precision in test_projection_math.py (P reprojects to both crop centres).
+    out_size = data["out_size"]
+
+    def eye_residual(x, obs2d, conf, f_px, R_e, t_e):
+        """Reproj residual of placed joints `x` (left-virtual) into one eye."""
+        cam = x @ R_e.T + t_e[None, :]                     # → this eye's frame
+        proj = project(cam, f_px, out_size)
+        res_px = (proj - obs2d) / norm                     # px-true (drives Huber)
+        # conf is the per-keypoint group weight; applied AFTER the Huber weight.
+        return res_px * conf[:, None] * jnp.sqrt(huber_w(res_px))
+
+    # BOTH eyes in ONE cost: the MANO forward kinematics (the expensive part, and
+    # what forward-mode AD differentiates through) runs ONCE per frame; the
+    # shared joints are then projected into each eye. Two separate per-eye costs
+    # would run FK + its Jacobian twice.
     @jaxls.Cost.factory(jac_mode="forward")
-    def reproj(vals, pose_v, t_v, beta_fixed, obs2d, valid, f_px, R_e, t_e, conf):
+    def reproj(vals, pose_v, t_v, beta_fixed,
+               obsL, fL, RL, tL, obsR, fR, RR, tR, conf):
         R = jaxlie.SO3(vals[pose_v]).as_matrix()           # (16,4)quat -> (16,3,3)
         joints = MJ.mano_forward_R(M, R, beta_fixed)
         joints = joints.at[:, 0].multiply(mirror)          # left-hand x-mirror
         x = joints + vals[t_v][None, :]                    # left-virtual frame
-        cam = x @ R_e.T + t_e[None, :]                     # → this eye's frame
-        proj = project(cam, f_px, data["out_size"])
-        # raw normalized pixel error → drives the Huber knee (px-true).
-        res_px = (proj - obs2d) / norm
-        # conf carries the per-keypoint group weight (wrist/mcp/pip/tip); valid
-        # masks epipolar outliers. Applied AFTER the Huber weight so they don't
-        # shift the px knee.
-        res = res_px * valid[:, None] * conf[:, None]
-        return (res * jnp.sqrt(huber_w(res_px))).ravel()
+        rL = eye_residual(x, obsL, conf, fL, RL, tL)
+        rR = eye_residual(x, obsR, conf, fR, RR, tR)
+        return jnp.concatenate([rL.ravel(), rR.ravel()])
 
     # SHAPE prior: pull the 15 INTERNAL finger-joint rotations toward the
     # geodesic mean of the two eyes' WiLoR estimates. Targets exactly the
@@ -176,14 +185,12 @@ def make_costs(M, data, w_temporal, huber_px, w_shape):
     costs = []
     eye_I = jnp.broadcast_to(jnp.eye(3), (n, 3, 3))     # left-virtual cam = identity
     eye_0 = jnp.zeros((n, 3))
-    # left eye: project directly (pose+t already in left-virtual frame)
+    # one cost, both eyes: left = (I,0) (pose+t already in left-virtual frame),
+    # right = (R_lr, t_lr) (verged rigid transform into the right-virtual frame).
     costs.append(reproj(PoseVar(fids), TransVar(fids), data["beta0"],
-                        data["kpL"], data["validL"], data["f_px"],
-                        eye_I, eye_0, data["confL"]))
-    # right eye: rigid (R_lr, t_lr) into the right-virtual frame
-    costs.append(reproj(PoseVar(fids), TransVar(fids), data["beta0"],
-                        data["kpR"], data["validR"], data["f_px"],
-                        data["R_lr"], data["t_lr"], data["confR"]))
+                        data["kpL"], data["f_px"], eye_I, eye_0,
+                        data["kpR"], data["f_px"], data["R_lr"], data["t_lr"],
+                        data["confL"]))
     # shape prior: internal finger pose toward the two-eye geodesic mean
     if w_shape > 0:
         costs.append(shape_prior(PoseVar(fids), data["shape_mean"]))
