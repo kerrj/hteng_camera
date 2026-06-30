@@ -52,6 +52,44 @@ def fisheye_unproject(px, py, K, dist, n_iter=10):
     return d / torch.linalg.norm(d, dim=-1, keepdim=True)
 
 
+def triangulate_rays(g_l, g_r, Rs, ts):
+    """Closest point to two (generally SKEW) gaze rays, in the LEFT frame.
+
+    The left/right YOLO bbox-centre rays won't actually intersect, so we take the
+    midpoint of their common perpendicular (the point closest to both rays).
+
+    Args:
+        g_l: (3,) ray direction in the LEFT camera frame.
+        g_r: (3,) ray direction in the RIGHT camera frame.
+        Rs, ts: stereo extrinsics, X_right = Rs @ X_left + ts (left→right).
+
+    Returns:
+        P: (3,) the common point in the LEFT camera frame.
+    """
+    u = g_l / torch.linalg.norm(g_l)                 # left ray dir, left frame
+    cr = -Rs.T @ ts                                  # right cam centre, left frame
+    v = Rs.T @ g_r                                   # right ray dir, left frame
+    v = v / torch.linalg.norm(v)
+    w0 = -cr                                         # O_left(=0) - cr
+    a = u @ u; b = u @ v; c = v @ v
+    d = u @ w0; e = v @ w0
+    denom = a * c - b * b                            # 0 ⇔ rays parallel
+    denom = torch.where(denom.abs() < 1e-8, torch.ones_like(denom), denom)
+    s = (b * e - c * d) / denom                      # param along left ray
+    t = (a * e - b * d) / denom                      # param along right ray
+    p_left = u * s                                   # closest pt on left ray
+    p_right = cr + v * t                             # closest pt on right ray
+    return 0.5 * (p_left + p_right)
+
+
+def render_crop(frame, Rv, f_px, K, dist, out_size, theta_max=2.6):
+    """Sample one virtual pinhole crop (Rv: virtual-cam→fisheye-cam, cols=axes)."""
+    rays = pinhole_rays(out_size, f_px, K.device)             # (N,3) virtual cam
+    rays_cam = rays @ Rv.T                                    # → fisheye cam frame
+    crop = sample_fisheye(frame, rays_cam, K, dist, theta_max)
+    return torch.nan_to_num(crop).reshape(3, out_size, out_size)
+
+
 def baseline_aligned_R(g, b_hat):
     """Virtual-cam rotation (cols = cam x,y,z axes in left frame), cv2 frame.
 
@@ -166,24 +204,44 @@ def fov_focal(bbox, g, K, dist, out_size, fov_scale=2.2):
     return (out_size / 2.0) / torch.tan(half_fov)
 
 
-def render_stereo_crop(frame_l, frame_r, bbox_l, Kl, Dl, Kr, Dr, Rs, b_hat,
-                       out_size=256, fov_scale=2.2, theta_max=2.6):
-    """Render a rectified pinhole crop pair for one hand (bbox in LEFT image).
+def bbox_center_ray(bbox, K, dist):
+    """Unproject a bbox-centre pixel → unit gaze ray in that eye's camera frame."""
+    return fisheye_unproject(float((bbox[0] + bbox[2]) / 2),
+                             float((bbox[1] + bbox[3]) / 2), K, dist)
 
-    Returns (crop_l, crop_r) as (3, out_size, out_size) tensors (NaN→0), plus a
-    dict of geometry {Rv_l, Rv_r, f_px, g} for later 3D lifting.
+
+def render_stereo_crop(frame_l, frame_r, bbox_l, bbox_r, Kl, Dl, Kr, Dr, Rs, ts,
+                       b_hat, out_size=256, fov_scale=2.2, theta_max=2.6):
+    """Render a VERGED, baseline-aligned pinhole crop pair for one hand.
+
+    Both eyes detect the hand independently (bbox_l in LEFT image, bbox_r in
+    RIGHT). We triangulate the two bbox-centre rays to a common 3D point P
+    (closest point to the skew rays), then aim each eye's virtual camera AT P —
+    so the hand is centred in BOTH crops (fixing the old bug where the right crop
+    just reused the left's orientation and drifted off-centre with disparity).
+
+    Each virtual camera is baseline-aligned (x-axis along the stereo baseline in
+    its own frame), so even though the optical axes verge on P, image rows remain
+    epipolar lines (horizontal). The cameras are NOT parallel, so depth is NOT
+    f*baseline/disparity here — downstream geometry must use Rv_l/Rv_r + the
+    pinhole projection only (no parallel-axis / disparity shortcut).
+
+    Returns (crop_l, crop_r) (3,out,out) tensors (NaN→0) plus geometry
+    {Rv_l, Rv_r, f_px, g_l, g_r, P} (P in the LEFT camera frame).
     """
-    g = fisheye_unproject(float((bbox_l[0] + bbox_l[2]) / 2),
-                          float((bbox_l[1] + bbox_l[3]) / 2), Kl, Dl)
-    f_px = fov_focal(bbox_l, g, Kl, Dl, out_size, fov_scale)
-    rays = pinhole_rays(out_size, f_px, Kl.device)            # (N,3) virtual cam
-    Rv_l = baseline_aligned_R(g, b_hat)
-    Rv_r = Rs @ Rv_l                                          # same world orient.
-    rays_l = rays @ Rv_l.T                                    # virtual→left frame
-    rays_r = rays @ Rv_r.T                                    # virtual→right frame
-    crop_l = sample_fisheye(frame_l, rays_l, Kl, Dl, theta_max)
-    crop_r = sample_fisheye(frame_r, rays_r, Kr, Dr, theta_max)
-    shp = (3, out_size, out_size)
-    return (torch.nan_to_num(crop_l).reshape(shp),
-            torch.nan_to_num(crop_r).reshape(shp),
-            {"Rv_l": Rv_l, "Rv_r": Rv_r, "f_px": f_px, "g": g})
+    g_l = bbox_center_ray(bbox_l, Kl, Dl)                     # left frame
+    g_r = bbox_center_ray(bbox_r, Kr, Dr)                     # right frame
+    P = triangulate_rays(g_l, g_r, Rs, ts)                    # left frame
+    # re-aim both eyes exactly at P (refines the raw bbox-centre rays)
+    look_l = P / torch.linalg.norm(P)
+    P_r = Rs @ P + ts                                         # P in right frame
+    look_r = P_r / torch.linalg.norm(P_r)
+    # shared focal: size the crop from the LEFT bbox's angular extent about P
+    f_px = fov_focal(bbox_l, look_l, Kl, Dl, out_size, fov_scale)
+    b_hat_r = Rs @ b_hat                                      # baseline dir, right frame
+    Rv_l = baseline_aligned_R(look_l, b_hat)
+    Rv_r = baseline_aligned_R(look_r, b_hat_r)
+    crop_l = render_crop(frame_l, Rv_l, f_px, Kl, Dl, out_size, theta_max)
+    crop_r = render_crop(frame_r, Rv_r, f_px, Kr, Dr, out_size, theta_max)
+    return crop_l, crop_r, {"Rv_l": Rv_l, "Rv_r": Rv_r, "f_px": f_px,
+                            "g_l": g_l, "g_r": g_r, "P": P}

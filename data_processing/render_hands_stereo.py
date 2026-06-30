@@ -59,9 +59,7 @@ def load_calib(calib_dir, ls, rs, dev):
     st = json.load(open(f"{calib_dir}/stereo_{ls}_{rs}.json"))
     t = lambda x: torch.tensor(x, device=dev, dtype=torch.float32)
     Rs, ts = t(st["R"]), t(st["t"])
-    b_hat = -Rs.T @ ts
-    b_hat = b_hat / torch.linalg.norm(b_hat)
-    return (t(cl["K"]), t(cl["dist"]), t(cr["K"]), t(cr["dist"]), Rs, b_hat,
+    return (t(cl["K"]), t(cl["dist"]), t(cr["K"]), t(cr["dist"]), Rs, ts,
             float(np.linalg.norm(st["t"])))
 
 
@@ -84,7 +82,7 @@ def main():
     args = parse_args()
     dev = torch.device("cuda")
     OUT = args.out_size
-    Kl, Dl, Kr, Dr, Rs, b_hat, baseline = load_calib(
+    Kl, Dl, Kr, Dr, Rs, ts, baseline = load_calib(
         args.calib_dir, args.left_serial, args.right_serial, dev)
 
     pin = {}
@@ -135,9 +133,11 @@ def main():
             dy = np.abs(kpL[:, 1] - kpR[:, 1])
             outlier = (dy >= args.dy_thresh) | ((kpL[:, 0] - kpR[:, 0]) <= 0.5)
 
-            bbox = torch.tensor(h["bbox"], device=dev)
-            cL, cR, _ = FP.render_stereo_crop(fl, frr, bbox, Kl, Dl, Kr, Dr, Rs,
-                                              b_hat, out_size=OUT)
+            # re-render the exact crops the ViT saw, from stored verged geometry
+            Rv_l = torch.tensor(h["Rv_l"], device=dev, dtype=torch.float32)
+            Rv_r = torch.tensor(h["Rv_r"], device=dev, dtype=torch.float32)
+            cL = FP.render_crop(fl, Rv_l, f_px, Kl, Dl, OUT)
+            cR = FP.render_crop(frr, Rv_r, f_px, Kr, Dr, OUT)
             L = cv2.cvtColor(cL.permute(1, 2, 0).clamp(0, 255).byte().cpu().numpy(),
                              cv2.COLOR_RGB2BGR)
             R = cv2.cvtColor(cR.permute(1, 2, 0).clamp(0, 255).byte().cpu().numpy(),

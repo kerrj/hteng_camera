@@ -2,11 +2,14 @@
 
 Like wilor_hands_batched.py, but instead of feeding WiLoR a raw square crop we
 render an undistorted virtual-pinhole view aimed at each hand (fisheye_pinhole).
-Detection runs on the LEFT eye; from each left bbox we render a *baseline-aligned
-rectified* left+right pinhole pair (same virtual intrinsics, rows = epipolar
-lines). We run the ViT on both eyes' crops (batched together across the whole
-chunk) and save both keypoint sets in rectified crop pixels, so per-keypoint
-disparity is just ``x_left - x_right`` and depth = f_px * baseline / disparity.
+Detection runs on BOTH eyes independently; per handedness we match the largest
+bbox in each eye, triangulate their centre rays to a common 3D point P (closest
+point to the skew rays), and render a *baseline-aligned VERGED* left+right
+pinhole pair aimed at P (shared focal). Both crops are centred on the hand and
+rows stay epipolar (horizontal), but the optical axes verge — so this is NOT a
+parallel-axis rig: depth is recovered by the stereo optimizer from each eye's
+SO3 + pinhole projection, NOT f*baseline/disparity. We run the ViT on both eyes'
+crops (batched across the chunk) and save both keypoint sets in crop pixels.
 
 Speed: pinhole rendering is two grid_samples — it *replaces* the raw crop op, so
 the only extra cost vs wilor_hands_batched is the 2nd eye's ViT pass (we run
@@ -61,7 +64,7 @@ def load_calib(calib_dir, ls, rs, device):
     baseline = float(np.linalg.norm(st["t"]))
     b_hat = -Rs.T @ ts
     b_hat = b_hat / torch.linalg.norm(b_hat)
-    return Kl, Dl, Kr, Dr, Rs, b_hat, baseline
+    return Kl, Dl, Kr, Dr, Rs, ts, b_hat, baseline
 
 
 def postprocess_crop(o_i, is_right, out_size, pipe):
@@ -77,33 +80,47 @@ def postprocess_crop(o_i, is_right, out_size, pipe):
 
 def run_chunk(pipe, dtype, calib, frames_l_u8, frames_r_u8, frame_idxs,
               conf, vit_batch, out_size, writer):
-    Kl, Dl, Kr, Dr, Rs, b_hat, baseline = calib
+    Kl, Dl, Kr, Dr, Rs, ts, b_hat, baseline = calib
     dev = pipe.device
     n = frames_l_u8.shape[0]
     H, Wd = frames_l_u8.shape[2], frames_l_u8.shape[3]
     frames_l_f = frames_l_u8.float()
     frames_r_f = frames_r_u8.float()
 
-    # 1) detect on the left eye (GPU)
-    dets = W.detect_gpu(pipe.hand_detector, frames_l_u8, conf)
+    # 1) detect on BOTH eyes independently (GPU)
+    dets_l = W.detect_gpu(pipe.hand_detector, frames_l_u8, conf)
+    dets_r = W.detect_gpu(pipe.hand_detector, frames_r_u8, conf)
 
-    # 2) per hand: render rectified L+R pinhole crops + geometry
-    crops_l, crops_r, meta = [], [], []  # meta: (li, bbox, is_right, geo)
-    per_frame_hands = [[] for _ in range(n)]
-    for li, boxes in enumerate(dets):
+    def largest_per_hand(boxes):
+        """{is_right: bbox(4,)} keeping only the largest-bbox box per handedness."""
+        best = {}
         for b in boxes:
-            is_right = int(round(float(b[5])))
-            bbox = torch.tensor(b[:4], device=dev)
+            ir = int(round(float(b[5])))
+            area = (b[2] - b[0]) * (b[3] - b[1])
+            if ir not in best or area > best[ir][0]:
+                best[ir] = (area, b[:4])
+        return {ir: bb for ir, (_, bb) in best.items()}
+
+    # 2) per hand: match L↔R by handedness (largest in each eye), triangulate,
+    #    render VERGED rectified crops aimed at the common 3D point.
+    crops_l, crops_r, meta = [], [], []  # meta: (li, bbox_l, bbox_r, is_right, geo)
+    per_frame_hands = [[] for _ in range(n)]
+    for li in range(n):
+        bl = largest_per_hand(dets_l[li])
+        br = largest_per_hand(dets_r[li])
+        for is_right in (bl.keys() & br.keys()):   # need the hand in BOTH eyes
+            bbox_l = torch.tensor(bl[is_right], device=dev)
+            bbox_r = torch.tensor(br[is_right], device=dev)
             cL, cR, geo = FP.render_stereo_crop(
-                frames_l_f[li], frames_r_f[li], bbox, Kl, Dl, Kr, Dr, Rs, b_hat,
-                out_size=out_size)
+                frames_l_f[li], frames_r_f[li], bbox_l, bbox_r,
+                Kl, Dl, Kr, Dr, Rs, ts, b_hat, out_size=out_size)
             # WiLoR trains on right hands: flip LEFT-hand crops before the ViT.
             if is_right == 0:
                 cL = torch.flip(cL, dims=[2])
                 cR = torch.flip(cR, dims=[2])
             crops_l.append(cL)
             crops_r.append(cR)
-            meta.append((li, b[:4], is_right, geo))
+            meta.append((li, bl[is_right], br[is_right], is_right, geo))
 
     if not meta:
         for li, fi in enumerate(frame_idxs):
@@ -124,7 +141,7 @@ def run_chunk(pipe, dtype, calib, frames_l_u8, frames_r_u8, frame_idxs,
     nL = len(crops_l)
 
     # 4) per hand: postprocess both eyes in crop coords, back-map left for viz
-    for j, (li, bbox, is_right, geo) in enumerate(meta):
+    for j, (li, bbox_l, bbox_r, is_right, geo) in enumerate(meta):
         oL = postprocess_crop({k: v[[j]] for k, v in outs.items()},
                               is_right, out_size, pipe)
         oR = postprocess_crop({k: v[[nL + j]] for k, v in outs.items()},
@@ -137,23 +154,26 @@ def run_chunk(pipe, dtype, calib, frames_l_u8, frames_r_u8, frame_idxs,
             geo["f_px"], out_size, geo["Rv_l"], Kl, Dl).cpu().numpy()
         per_frame_hands[li].append({
             "is_right": is_right,
-            "bbox": np.asarray(bbox).ravel().tolist(),
+            "bbox": np.asarray(bbox_l).ravel().tolist(),       # left-eye bbox
+            "bbox_right": np.asarray(bbox_r).ravel().tolist(),
             "f_px": float(geo["f_px"]),
             "out_size": out_size,
             "kp_left": kpL.tolist(),
             "kp_right": kpR.tolist(),
             "keypoints_2d": kpL_fish.tolist(),
             "keypoints_3d": oL["pred_keypoints_3d"][0].tolist(),
-            # MANO params (left-eye estimate) — init + prior for stereo opt.
+            "P": geo["P"].cpu().numpy().tolist(),              # triangulated pt, left frame
+            # MANO params (left-eye estimate) — init for stereo opt.
             # global_orient/hand_pose are axis-angle in the rectified LEFT-crop
             # camera frame (postprocess already undid the left-hand flip).
             "global_orient": np.asarray(oL["global_orient"]).reshape(-1).tolist(),
             "hand_pose": np.asarray(oL["hand_pose"]).reshape(-1).tolist(),
             "betas": np.asarray(oL["betas"]).reshape(-1).tolist(),
-            # Rv_l: rectified-crop-cam -> left-fisheye-cam rotation (cols=axes).
-            # Maps each hand's per-frame crop frame into the common left-fisheye
-            # frame for temporal coupling.
+            # Rv_l/Rv_r: rectified-crop-cam -> {left,right}-fisheye-cam rotations
+            # (cols=axes). The crops VERGE on P, so the optimizer must project
+            # with each eye's own SO3 + pinhole (no parallel-axis shortcut).
             "Rv_l": geo["Rv_l"].cpu().numpy().tolist(),
+            "Rv_r": geo["Rv_r"].cpu().numpy().tolist(),
         })
 
     for li, fi in enumerate(frame_idxs):
