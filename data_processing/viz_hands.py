@@ -147,7 +147,8 @@ def main():
                            beta_for(meta), meta["mirror"])
             mesh_h[name].vertices = v.astype(np.float32)   # update in place
             mesh_h[name].visible = True
-            lines.append(f"  {name}: depth {h['depth_m']:.2f}m")
+            dist = float(np.linalg.norm(h["trans"]))   # from camera origin
+            lines.append(f"  {name}: dist {dist:.2f}m")
         gui_info.value = "\n".join(lines)
         # left-eye frame → frustum image plane + sidebar (update in place)
         if left_frame is not None:
