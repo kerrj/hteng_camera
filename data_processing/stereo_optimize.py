@@ -397,7 +397,7 @@ def main():
     quat0_np = np.array(data["quat0"])
     beta = np.array(data["beta0"])  # frozen to WiLoR's estimate
     valid_np = np.array(data["validL"])  # (n,21) inlier mask
-    kpL_np = np.array(data["kpL"]); kpR_np = np.array(data["kpR"]); fpx_np = np.array(fpx)
+    kpL_np = np.array(data["kpL"]); kpR_np = np.array(data["kpR"]); fpx_np = np.array(data["f_px"])
     R_lr_np = np.array(data["R_lr"]); t_lr_np = np.array(data["t_lr"])
 
     mirror = 1.0 if want_right else -1.0
