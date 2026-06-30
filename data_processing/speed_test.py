@@ -32,7 +32,15 @@ def main():
     ap.add_argument("--huber-px", type=float, default=5.0)
     ap.add_argument("--chunks", default="100,200,300,500")
     ap.add_argument("--linear", default="conjugate_gradient")
+    ap.add_argument("--cg-tol", type=float, default=None,
+                    help="if set, FIXED CG tolerance (min=max) — disables "
+                         "Eisenstat-Walker adaptive tightening")
     args = ap.parse_args()
+
+    linear = args.linear
+    if args.cg_tol is not None:
+        linear = jaxls.ConjugateGradientConfig(
+            tolerance_min=args.cg_tol, tolerance_max=args.cg_tol)
 
     Mh = MJ.load_mano(args.mano)
     data, t_init, frames, _, _ = SO.build_data(
@@ -56,7 +64,7 @@ def main():
             ccosts, [SO.PoseVar(cfids), SO.TransVar(cfids)]).analyze()
         t2 = time.time()
         sol = prob.solve(cinit, trust_region=jaxls.TrustRegionConfig(),
-                         linear_solver=args.linear,
+                         linear_solver=linear,
                          termination=jaxls.TerminationConfig(max_iterations=args.iters),
                          verbose=False)
         jax.block_until_ready(sol[SO.PoseVar])
