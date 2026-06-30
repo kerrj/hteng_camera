@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 
 import jaxls
+import mano_jax as MJ
 import stereo_optimize as SO
 
 
@@ -33,7 +34,7 @@ def main():
     ap.add_argument("--linear", default="conjugate_gradient")
     args = ap.parse_args()
 
-    Mh = SO.load_mano(args.mano)
+    Mh = MJ.load_mano(args.mano)
     data, t_init, frames, _, _ = SO.build_data(
         args.jsonl, args.calib_dir, args.left_serial, args.right_serial, args.hand)
     n = len(frames)
