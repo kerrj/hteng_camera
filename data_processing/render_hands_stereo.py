@@ -63,9 +63,9 @@ def load_calib(calib_dir, ls, rs, dev):
             float(np.linalg.norm(st["t"])))
 
 
-def project(j_cam, f_px, out_size, baseline_x=0.0):
+def project(cam, f_px, out_size):
+    """Pinhole project (N,3) virtual-cam points → crop px (centre principal pt)."""
     c = (out_size - 1) / 2.0
-    cam = j_cam - np.array([baseline_x, 0, 0])[None]
     return np.stack([f_px * cam[:, 0] / cam[:, 2] + c,
                      f_px * cam[:, 1] / cam[:, 2] + c], 1)
 
@@ -84,6 +84,7 @@ def main():
     OUT = args.out_size
     Kl, Dl, Kr, Dr, Rs, ts, baseline = load_calib(
         args.calib_dir, args.left_serial, args.right_serial, dev)
+    Rs_np = np.array(Rs.cpu()); ts_np = np.array(ts.cpu()).reshape(3)
 
     pin = {}
     for line in open(args.pinhole):
@@ -131,11 +132,13 @@ def main():
             kpL = np.array(h["kp_left"], np.float32)
             kpR = np.array(h["kp_right"], np.float32)
             dy = np.abs(kpL[:, 1] - kpR[:, 1])
-            outlier = (dy >= args.dy_thresh) | ((kpL[:, 0] - kpR[:, 0]) <= 0.5)
+            outlier = (dy >= args.dy_thresh)   # epipolar gate (matches optimizer)
 
             # re-render the exact crops the ViT saw, from stored verged geometry
-            Rv_l = torch.tensor(h["Rv_l"], device=dev, dtype=torch.float32)
-            Rv_r = torch.tensor(h["Rv_r"], device=dev, dtype=torch.float32)
+            Rv_l_np = np.array(h["Rv_l"], np.float32)
+            Rv_r_np = np.array(h["Rv_r"], np.float32)
+            Rv_l = torch.tensor(Rv_l_np, device=dev)
+            Rv_r = torch.tensor(Rv_r_np, device=dev)
             cL = FP.render_crop(fl, Rv_l, f_px, Kl, Dl, OUT)
             cR = FP.render_crop(frr, Rv_r, f_px, Kr, Dr, OUT)
             L = cv2.cvtColor(cL.permute(1, 2, 0).clamp(0, 255).byte().cpu().numpy(),
@@ -148,12 +151,15 @@ def main():
             draw_skel(Lr, kpL, (0, 220, 0), outlier)
             draw_skel(Rr, kpR, (0, 220, 0), outlier)
 
-            # opt: optimized 3D reprojected into both eyes
+            # opt: optimized 3D (LEFT-FISHEYE frame) reprojected into both verged
+            # eyes via their own Rv: left = Rv_l^T j; right = Rv_r^T (Rs j + ts).
             o = opt[want].get(fr)
             if o is not None:
-                j = np.array(o["joints_3d_cam"], np.float32)
-                draw_skel(Lo, project(j, f_px, OUT, 0.0), (255, 255, 0))
-                draw_skel(Ro, project(j, f_px, OUT, baseline), (255, 255, 0))
+                j = np.array(o["joints_3d_cam"], np.float32)        # left-fisheye
+                jL = j @ Rv_l_np                                    # Rv_l^T @ j
+                jR = (j @ Rs_np.T + ts_np[None]) @ Rv_r_np          # Rv_r^T @ (Rs j+ts)
+                draw_skel(Lo, project(jL, f_px, OUT), (255, 255, 0))
+                draw_skel(Ro, project(jR, f_px, OUT), (255, 255, 0))
                 tag = f"d={o['depth_m']:.2f}m"
             else:
                 n_in = int((~outlier).sum())
