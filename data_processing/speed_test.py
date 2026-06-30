@@ -82,6 +82,15 @@ def main():
             b, a, s = one_solve(o, o + chunk)
             print(f"  {lab:18s} build={b:7.1f}ms  analyze={a:7.1f}ms  solve={s:8.1f}ms")
 
+    # all-in-one-call: solve ALL n frames in a single jaxls problem. With Schur
+    # 'auto' on the block-diagonal (no-temporal) system this is an exact per-frame
+    # blockwise inverse, so one call should scale fine and avoids per-chunk
+    # recompiles. (Server load makes wall times noisy — take the min.)
+    print(f"\n===== ALL {n} frames in ONE call =====")
+    b, a, s = one_solve(0, n)
+    print(f"  build={b:7.1f}ms  analyze={a:7.1f}ms  solve={s:8.1f}ms "
+          f"({s/n*1e3:.2f}ms/frame)")
+
 
 if __name__ == "__main__":
     main()
