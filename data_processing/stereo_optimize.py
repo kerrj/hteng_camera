@@ -557,7 +557,15 @@ def main():
     R_glob_v_all = np.array(jax.vmap(lambda q: jaxlie.SO3(q).as_matrix())(
         jnp.asarray(quat[:, 0])))                                   # (n,3,3)
     R_glob_fish_all = np.einsum("nij,njk->nik", Rvl_arr, R_glob_v_all)
+    beta_wilor_mean = np.mean(np.array(data["beta0"]), axis=0)
     with open(args.out, "w") as f:
+        # first line: file-level meta (shared shape + the WiLoR-mean for the viz
+        # "default vs optimized beta" toggle). Distinguished by "meta": True.
+        f.write(json.dumps({
+            "meta": True, "is_right": want_right, "mirror": mirror,
+            "beta_opt": beta_solved.tolist(),
+            "beta_wilor_mean": beta_wilor_mean.tolist(),
+        }) + "\n")
         for i, fr in enumerate(frames):
             f.write(json.dumps({
                 "frame": int(fr), "is_right": want_right,
@@ -566,6 +574,10 @@ def main():
                 "joints_3d_cam": j_fish_all[i].tolist(),  # LEFT-FISHEYE frame
                 "Rv_l": Rvl_arr[i].tolist(),             # virtual→fisheye (for ref)
                 "global_orient_R": R_glob_fish_all[i].tolist(),  # wrist rot, fisheye frame
+                # viz re-poser needs pose quats + LEFT-VIRTUAL trans (mesh is
+                # built in left-virtual then placed by + trans, @ Rv_l → fisheye):
+                "quat": quat[i].tolist(),                # (16,4) per-joint wxyz
+                "trans_virtual": trans[i].tolist(),      # (3,) left-virtual root
             }) + "\n")
     print(f"wrote {args.out}")
 
