@@ -26,7 +26,7 @@ def main():
     args = ap.parse_args()
     dev = torch.device("cuda")
     OUT = args.out_size
-    Kl, Dl, Kr, Dr, Rs, ts, baseline = load_calib(
+    Kl, Dl, Kr, Dr, Rs, ts, b_hat, baseline = load_calib(
         args.calib_dir, "046060323008", "046060323001", dev)
 
     from torchcodec.decoders import VideoDecoder
