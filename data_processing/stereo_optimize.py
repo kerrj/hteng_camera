@@ -9,7 +9,7 @@ but the optical axes are NOT parallel). We optimize, per frame:
     pose       (16,4) per-joint unit quats (wxyz) on the SO(3) manifold;
                       joint 0 = global_orient, 1..15 = finger joints. The
                       optimizer retracts tangent steps via SO3.exp (egoallo style).
-    betas      (10,) shape — FROZEN to WiLoR's per-frame estimate
+    betas      (10,) shape — ONE shared instance optimized for the whole video
     t          (3,)  MANO-root translation in the LEFT-VIRTUAL crop frame
 
 against three factor types:
@@ -63,6 +63,11 @@ class TransVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.array([0., 0., 
     """MANO-root translation in the rectified-left-crop camera frame (metres)."""
 
 
+class BetaVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.zeros(10)):
+    """MANO shape (10,). ONE instance shared across the whole video (the hand's
+    shape is constant), so every frame's reproj cost references BetaVar(0)."""
+
+
 def project(joints_cam, f_px, out_size):
     """Pinhole project (N,3) camera-frame points → (N,2) crop pixels."""
     c = (out_size - 1) / 2.0
@@ -95,7 +100,7 @@ def kp_weights(w_wrist, w_mcp, w_pip, w_tip):
 
 
 def make_costs(M, data, huber_px, w_shape,
-               w_accel_pose, w_accel_pose_global, w_accel_trans):
+               w_accel_pose, w_accel_pose_global, w_accel_trans, w_beta):
     """Build batched jaxls costs from the per-frame stacked arrays in ``data``."""
     n = data["pose0"].shape[0]
     fids = jnp.arange(n)
@@ -152,10 +157,12 @@ def make_costs(M, data, huber_px, w_shape,
     # shared joints are then projected into each eye. Two separate per-eye costs
     # would run FK + its Jacobian twice.
     @jaxls.Cost.factory(jac_mode="forward")
-    def reproj(vals, pose_v, t_v, beta_fixed,
+    def reproj(vals, pose_v, t_v, beta_v,
                obsL, fL, RL, tL, obsR, fR, RR, tR, conf):
         R = jaxlie.SO3(vals[pose_v]).as_matrix()           # (16,4)quat -> (16,3,3)
-        joints = MJ.mano_forward_R(M, R, beta_fixed)
+        # beta_v is ONE shared BetaVar(0) — every frame's cost reads the same
+        # shape, so the joint solve fits a single video-wide hand shape.
+        joints = MJ.mano_forward_R(M, R, vals[beta_v])
         joints = joints.at[:, 0].multiply(mirror)          # left-hand x-mirror
         x = joints + vals[t_v][None, :]                    # left-virtual frame
         rL = eye_residual(x, obsL, conf, fL, RL, tL)
@@ -200,15 +207,26 @@ def make_costs(M, data, huber_px, w_shape,
     def accel_trans(vals, a, b, c):
         return w_accel_trans * (vals[a] - 2.0 * vals[b] + vals[c])
 
+    # weak prior keeping the shared shape near beta=0 (MANO mean hand). 10 betas
+    # over thousands of frames are well-constrained, but this guards against
+    # drift into implausible shapes / the shape absorbing pose error.
+    @jaxls.Cost.factory
+    def beta_prior(vals, beta_v):
+        return w_beta * vals[beta_v]
+
     costs = []
     eye_I = jnp.broadcast_to(jnp.eye(3), (n, 3, 3))     # left-virtual cam = identity
     eye_0 = jnp.zeros((n, 3))
     # one cost, both eyes: left = (I,0) (pose+t already in left-virtual frame),
     # right = (R_lr, t_lr) (verged rigid transform into the right-virtual frame).
-    costs.append(reproj(PoseVar(fids), TransVar(fids), data["beta0"],
+    # BetaVar(0) is ONE shared shape var broadcast across all n frames.
+    beta_ids = jnp.zeros(n, dtype=jnp.int32)
+    costs.append(reproj(PoseVar(fids), TransVar(fids), BetaVar(beta_ids),
                         data["kpL"], data["f_px"], eye_I, eye_0,
                         data["kpR"], data["f_px"], data["R_lr"], data["t_lr"],
                         data["confL"]))
+    if w_beta > 0:
+        costs.append(beta_prior(BetaVar(0)))
     # shape prior: internal finger pose toward the two-eye geodesic mean
     if w_shape > 0:
         costs.append(shape_prior(PoseVar(fids), data["shape_mean"]))
@@ -373,6 +391,10 @@ def main():
                          "Sweep (2026-06-29): 0->54px reproj p99 & 6rad pose drift; "
                          "0.1 -> 1.9px p50 / 10px p99 / 0.3rad drift; 1.0 over-"
                          "constrains. 0.1 is the knee.")
+    ap.add_argument("--w-beta", type=float, default=0.5,
+                    help="prior keeping the single shared MANO shape near 0 (mean "
+                         "hand). Shape is now OPTIMIZED (one beta for the whole "
+                         "video), not frozen; set 0 to disable the prior.")
     # per-keypoint reprojection group weights (residual-space; cost ∝ w²).
     # wrist high: it's root-relative (0,0,0) so it only constrains translation
     # → lets stereo disparity fix metric depth. tips low: noisy + pose-sensitive.
@@ -419,13 +441,16 @@ def main():
     fids = jnp.arange(n)
     costs, _ = make_costs(M, data, args.huber_px, args.w_shape,
                           args.w_accel_pose, args.w_accel_pose_global,
-                          args.w_accel_trans)
+                          args.w_accel_trans, args.w_beta)
+    # init the shared shape to the per-frame mean of WiLoR's betas
+    beta_init = jnp.mean(data["beta0"], axis=0)                  # (10,)
     init = jaxls.VarValues.make([
         PoseVar(fids).with_value(data["quat0"]),
         TransVar(fids).with_value(t_init),
+        BetaVar(0).with_value(beta_init),
     ])
     prob = jaxls.LeastSquaresProblem(
-        costs, [PoseVar(fids), TransVar(fids)]).analyze()
+        costs, [PoseVar(fids), TransVar(fids), BetaVar(0)]).analyze()
     t = time.time()
     # LM trust region required (plain Gauss-Newton diverges to NaN here).
     sol = prob.solve(init, trust_region=jaxls.TrustRegionConfig(),
@@ -434,10 +459,13 @@ def main():
                      verbose=True)
     quat = np.array(sol[PoseVar])
     trans = np.array(sol[TransVar])
+    beta_solved = np.array(sol[BetaVar]).reshape(-1)[:10]   # (10,) shared shape
     print(f"solved {n} frames in {time.time()-t:.1f}s")
+    print(f"shared betas: WiLoR-mean={np.mean(np.array(data['beta0']),0).round(2)}")
+    print(f"              optimized ={beta_solved.round(2)}")
 
     quat0_np = np.array(data["quat0"])
-    beta = np.array(data["beta0"])  # frozen to WiLoR's estimate
+    beta = np.broadcast_to(beta_solved, (n, 10))        # shared shape, per frame
     valid_np = np.array(data["validL"])  # (n,21) inlier mask
     kpL_np = np.array(data["kpL"]); kpR_np = np.array(data["kpR"]); fpx_np = np.array(data["f_px"])
     R_lr_np = np.array(data["R_lr"]); t_lr_np = np.array(data["t_lr"])
@@ -493,9 +521,9 @@ def main():
     print("\n================ OPTIMIZATION DIAGNOSTICS ================")
     print(f"frames solved: {n}   iters: {args.iters}   linear: {args.linear}")
     print(f"weights: accel[pose={args.w_accel_pose} global={args.w_accel_pose_global} "
-          f"trans={args.w_accel_trans}] shape={args.w_shape} huber_px={args.huber_px}"
-          f"  ({len(np.asarray(data['accel_i1']))} accel triples; shape prior = "
-          f"two-eye mean; NO global/depth prior; beta FROZEN to WiLoR)")
+          f"trans={args.w_accel_trans}] shape={args.w_shape} beta={args.w_beta} "
+          f"huber_px={args.huber_px}  ({len(np.asarray(data['accel_i1']))} accel "
+          f"triples; ONE shared optimized beta; NO global/depth prior)")
     print(f"\nREPROJ ERR inliers (px, {len(perkp_in)} kp): "
           f"mean={perkp_in.mean():.2f}  {pct(perkp_in)}")
     if len(perkp_out):
