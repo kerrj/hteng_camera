@@ -36,6 +36,13 @@ import torch
 import fisheye_pinhole as FP
 import wilor_hands_batched as W
 
+# Reject a stereo hand whose triangulated depth is below this (metres). A hand
+# can't be this close; sub-0.1m (often negative) P comes from near-parallel or
+# mismatched left/right bbox-centre rays and would otherwise create a 1/z^2
+# projection singularity that destabilises the downstream solve.
+MIN_DEPTH_M = 0.1
+_REJECT = {"n": 0}   # count of hands rejected for implausible triangulation
+
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
@@ -111,6 +118,17 @@ def run_chunk(pipe, dtype, calib, frames_l_u8, frames_r_u8, frame_idxs,
         for is_right in (bl.keys() & br.keys()):   # need the hand in BOTH eyes
             bbox_l = torch.tensor(bl[is_right], device=dev)
             bbox_r = torch.tensor(br[is_right], device=dev)
+            # REJECT implausible triangulation before rendering. Near-parallel or
+            # mismatched (left/right boxes on different things) bbox-centre rays
+            # give a closest-point P near/behind the baseline (z<0.1m, sometimes
+            # negative). Such frames create a projection singularity (1/z^2
+            # Jacobian) that poisons the shared LM trust-region in the solve.
+            g_l = FP.bbox_center_ray(bbox_l, Kl, Dl)
+            g_r = FP.bbox_center_ray(bbox_r, Kr, Dr)
+            P_chk = FP.triangulate_rays(g_l, g_r, Rs, ts)
+            if float(P_chk[2]) < MIN_DEPTH_M:
+                _REJECT["n"] += 1
+                continue
             cL, cR, geo = FP.render_stereo_crop(
                 frames_l_f[li], frames_r_f[li], bbox_l, bbox_r,
                 Kl, Dl, Kr, Dr, Rs, ts, b_hat, out_size=out_size)
@@ -215,7 +233,8 @@ def main():
         el = time.time() - t0
         print(f"[{done}/{n_frames}] {done/el:.1f} fps", flush=True)
     writer.close()
-    print(f"done in {time.time()-t0:.0f}s -> {args.out}/hands.jsonl")
+    print(f"done in {time.time()-t0:.0f}s -> {args.out}/hands.jsonl  "
+          f"(rejected {_REJECT['n']} hands: triangulated depth < {MIN_DEPTH_M}m)")
 
 
 if __name__ == "__main__":
