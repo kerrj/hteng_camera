@@ -350,14 +350,12 @@ def main():
                          "so 5px robustifies the noisy mid-tail; was 10px (barely "
                          "active). Normalized internally to match residual scale.")
     ap.add_argument("--iters", type=int, default=30)
-    ap.add_argument("--chunk", type=int, default=500,
-                    help="solve in fixed-size frame chunks (0 = all at once). "
-                         "Exact when temporal is off; keeps each CG system small "
-                         "and lets jaxls reuse one compiled solve.")
     ap.add_argument("--frame-min", type=int, default=None)
     ap.add_argument("--frame-max", type=int, default=None)
-    ap.add_argument("--linear", default="conjugate_gradient",
-                    help="jaxls linear solver: conjugate_gradient | dense_cholesky | cholmod")
+    ap.add_argument("--linear", default="dense_cholesky",
+                    help="jaxls linear solver for the Schur-reduced system: "
+                         "dense_cholesky (default; fast+deterministic) | "
+                         "conjugate_gradient | cholmod")
     args = ap.parse_args()
 
     M = MJ.load_mano(args.mano)
@@ -369,39 +367,31 @@ def main():
     out_size = data["out_size"]
 
     import time
-    # Solve in fixed-size CHUNKS. With temporal off, frames are independent, so
-    # one giant CG solve over all n frames gives no coupling benefit but a huge,
-    # ill-conditioned linear system (CG iters scale superlinearly) — 4808 frames
-    # ran >30 min and didn't finish. Chunking is exact here and keeps each CG
-    # system small; fixed chunk shape → jaxls compiles the solve ONCE and reuses
-    # it for every chunk (only the ragged last chunk recompiles). With temporal
-    # on, chunk boundaries drop one smoothness edge each — negligible for the
-    # chunk sizes here; revisit with overlap if temporal weight gets large.
-    chunk = args.chunk if args.chunk > 0 else n
-    quat = np.empty((n, 16, 4), np.float32)
-    trans = np.empty((n, 3), np.float32)
+    # ONE big solve over all n frames. jaxls's Schur elimination (analyze's
+    # default "auto") eliminates the per-frame PoseVar block — for the
+    # block-diagonal (no-temporal) system the reduced system is just the small
+    # TransVar block, factored directly by dense_cholesky. This is ~16x faster
+    # than the old chunked CG path (189s -> ~12s for 4400 frames) AND
+    # deterministic (CG's shared-lambda + Eisenstat-Walker gave 5-80s variance).
+    # It also transfers cleanly to temporal smoothing: a banded coupled system
+    # Schur-eliminates the same way, whereas chunking would sever smoothness
+    # edges at boundaries.
+    fids = jnp.arange(n)
+    costs, _ = make_costs(M, data, args.w_temporal, args.huber_px, args.w_shape)
+    init = jaxls.VarValues.make([
+        PoseVar(fids).with_value(data["quat0"]),
+        TransVar(fids).with_value(t_init),
+    ])
+    prob = jaxls.LeastSquaresProblem(
+        costs, [PoseVar(fids), TransVar(fids)]).analyze()
     t = time.time()
-    for s in range(0, n, chunk):
-        e = min(s + chunk, n)
-        cn = e - s
-        cfids = jnp.arange(cn)
-        cdata = {k: (v[s:e] if hasattr(v, "shape") and getattr(v, "ndim", 0) >= 1
-                     else v) for k, v in data.items()}
-        ccosts, _ = make_costs(M, cdata, args.w_temporal, args.huber_px, args.w_shape)
-        cinit = jaxls.VarValues.make([
-            PoseVar(cfids).with_value(cdata["quat0"]),
-            TransVar(cfids).with_value(t_init[s:e]),
-        ])
-        prob = jaxls.LeastSquaresProblem(
-            ccosts, [PoseVar(cfids), TransVar(cfids)]).analyze()
-        # LM trust region required (plain Gauss-Newton diverges to NaN here).
-        csol = prob.solve(cinit, trust_region=jaxls.TrustRegionConfig(),
-                          linear_solver=args.linear,
-                          termination=jaxls.TerminationConfig(max_iterations=args.iters),
-                          verbose=False)
-        quat[s:e] = np.array(csol[PoseVar])
-        trans[s:e] = np.array(csol[TransVar])
-        print(f"  chunk [{s}:{e}] / {n} solved ({time.time()-t:.1f}s elapsed)", flush=True)
+    # LM trust region required (plain Gauss-Newton diverges to NaN here).
+    sol = prob.solve(init, trust_region=jaxls.TrustRegionConfig(),
+                     linear_solver=args.linear,
+                     termination=jaxls.TerminationConfig(max_iterations=args.iters),
+                     verbose=True)
+    quat = np.array(sol[PoseVar])
+    trans = np.array(sol[TransVar])
     print(f"solved {n} frames in {time.time()-t:.1f}s")
 
     quat0_np = np.array(data["quat0"])
