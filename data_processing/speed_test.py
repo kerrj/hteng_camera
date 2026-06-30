@@ -17,48 +17,6 @@ import jax.numpy as jnp
 import jaxls
 import mano_jax as MJ
 import stereo_optimize as SO
-import vmap_solve as VS
-
-
-def run_vmap(Mh, data, t_init, n, args):
-    """Benchmark + validate the per-frame vmapped LM solver."""
-    norm = float(data["out_size"])
-    huber_n = args.huber_px / norm
-    mirror = float(data["mirror"])
-    residual = VS.make_residual_fn(Mh, mirror, norm, huber_n, args.w_shape)
-    solver = VS.make_solver(residual, n_iters=args.iters)
-
-    # stack per-frame data dicts
-    fd = {
-        "beta": data["beta0"], "kpL": data["kpL"], "kpR": data["kpR"],
-        "conf": data["confL"], "f_px": data["f_px"],
-        "R_lr": data["R_lr"], "t_lr": data["t_lr"], "shape_mean": data["shape_mean"],
-    }
-    q0 = data["quat0"]; t0 = t_init
-
-    t = time.time()
-    quat, trans = solver(q0, t0, fd)
-    jax.block_until_ready(quat)
-    t_compile = time.time() - t
-    # warm runs
-    times = []
-    for _ in range(3):
-        t = time.time()
-        quat, trans = solver(q0, t0, fd)
-        jax.block_until_ready(quat)
-        times.append(time.time() - t)
-    t_warm = min(times)
-
-    # reprojection error (inlier-style: all kp) to validate the fit
-    rs = jax.vmap(lambda q, tr, d: residual(q, tr, d))(quat, trans, fd)
-    # recover px error: residual is normalized & huber-weighted; recompute raw
-    import numpy as np
-    quat = np.array(quat); trans = np.array(trans)
-    print(f"\nVMAP solver: {n} frames, iters={args.iters}")
-    print(f"  compile+1st run: {t_compile:.2f}s")
-    print(f"  warm full-batch: {t_warm*1000:.1f}ms  ({t_warm/n*1e6:.1f} us/frame)")
-    print(f"  -> {n} frames in {t_warm:.3f}s warm "
-          f"(vs jaxls ~5-80s per 500-chunk)")
 
 
 def main():
@@ -74,27 +32,20 @@ def main():
     ap.add_argument("--huber-px", type=float, default=5.0)
     ap.add_argument("--chunks", default="100,200,300,500")
     ap.add_argument("--linear", default="conjugate_gradient")
-    ap.add_argument("--cg-tol", type=float, default=None,
-                    help="if set, FIXED CG tolerance (min=max) — disables "
-                         "Eisenstat-Walker adaptive tightening")
-    ap.add_argument("--vmap", action="store_true",
-                    help="benchmark the per-frame vmapped LM solver instead")
+    ap.add_argument("--schur", default="auto", choices=["auto", "off"],
+                    help="Schur elimination in analyze(). 'auto' makes the fully "
+                         "block-diagonal (no-temporal) system an exact per-frame "
+                         "blockwise inverse.")
     args = ap.parse_args()
 
     linear = args.linear
-    if args.cg_tol is not None:
-        linear = jaxls.ConjugateGradientConfig(
-            tolerance_min=args.cg_tol, tolerance_max=args.cg_tol)
 
     Mh = MJ.load_mano(args.mano)
     data, t_init, frames, _, _ = SO.build_data(
         args.jsonl, args.calib_dir, args.left_serial, args.right_serial, args.hand)
     n = len(frames)
-    print(f"loaded {n} frames, hand={args.hand}, linear={args.linear}, iters={args.iters}")
-
-    if args.vmap:
-        run_vmap(Mh, data, t_init, n, args)
-        return
+    print(f"loaded {n} frames, hand={args.hand}, linear={args.linear}, "
+          f"schur={args.schur}, iters={args.iters}")
 
     def one_solve(s, e):
         cn = e - s
@@ -109,7 +60,8 @@ def main():
             SO.TransVar(cfids).with_value(t_init[s:e]),
         ])
         prob = jaxls.LeastSquaresProblem(
-            ccosts, [SO.PoseVar(cfids), SO.TransVar(cfids)]).analyze()
+            ccosts, [SO.PoseVar(cfids), SO.TransVar(cfids)]
+        ).analyze(schur_elimination=args.schur)
         t2 = time.time()
         sol = prob.solve(cinit, trust_region=jaxls.TrustRegionConfig(),
                          linear_solver=linear,
