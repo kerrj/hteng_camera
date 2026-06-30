@@ -168,6 +168,11 @@ def run_chunk(pipe, dtype, calib, frames_l_u8, frames_r_u8, frame_idxs,
             # camera frame (postprocess already undid the left-hand flip).
             "global_orient": np.asarray(oL["global_orient"]).reshape(-1).tolist(),
             "hand_pose": np.asarray(oL["hand_pose"]).reshape(-1).tolist(),
+            # right-eye internal pose too: hand_pose is the 15 finger-joint
+            # rotations expressed LOCALLY (parent-relative), so it's viewpoint-
+            # invariant — both eyes measure the same hand shape. The stereo
+            # optimizer averages the two as a shape regularizer.
+            "hand_pose_right": np.asarray(oR["hand_pose"]).reshape(-1).tolist(),
             "betas": np.asarray(oL["betas"]).reshape(-1).tolist(),
             # Rv_l/Rv_r: rectified-crop-cam -> {left,right}-fisheye-cam rotations
             # (cols=axes). The crops VERGE on P, so the optimizer must project

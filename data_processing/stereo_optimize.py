@@ -94,7 +94,7 @@ def kp_weights(w_wrist, w_mcp, w_pip, w_tip):
     return jnp.asarray(w)
 
 
-def make_costs(M, data, w_temporal, huber_px):
+def make_costs(M, data, w_temporal, huber_px, w_shape):
     """Build batched jaxls costs from the per-frame stacked arrays in ``data``."""
     n = data["pose0"].shape[0]
     fids = jnp.arange(n)
@@ -143,6 +143,17 @@ def make_costs(M, data, w_temporal, huber_px):
         res = (proj - obs2d) / norm * valid[:, None] * conf[:, None]
         return (res * jnp.sqrt(huber_w(res))).ravel()
 
+    # SHAPE prior: pull the 15 INTERNAL finger-joint rotations toward the
+    # geodesic mean of the two eyes' WiLoR estimates. Targets exactly the
+    # rank-deficient finger DOF (under-constrained along the view ray); leaves
+    # global orient (joint 0) and translation/depth untouched — depth stays
+    # purely stereo-driven. Residual is geodesic (SO3 log), in radians.
+    @jaxls.Cost.factory
+    def shape_prior(vals, pose_v, mean15):
+        R = jaxlie.SO3(vals[pose_v][1:])                      # joints 1..15
+        res = (jaxlie.SO3(mean15).inverse() @ R).log()        # (15,3)
+        return (w_shape * res).reshape(-1)
+
     @jaxls.Cost.factory
     def temporal_pose(vals, a, b, w):
         # geodesic difference between consecutive frames' per-joint rotations
@@ -164,6 +175,9 @@ def make_costs(M, data, w_temporal, huber_px):
     costs.append(reproj(PoseVar(fids), TransVar(fids), data["beta0"],
                         data["kpR"], data["validR"], data["f_px"],
                         data["R_lr"], data["t_lr"], data["confR"]))
+    # shape prior: internal finger pose toward the two-eye geodesic mean
+    if w_shape > 0:
+        costs.append(shape_prior(PoseVar(fids), data["shape_mean"]))
     # temporal on consecutive frames of the SAME track (only when enabled).
     # NB: couples adjacent KEPT frames; if frames were dropped these aren't
     # adjacent in real time — fine while w_temporal is small, revisit later.
@@ -186,6 +200,9 @@ def main():
     ap.add_argument("--hand", choices=["left", "right"], default="right",
                     help="which hand track (is_right) to optimize")
     ap.add_argument("--w-temporal", type=float, default=10.0)
+    ap.add_argument("--w-shape", type=float, default=0.1,
+                    help="weight pulling internal finger pose toward the two-eye "
+                         "geodesic-mean shape (radians-scale geodesic residual)")
     # per-keypoint reprojection group weights (residual-space; cost ∝ w²).
     # wrist high: it's root-relative (0,0,0) so it only constrains translation
     # → lets stereo disparity fix metric depth. tips low: noisy + pose-sensitive.
@@ -233,6 +250,7 @@ def main():
     frames, pose0, beta0, kpL, kpR, fpx, valid = ([] for _ in range(7))
     Rvl, Parr = [], []
     R_lr, t_lr = [], []
+    hp_left, hp_right = [], []     # per-eye 15-joint internal pose (axis-angle)
     n_dropped_frame = 0
     n_masked_kp = 0
     n_kp_total = 0
@@ -271,6 +289,8 @@ def main():
         Parr.append(np.array(h["P"], np.float32))
         R_lr.append(Rv_r.T @ Rs @ Rv_l)            # left-virtual → right-virtual
         t_lr.append(Rv_r.T @ ts)
+        hp_left.append(np.array(h["hand_pose"], np.float32))        # (45,)
+        hp_right.append(np.array(h["hand_pose_right"], np.float32))  # (45,)
     n = len(frames)
     assert n > 0, "no frames survived robust filtering"
     # per-keypoint group weight vector (wrist/mcp/pip/tip), same for both eyes.
@@ -293,6 +313,26 @@ def main():
     pose0_arr = jnp.asarray(pose0_arr.reshape(n, 48))
     # convert WiLoR axis-angle init -> per-joint quats (n,16,4) wxyz
     quat0 = jax.vmap(lambda p: jaxlie.SO3.exp(p.reshape(16, 3)).wxyz)(pose0_arr)
+
+    # SHAPE TARGET: the geodesic mean of the left & right eyes' INTERNAL pose
+    # (15 finger joints). hand_pose is parent-relative, hence viewpoint-invariant,
+    # so the two eyes are independent noisy measurements of the same hand shape;
+    # their mean denoises the rank-deficient finger DOF without touching global
+    # orient or translation/depth. Un-mirror both eyes for left hands (same
+    # reflection as the init) so the target lives in MANO_RIGHT quat space.
+    hpL = np.stack(hp_left).reshape(n, 15, 3)
+    hpR = np.stack(hp_right).reshape(n, 15, 3)
+    if not want_right:
+        hpL[:, :, 1:3] *= -1.0
+        hpR[:, :, 1:3] *= -1.0
+    qL = jax.vmap(lambda p: jaxlie.SO3.exp(p).wxyz)(jnp.asarray(hpL))   # (n,15,4)
+    qR = jax.vmap(lambda p: jaxlie.SO3.exp(p).wxyz)(jnp.asarray(hpR))
+    # R_mean = R_l ⊕ ½·log(R_l^T R_r)  (geodesic midpoint on SO3)
+    rel = jax.vmap(jax.vmap(lambda a, b:
+        (jaxlie.SO3(a).inverse() @ jaxlie.SO3(b)).log()))(qL, qR)      # (n,15,3)
+    shape_mean = jax.vmap(jax.vmap(lambda a, d:
+        (jaxlie.SO3(a) @ jaxlie.SO3.exp(0.5 * d)).wxyz))(qL, rel)      # (n,15,4)
+
     Rvl_arr = np.stack(Rvl)                                       # (n,3,3)
     P_arr = np.stack(Parr)                                        # (n,3) left-fisheye
     data = {
@@ -308,6 +348,7 @@ def main():
         "f_px": jnp.asarray(np.array(fpx, np.float32)),
         "R_lr": jnp.asarray(np.stack(R_lr)),         # (n,3,3) left-virt→right-virt
         "t_lr": jnp.asarray(np.stack(t_lr)),         # (n,3)
+        "shape_mean": shape_mean,                    # (n,15,4) geodesic-mean internal pose
         "out_size": out_size,
         "mirror": 1.0 if want_right else -1.0,   # left-hand x-mirror (MANO_RIGHT)
     }
@@ -337,7 +378,7 @@ def main():
         cfids = jnp.arange(cn)
         cdata = {k: (v[s:e] if hasattr(v, "shape") and getattr(v, "ndim", 0) >= 1
                      else v) for k, v in data.items()}
-        ccosts, _ = make_costs(M, cdata, args.w_temporal, args.huber_px)
+        ccosts, _ = make_costs(M, cdata, args.w_temporal, args.huber_px, args.w_shape)
         cinit = jaxls.VarValues.make([
             PoseVar(cfids).with_value(cdata["quat0"]),
             TransVar(cfids).with_value(t_init[s:e]),
@@ -406,9 +447,10 @@ def main():
         return "  ".join(f"p{p}={np.percentile(a,p):.2f}" for p in ps)
     print("\n================ OPTIMIZATION DIAGNOSTICS ================")
     print(f"frames solved: {n}   iters: {args.iters}   linear: {args.linear}")
-    print(f"weights: temporal={args.w_temporal} huber_px={args.huber_px}  "
-          f"kp[wrist={args.w_wrist} mcp={args.w_mcp} pip={args.w_pip} "
-          f"tip={args.w_tip}]  (NO pose prior; beta FROZEN to WiLoR)")
+    print(f"weights: temporal={args.w_temporal} shape={args.w_shape} "
+          f"huber_px={args.huber_px}  kp[wrist={args.w_wrist} mcp={args.w_mcp} "
+          f"pip={args.w_pip} tip={args.w_tip}]  (shape prior = two-eye mean; "
+          f"NO global/depth prior; beta FROZEN to WiLoR)")
     print(f"\nREPROJ ERR inliers (px, {len(perkp_in)} kp): "
           f"mean={perkp_in.mean():.2f}  {pct(perkp_in)}")
     if len(perkp_out):
