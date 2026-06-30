@@ -53,7 +53,7 @@ def main():
         cdata = {k: (v[s:e] if hasattr(v, "shape") and getattr(v, "ndim", 0) >= 1
                      else v) for k, v in data.items()}
         t0 = time.time()
-        ccosts, _ = SO.make_costs(Mh, cdata, 0.0, args.huber_px, args.w_shape)
+        ccosts, _ = SO.make_costs(Mh, cdata, args.huber_px, args.w_shape, 0.0, 0.0, 0.0)
         t1 = time.time()
         cinit = jaxls.VarValues.make([
             SO.PoseVar(cfids).with_value(cdata["quat0"]),

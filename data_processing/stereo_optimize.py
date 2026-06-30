@@ -94,7 +94,8 @@ def kp_weights(w_wrist, w_mcp, w_pip, w_tip):
     return jnp.asarray(w)
 
 
-def make_costs(M, data, w_temporal, huber_px, w_shape):
+def make_costs(M, data, huber_px, w_shape,
+               w_accel_pose, w_accel_pose_global, w_accel_trans):
     """Build batched jaxls costs from the per-frame stacked arrays in ``data``."""
     n = data["pose0"].shape[0]
     fids = jnp.arange(n)
@@ -172,15 +173,26 @@ def make_costs(M, data, w_temporal, huber_px, w_shape):
         res = (jaxlie.SO3(mean15).inverse() @ R).log()        # (15,3)
         return (w_shape * res).reshape(-1)
 
+    # ACCELERATION (Laplacian) smoother on consecutive-in-time triples (i-1,i,i+1).
+    # Penalizing the 2nd difference resists changes in velocity → favors constant-
+    # velocity motion (zero cost for any straight-line trajectory), so it removes
+    # jitter without fighting genuine hand motion. (1st-diff/velocity would drag
+    # toward a static pose; jerk/3rd-diff over-smooths with wider support.)
+    #
+    # Pose acceleration is the geodesic 2nd difference in the SO3 tangent: the
+    # difference of consecutive log-relative-rotations, per joint. Weighted per
+    # joint: INTERNAL fingers (1..15) smoothed STRONGLY (articulation changes
+    # slowly), GLOBAL wrist (joint 0) more weakly (the whole hand can rotate fast).
     @jaxls.Cost.factory
-    def temporal_pose(vals, a, b, w):
-        # geodesic difference between consecutive frames' per-joint rotations
-        res = (jaxlie.SO3(vals[a]).inverse() @ jaxlie.SO3(vals[b])).log()
-        return w * res.reshape(-1)
+    def accel_pose(vals, a, b, c, wj):
+        # wj: (16,1) per-joint weight (global vs internal)
+        v0 = (jaxlie.SO3(vals[a]).inverse() @ jaxlie.SO3(vals[b])).log()  # (16,3)
+        v1 = (jaxlie.SO3(vals[b]).inverse() @ jaxlie.SO3(vals[c])).log()
+        return (wj * (v1 - v0)).reshape(-1)
 
     @jaxls.Cost.factory
-    def temporal(vals, a, b, w):
-        return w * (vals[a] - vals[b])
+    def accel_trans(vals, a, b, c, w):
+        return w * (vals[a] - 2.0 * vals[b] + vals[c])
 
     costs = []
     eye_I = jnp.broadcast_to(jnp.eye(3), (n, 3, 3))     # left-virtual cam = identity
@@ -194,13 +206,20 @@ def make_costs(M, data, w_temporal, huber_px, w_shape):
     # shape prior: internal finger pose toward the two-eye geodesic mean
     if w_shape > 0:
         costs.append(shape_prior(PoseVar(fids), data["shape_mean"]))
-    # temporal on consecutive frames of the SAME track (only when enabled).
-    # NB: couples adjacent KEPT frames; if frames were dropped these aren't
-    # adjacent in real time — fine while w_temporal is small, revisit later.
-    if w_temporal > 0:
-        a, b = jnp.arange(n - 1), jnp.arange(1, n)
-        costs.append(temporal_pose(PoseVar(a), PoseVar(b), w_temporal))
-        costs.append(temporal(TransVar(a), TransVar(b), w_temporal * 5.0))
+    # acceleration smoother over consecutive-in-time triples. Couples adjacent
+    # frames → the pose Hessian is block-TRIDIAGONAL (banded), which Schur + CG
+    # still handle efficiently (one global solve = optimal sliding-window smooth).
+    i0, i1, i2 = data["accel_i0"], data["accel_i1"], data["accel_i2"]
+    if (w_accel_pose > 0 or w_accel_trans > 0) and i0.shape[0] > 0:
+        if w_accel_pose > 0:
+            # per-joint: joint 0 (global) weaker, joints 1..15 (internal) stronger
+            wj = jnp.concatenate([
+                jnp.full((1, 1), w_accel_pose_global),
+                jnp.full((15, 1), w_accel_pose)], axis=0)             # (16,1)
+            costs.append(accel_pose(PoseVar(i0), PoseVar(i1), PoseVar(i2), wj))
+        if w_accel_trans > 0:
+            costs.append(accel_trans(TransVar(i0), TransVar(i1), TransVar(i2),
+                                     w_accel_trans))
     return costs, fids
 
 
@@ -307,6 +326,18 @@ def build_data(jsonl, calib_dir, left_serial, right_serial, hand,
         "mirror": 1.0 if want_right else -1.0,   # left-hand x-mirror (MANO_RIGHT)
     }
 
+    # Acceleration-smoother triples: indices (i-1,i,i+1) of kept frames that are
+    # CONSECUTIVE IN REAL TIME (frame numbers differ by exactly 1 on both sides).
+    # Dropped/rejected frames create time gaps; we skip triples spanning a gap
+    # rather than over-penalizing across them.
+    fr = np.asarray(frames)
+    mid = np.arange(1, n - 1)
+    adj = (fr[mid] - fr[mid - 1] == 1) & (fr[mid + 1] - fr[mid] == 1)
+    tri_mid = mid[adj]
+    data["accel_i0"] = jnp.asarray(tri_mid - 1)
+    data["accel_i1"] = jnp.asarray(tri_mid)
+    data["accel_i2"] = jnp.asarray(tri_mid + 1)
+
     # init: WiLoR pose; translation from the triangulated point P (left-fisheye
     # frame) expressed in the LEFT-VIRTUAL frame: t0 = Rv_l^T @ P. The MANO root
     # is wrist-centred and root-relative, so placing the root at P (≈ hand centre)
@@ -326,7 +357,15 @@ def main():
     ap.add_argument("--right-serial", default="046060323001")
     ap.add_argument("--hand", choices=["left", "right"], default="right",
                     help="which hand track (is_right) to optimize")
-    ap.add_argument("--w-temporal", type=float, default=10.0)
+    # acceleration (Laplacian) smoother weights, on consecutive-in-time triples.
+    ap.add_argument("--w-accel-pose", type=float, default=2.0,
+                    help="accel penalty on INTERNAL finger joints (1..15); strong "
+                         "— articulation changes slowly")
+    ap.add_argument("--w-accel-pose-global", type=float, default=0.5,
+                    help="accel penalty on GLOBAL wrist rotation (joint 0); weaker "
+                         "— the whole hand can rotate quickly")
+    ap.add_argument("--w-accel-trans", type=float, default=2.0,
+                    help="accel penalty on root translation")
     ap.add_argument("--w-shape", type=float, default=0.1,
                     help="weight pulling internal finger pose toward the two-eye "
                          "geodesic-mean shape (radians-scale geodesic residual). "
@@ -377,7 +416,9 @@ def main():
     # Schur-eliminates the same way, whereas chunking would sever smoothness
     # edges at boundaries.
     fids = jnp.arange(n)
-    costs, _ = make_costs(M, data, args.w_temporal, args.huber_px, args.w_shape)
+    costs, _ = make_costs(M, data, args.huber_px, args.w_shape,
+                          args.w_accel_pose, args.w_accel_pose_global,
+                          args.w_accel_trans)
     init = jaxls.VarValues.make([
         PoseVar(fids).with_value(data["quat0"]),
         TransVar(fids).with_value(t_init),
@@ -450,10 +491,10 @@ def main():
         return "  ".join(f"p{p}={np.percentile(a,p):.2f}" for p in ps)
     print("\n================ OPTIMIZATION DIAGNOSTICS ================")
     print(f"frames solved: {n}   iters: {args.iters}   linear: {args.linear}")
-    print(f"weights: temporal={args.w_temporal} shape={args.w_shape} "
-          f"huber_px={args.huber_px}  kp[wrist={args.w_wrist} mcp={args.w_mcp} "
-          f"pip={args.w_pip} tip={args.w_tip}]  (shape prior = two-eye mean; "
-          f"NO global/depth prior; beta FROZEN to WiLoR)")
+    print(f"weights: accel[pose={args.w_accel_pose} global={args.w_accel_pose_global} "
+          f"trans={args.w_accel_trans}] shape={args.w_shape} huber_px={args.huber_px}"
+          f"  ({len(np.asarray(data['accel_i1']))} accel triples; shape prior = "
+          f"two-eye mean; NO global/depth prior; beta FROZEN to WiLoR)")
     print(f"\nREPROJ ERR inliers (px, {len(perkp_in)} kp): "
           f"mean={perkp_in.mean():.2f}  {pct(perkp_in)}")
     if len(perkp_out):
