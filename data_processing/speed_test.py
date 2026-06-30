@@ -59,6 +59,9 @@ def run_vmap(Mh, data, t_init, n, args):
     print(f"  warm full-batch: {t_warm*1000:.1f}ms  ({t_warm/n*1e6:.1f} us/frame)")
     print(f"  -> {n} frames in {t_warm:.3f}s warm "
           f"(vs jaxls ~5-80s per 500-chunk)")
+
+
+def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--jsonl", required=True)
     ap.add_argument("--mano", default="/tmp/mano_jax.npz")
