@@ -62,7 +62,7 @@ def main():
     ap.add_argument("--left", help="left-hand stereo3d jsonl")
     ap.add_argument("--mano", default="/tmp/mano_jax.npz")
     ap.add_argument("--video", help="8-bit stereo video; show the LEFT-eye frame")
-    ap.add_argument("--thumb-w", type=int, default=320,
+    ap.add_argument("--thumb-w", type=int, default=256,
                     help="downscaled width for the left-eye frame (decode is heavy)")
     ap.add_argument("--port", type=int, default=8080)
     args = ap.parse_args()
@@ -104,14 +104,20 @@ def main():
     # camera frustum at origin (left-fisheye cam: +z forward, +y down in cv2).
     # viser is +z up by convention; we just draw a marker frame + a small frustum.
     server.scene.add_frame("/camera", axes_length=0.05, axes_radius=0.002)
-
-    def set_frustum(img):
-        # image plane carries the left-eye frame; aspect from the image.
-        aspect = (img.shape[1] / img.shape[0]) if img is not None else 1.0
-        server.scene.add_camera_frustum(
-            "/camera/frustum", fov=1.4, aspect=aspect, scale=0.08,
-            color=(0.7, 0.7, 0.7), image=img)
-    set_frustum(None)
+    # PERSISTENT scene handles, created ONCE — we update them in place each frame
+    # rather than re-adding (re-adding rebuilds + re-uploads the whole object,
+    # which made scrubbing very slow).
+    aspect0 = 1.0
+    if left_frame is not None:
+        aspect0 = left_frame(fmin).shape[1] / left_frame(fmin).shape[0]
+    frustum_h = server.scene.add_camera_frustum(
+        "/camera/frustum", fov=1.4, aspect=aspect0, scale=0.08,
+        color=(0.7, 0.7, 0.7), format="jpeg",
+        image=left_frame(fmin) if left_frame else None)
+    mesh_h = {name: server.scene.add_mesh_simple(
+                  f"/hand_{name}", np.zeros((3, 3), np.float32), faces[:1],
+                  color=color, flat_shading=False, visible=False)
+              for name, (_, _, color) in tracks.items()}
 
     # --- GUI -----------------------------------------------------------------
     gui_play = server.gui.add_checkbox("play", False)
@@ -119,8 +125,8 @@ def main():
     gui_beta = server.gui.add_dropdown("shape betas", ("optimized", "WiLoR-mean"),
                                        "optimized")
     gui_info = server.gui.add_text("info", "", disabled=True)
-    gui_img = server.gui.add_image(np.zeros((2, 2, 3), np.uint8),
-                                   label="left eye") if left_frame else None
+    gui_img = server.gui.add_image(left_frame(fmin), label="left eye",
+                                   format="jpeg") if left_frame else None
 
     def beta_for(meta):
         return (meta["beta_opt"] if gui_beta.value == "optimized"
@@ -131,21 +137,19 @@ def main():
         lines = [f"frame {fr}"]
         for name, (meta, frames, color) in tracks.items():
             h = frames.get(fr)
-            handle = f"/hand_{name}"
             if h is None:
-                server.scene.add_mesh_simple(handle, np.zeros((3, 3)), faces[:1],
-                                             visible=False)
+                mesh_h[name].visible = False
                 continue
             v = mesh_verts(M, faces, h["quat"], h["trans_virtual"], h["Rv_l"],
                            beta_for(meta), meta["mirror"])
-            server.scene.add_mesh_simple(handle, v, faces, color=color,
-                                         flat_shading=False, visible=True)
+            mesh_h[name].vertices = v.astype(np.float32)   # update in place
+            mesh_h[name].visible = True
             lines.append(f"  {name}: depth {h['depth_m']:.2f}m")
         gui_info.value = "\n".join(lines)
-        # left-eye frame → frustum image plane + sidebar
+        # left-eye frame → frustum image plane + sidebar (update in place)
         if left_frame is not None:
             img = left_frame(fr)
-            set_frustum(img)
+            frustum_h.image = img
             gui_img.image = img
 
     gui_frame.on_update(update)
