@@ -102,13 +102,18 @@ def make_costs(M, data, w_temporal, huber_px, w_shape):
     # Residuals are normalized to image fractions by dividing pixel error by
     # max(w,h) = out_size. This keeps the reprojection residual O(0.01-0.1)
     # instead of O(10-100) px, so squared costs stay O(1) (numerically stable)
-    # and sit on the same scale as the pose prior (radians). The Huber knee is
-    # given in px and normalized to match.
+    # and on the same radians-scale as the shape prior. The Huber knee is given
+    # in px and normalized by the SAME factor, so |res|>huber_n is exactly
+    # "pixel error > huber_px" — the normalization cancels in the threshold.
     norm = float(data["out_size"])
     huber_n = huber_px / norm
 
-    def huber_w(res):
-        a = jnp.abs(res) + 1e-8
+    def huber_w(res_px_norm):
+        # IRLS weight: returning res*sqrt(w) makes jaxls' squared cost = w*res^2,
+        # i.e. linear (robust) beyond the knee, quadratic within. Keyed on the
+        # RAW normalized pixel error only — NOT scaled by valid/conf, so a
+        # down-weighted keypoint keeps the same px knee (decoupled robustness).
+        a = jnp.abs(res_px_norm) + 1e-8
         return jax.lax.stop_gradient(jnp.where(a > huber_n, huber_n / a, 1.0))
 
     # beta (MANO shape) is FROZEN to WiLoR's per-frame estimate — passed as a
@@ -139,9 +144,13 @@ def make_costs(M, data, w_temporal, huber_px, w_shape):
         x = joints + vals[t_v][None, :]                    # left-virtual frame
         cam = x @ R_e.T + t_e[None, :]                     # → this eye's frame
         proj = project(cam, f_px, data["out_size"])
-        # conf carries the per-keypoint group weight (wrist/mcp/pip/tip).
-        res = (proj - obs2d) / norm * valid[:, None] * conf[:, None]
-        return (res * jnp.sqrt(huber_w(res))).ravel()
+        # raw normalized pixel error → drives the Huber knee (px-true).
+        res_px = (proj - obs2d) / norm
+        # conf carries the per-keypoint group weight (wrist/mcp/pip/tip); valid
+        # masks epipolar outliers. Applied AFTER the Huber weight so they don't
+        # shift the px knee.
+        res = res_px * valid[:, None] * conf[:, None]
+        return (res * jnp.sqrt(huber_w(res_px))).ravel()
 
     # SHAPE prior: pull the 15 INTERNAL finger-joint rotations toward the
     # geodesic mean of the two eyes' WiLoR estimates. Targets exactly the
@@ -202,7 +211,10 @@ def main():
     ap.add_argument("--w-temporal", type=float, default=10.0)
     ap.add_argument("--w-shape", type=float, default=0.1,
                     help="weight pulling internal finger pose toward the two-eye "
-                         "geodesic-mean shape (radians-scale geodesic residual)")
+                         "geodesic-mean shape (radians-scale geodesic residual). "
+                         "Sweep (2026-06-29): 0->54px reproj p99 & 6rad pose drift; "
+                         "0.1 -> 1.9px p50 / 10px p99 / 0.3rad drift; 1.0 over-"
+                         "constrains. 0.1 is the knee.")
     # per-keypoint reprojection group weights (residual-space; cost ∝ w²).
     # wrist high: it's root-relative (0,0,0) so it only constrains translation
     # → lets stereo disparity fix metric depth. tips low: noisy + pose-sensitive.
@@ -214,7 +226,11 @@ def main():
     ap.add_argument("--w-mcp", type=float, default=1.0)
     ap.add_argument("--w-pip", type=float, default=1.0)
     ap.add_argument("--w-tip", type=float, default=1.0)
-    ap.add_argument("--huber-px", type=float, default=10.0)
+    ap.add_argument("--huber-px", type=float, default=5.0,
+                    help="Huber knee in PIXELS (cost is quadratic within, linear "
+                         "beyond). With the shape prior, inlier reproj is p90~4.5px, "
+                         "so 5px robustifies the noisy mid-tail; was 10px (barely "
+                         "active). Normalized internally to match residual scale.")
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--chunk", type=int, default=500,
                     help="solve in fixed-size frame chunks (0 = all at once). "
