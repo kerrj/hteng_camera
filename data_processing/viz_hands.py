@@ -114,8 +114,11 @@ def main():
         "/camera/frustum", fov=1.4, aspect=aspect0, scale=0.08,
         color=(0.7, 0.7, 0.7), format="jpeg",
         image=left_frame(fmin) if left_frame else None)
+    # create with the FULL faces + correctly-sized dummy verts (778); only
+    # .vertices is updated per frame, so faces must be the real topology here.
+    n_v = int(np.asarray(M["v_template"]).shape[0])                # 778
     mesh_h = {name: server.scene.add_mesh_simple(
-                  f"/hand_{name}", np.zeros((3, 3), np.float32), faces[:1],
+                  f"/hand_{name}", np.zeros((n_v, 3), np.float32), faces,
                   color=color, flat_shading=False, visible=False)
               for name, (_, _, color) in tracks.items()}
 
