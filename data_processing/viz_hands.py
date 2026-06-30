@@ -22,6 +22,7 @@ Run (in eyeball211, has viser+smplx):
 Then forward the printed port to your laptop.
 """
 import argparse
+import functools
 import json
 
 import numpy as np
@@ -60,8 +61,29 @@ def main():
     ap.add_argument("--right", help="right-hand stereo3d jsonl")
     ap.add_argument("--left", help="left-hand stereo3d jsonl")
     ap.add_argument("--mano", default="/tmp/mano_jax.npz")
+    ap.add_argument("--video", help="8-bit stereo video; show the LEFT-eye frame")
+    ap.add_argument("--thumb-w", type=int, default=320,
+                    help="downscaled width for the left-eye frame (decode is heavy)")
     ap.add_argument("--port", type=int, default=8080)
     args = ap.parse_args()
+
+    # left-eye frame loader (decode on demand, cached). cv2 + torchcodec are in
+    # eyeball211; use torchcodec to match the rest of the pipeline.
+    left_frame = None
+    if args.video:
+        import cv2
+        from torchcodec.decoders import VideoDecoder
+        _dec = VideoDecoder(args.video, device="cpu")
+        _half = _dec.metadata.width // 2
+
+        @functools.lru_cache(maxsize=256)
+        def left_frame(fr):
+            f = _dec.get_frames_in_range(start=fr, stop=fr + 1).data[0]   # (3,H,W) rgb
+            img = f[:, :, :_half].permute(1, 2, 0).numpy().astype(np.uint8)
+            h, w = img.shape[:2]
+            tw = args.thumb_w
+            img = cv2.resize(img, (tw, int(h * tw / w)), interpolation=cv2.INTER_AREA)
+            return img
 
     M = MJ.load_mano(args.mano)
     faces = np.asarray(M["faces"])
@@ -82,8 +104,14 @@ def main():
     # camera frustum at origin (left-fisheye cam: +z forward, +y down in cv2).
     # viser is +z up by convention; we just draw a marker frame + a small frustum.
     server.scene.add_frame("/camera", axes_length=0.05, axes_radius=0.002)
-    server.scene.add_camera_frustum(
-        "/camera/frustum", fov=1.4, aspect=1.0, scale=0.06, color=(0.7, 0.7, 0.7))
+
+    def set_frustum(img):
+        # image plane carries the left-eye frame; aspect from the image.
+        aspect = (img.shape[1] / img.shape[0]) if img is not None else 1.0
+        server.scene.add_camera_frustum(
+            "/camera/frustum", fov=1.4, aspect=aspect, scale=0.08,
+            color=(0.7, 0.7, 0.7), image=img)
+    set_frustum(None)
 
     # --- GUI -----------------------------------------------------------------
     gui_play = server.gui.add_checkbox("play", False)
@@ -91,6 +119,8 @@ def main():
     gui_beta = server.gui.add_dropdown("shape betas", ("optimized", "WiLoR-mean"),
                                        "optimized")
     gui_info = server.gui.add_text("info", "", disabled=True)
+    gui_img = server.gui.add_image(np.zeros((2, 2, 3), np.uint8),
+                                   label="left eye") if left_frame else None
 
     def beta_for(meta):
         return (meta["beta_opt"] if gui_beta.value == "optimized"
@@ -112,6 +142,11 @@ def main():
                                          flat_shading=False, visible=True)
             lines.append(f"  {name}: depth {h['depth_m']:.2f}m")
         gui_info.value = "\n".join(lines)
+        # left-eye frame → frustum image plane + sidebar
+        if left_frame is not None:
+            img = left_frame(fr)
+            set_frustum(img)
+            gui_img.image = img
 
     gui_frame.on_update(update)
     gui_beta.on_update(update)
