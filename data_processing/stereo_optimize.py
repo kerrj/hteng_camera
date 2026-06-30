@@ -2,30 +2,31 @@
 
 Keypoints-only (no images, no ViT) — so a dense, temporally-coupled solve over
 the whole video is cheap (seconds on CPU). For each frame we have WiLoR's
-per-eye 2D keypoints in two *rectified* pinhole crops (left/right) that share a
-virtual orientation with x along the stereo baseline, so the right camera is the
-left translated by ``-baseline`` along x. We optimize, per frame:
+per-eye 2D keypoints in two baseline-aligned pinhole crops that VERGE on the
+hand (both virtual cameras aimed at the triangulated point P; rows stay epipolar
+but the optical axes are NOT parallel). We optimize, per frame:
 
     pose       (16,4) per-joint unit quats (wxyz) on the SO(3) manifold;
                       joint 0 = global_orient, 1..15 = finger joints. The
                       optimizer retracts tangent steps via SO3.exp (egoallo style).
     betas      (10,) shape — FROZEN to WiLoR's per-frame estimate
-    t          (3,)  MANO-root translation in the rectified LEFT-crop frame
+    t          (3,)  MANO-root translation in the LEFT-VIRTUAL crop frame
 
 against three factor types:
-  - left reprojection:  project MANO joints (at t) into the left pinhole
-  - right reprojection: project (joints at t, shifted -baseline x) into right
+  - left reprojection:  project MANO joints (at t) into the left virtual cam
+  - right reprojection: project (R_lr @ (joints+t) + t_lr) into the right cam,
+                        where R_lr = Rv_r^T Rs Rv_l, t_lr = Rv_r^T ts encode the
+                        VERGED stereo geometry exactly (no baseline/disparity
+                        shortcut — that only held for parallel axes).
   - temporal:           smoothness on (pose, t) between consecutive frames
 
-Reprojection is weighted PER KEYPOINT GROUP (wrist/mcp/pip/tip): the wrist is
-root-relative (0,0,0) so it constrains only t (letting stereo disparity fix
-metric depth), while fingertips — single skinned verts, noisiest + most
-pose-sensitive — are down-weighted. There is NO pose prior: stereo disparity
-gives strictly better depth/pose than WiLoR's monocular regression, so pulling
-back toward it would only fight the signal we trust. betas stay frozen to WiLoR.
+Reprojection is weighted PER KEYPOINT GROUP (wrist/mcp/pip/tip; default uniform).
+There is NO pose prior: stereo gives strictly better depth/pose than WiLoR's
+monocular regression. betas stay frozen to WiLoR.
 
-This resolves WiLoR's monocular depth ambiguity (the right-eye term pins down t)
-and MANO's anatomical model regularizes per-keypoint disparity noise.
+Results are converted from the per-frame left-virtual frame back to the common
+LEFT-FISHEYE (optical-axis) frame before saving (joints_3d_cam, trans, depth_m,
+global_orient_R), so they're comparable across frames.
 
 Run:  python stereo_optimize.py --jsonl out/pinhole_stereo/hands.jsonl \
           --mano /tmp/mano_jax.npz --out out/pinhole_stereo/hands3d.jsonl
@@ -122,12 +123,21 @@ def make_costs(M, data, w_temporal, huber_px):
     # forward-kinematics output — the canonical MANO left-from-right trick.
     mirror = float(data["mirror"])
 
+    # Pose + translation live in the LEFT-VIRTUAL crop frame. The two virtual
+    # cameras VERGE on the hand (they do NOT share orientation), so each eye
+    # projects through its OWN rigid transform — NOT a baseline x-shift:
+    #     left  eye:  x_l = x                          (R=I, t=0)
+    #     right eye:  x_r = R_lr @ x + t_lr
+    #         R_lr = Rv_r^T Rs Rv_l,  t_lr = Rv_r^T ts  (precomputed per frame)
+    # Both eyes share f_px and principal point = crop centre. Verified to machine
+    # precision in test_projection_math.py (P reprojects to both crop centres).
     @jaxls.Cost.factory(jac_mode="forward")
-    def reproj(vals, pose_v, t_v, beta_fixed, obs2d, valid, f_px, baseline_x, conf):
+    def reproj(vals, pose_v, t_v, beta_fixed, obs2d, valid, f_px, R_e, t_e, conf):
         R = jaxlie.SO3(vals[pose_v]).as_matrix()           # (16,4)quat -> (16,3,3)
         joints = MJ.mano_forward_R(M, R, beta_fixed)
         joints = joints.at[:, 0].multiply(mirror)          # left-hand x-mirror
-        cam = joints + vals[t_v][None, :] - jnp.array([baseline_x, 0.0, 0.0])[None, :]
+        x = joints + vals[t_v][None, :]                    # left-virtual frame
+        cam = x @ R_e.T + t_e[None, :]                     # → this eye's frame
         proj = project(cam, f_px, data["out_size"])
         # conf carries the per-keypoint group weight (wrist/mcp/pip/tip).
         res = (proj - obs2d) / norm * valid[:, None] * conf[:, None]
@@ -144,14 +154,16 @@ def make_costs(M, data, w_temporal, huber_px):
         return w * (vals[a] - vals[b])
 
     costs = []
-    # left eye: baseline_x = 0 (left camera is the reference frame)
+    eye_I = jnp.broadcast_to(jnp.eye(3), (n, 3, 3))     # left-virtual cam = identity
+    eye_0 = jnp.zeros((n, 3))
+    # left eye: project directly (pose+t already in left-virtual frame)
     costs.append(reproj(PoseVar(fids), TransVar(fids), data["beta0"],
                         data["kpL"], data["validL"], data["f_px"],
-                        jnp.zeros(n), data["confL"]))
-    # right eye: shift by +baseline along x (point moves to right-cam frame)
+                        eye_I, eye_0, data["confL"]))
+    # right eye: rigid (R_lr, t_lr) into the right-virtual frame
     costs.append(reproj(PoseVar(fids), TransVar(fids), data["beta0"],
                         data["kpR"], data["validR"], data["f_px"],
-                        data["baseline"], data["confR"]))
+                        data["R_lr"], data["t_lr"], data["confR"]))
     # temporal on consecutive frames of the SAME track (only when enabled).
     # NB: couples adjacent KEPT frames; if frames were dropped these aren't
     # adjacent in real time — fine while w_temporal is small, revisit later.
@@ -168,6 +180,9 @@ def main():
     ap.add_argument("--jsonl", required=True)
     ap.add_argument("--mano", default="/tmp/mano_jax.npz")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--calib-dir", default="../long-test1")
+    ap.add_argument("--left-serial", default="046060323008")
+    ap.add_argument("--right-serial", default="046060323001")
     ap.add_argument("--hand", choices=["left", "right"], default="right",
                     help="which hand track (is_right) to optimize")
     ap.add_argument("--w-temporal", type=float, default=10.0)
@@ -207,8 +222,17 @@ def main():
     # --dy-thresh px is a bad cross-eye match → mask it out. Frames with fewer
     # than --min-inliers surviving keypoints are dropped entirely (one eye's
     # detection failed). This is the key fix for outliers blowing up the solve.
+    # stereo extrinsics (X_right = Rs @ X_left + ts), needed for the verged
+    # per-eye projection transforms R_lr, t_lr.
+    ls, rs = args.left_serial, args.right_serial
+    st = json.load(open(f"{args.calib_dir}/stereo_{ls}_{rs}.json"))
+    Rs = np.array(st["R"], np.float32)
+    ts = np.array(st["t"], np.float32).reshape(3)
+
     rows = [json.loads(l) for l in open(args.jsonl)]
     frames, pose0, beta0, kpL, kpR, fpx, valid = ([] for _ in range(7))
+    Rvl, Parr = [], []
+    R_lr, t_lr = [], []
     n_dropped_frame = 0
     n_masked_kp = 0
     n_kp_total = 0
@@ -223,14 +247,19 @@ def main():
         h = max(cand, key=lambda x: (x["bbox"][2] - x["bbox"][0]))  # largest bbox
         kL = np.array(h["kp_left"], np.float32)
         kR = np.array(h["kp_right"], np.float32)
+        # crops are baseline-aligned (rows are epipolar) even though the optical
+        # axes verge on the hand → keep the |dy| inlier gate. Drop the old
+        # disparity-sign test: both eyes are aimed at P, so the hand sits near
+        # both crop centres and per-keypoint disparity is small / un-signed.
         dy = np.abs(kL[:, 1] - kR[:, 1])           # epipolar deviation per kp
-        disp = kL[:, 0] - kR[:, 0]                 # must be positive (left of right)
-        v = (dy < args.dy_thresh) & (disp > 0.5)   # per-keypoint inlier mask
+        v = (dy < args.dy_thresh)                  # per-keypoint inlier mask
         n_kp_total += 21
         n_masked_kp += int(21 - v.sum())
         if v.sum() < args.min_inliers:             # whole-hand detection failure
             n_dropped_frame += 1
             continue
+        Rv_l = np.array(h["Rv_l"], np.float32)
+        Rv_r = np.array(h["Rv_r"], np.float32)
         frames.append(d["frame"])
         pose0.append(np.array(h["global_orient"] + h["hand_pose"], np.float32))
         beta0.append(np.array(h["betas"], np.float32))
@@ -238,6 +267,10 @@ def main():
         kpR.append(kR)
         fpx.append(h["f_px"])
         valid.append(v.astype(np.float32))
+        Rvl.append(Rv_l)
+        Parr.append(np.array(h["P"], np.float32))
+        R_lr.append(Rv_r.T @ Rs @ Rv_l)            # left-virtual → right-virtual
+        t_lr.append(Rv_r.T @ ts)
     n = len(frames)
     assert n > 0, "no frames survived robust filtering"
     # per-keypoint group weight vector (wrist/mcp/pip/tip), same for both eyes.
@@ -246,7 +279,6 @@ def main():
     print(f"hand={args.hand}: {n} frames kept; dropped {n_dropped_frame} "
           f"(too few inliers); masked {n_masked_kp}/{n_kp_total} keypoints "
           f"(|dy|>{args.dy_thresh}px)")
-    baseline = json.loads(open(args.jsonl).readline())["baseline"]
     out_size = next((h["out_size"] for d in rows for h in d["hands"]), 256)
     print(f"hand={args.hand}: {n} frames with a detection")
 
@@ -261,6 +293,8 @@ def main():
     pose0_arr = jnp.asarray(pose0_arr.reshape(n, 48))
     # convert WiLoR axis-angle init -> per-joint quats (n,16,4) wxyz
     quat0 = jax.vmap(lambda p: jaxlie.SO3.exp(p.reshape(16, 3)).wxyz)(pose0_arr)
+    Rvl_arr = np.stack(Rvl)                                       # (n,3,3)
+    P_arr = np.stack(Parr)                                        # (n,3) left-fisheye
     data = {
         "pose0": pose0_arr,
         "quat0": quat0,
@@ -272,21 +306,17 @@ def main():
         "confL": jnp.asarray(confL),
         "confR": jnp.asarray(confR),
         "f_px": jnp.asarray(np.array(fpx, np.float32)),
-        "baseline": jnp.full(n, baseline, jnp.float32),
+        "R_lr": jnp.asarray(np.stack(R_lr)),         # (n,3,3) left-virt→right-virt
+        "t_lr": jnp.asarray(np.stack(t_lr)),         # (n,3)
         "out_size": out_size,
         "mirror": 1.0 if want_right else -1.0,   # left-hand x-mirror (MANO_RIGHT)
     }
 
-    # init: WiLoR pose/betas; translation from per-frame triangulation over the
-    # INLIER keypoints only (masked disparities skew the median otherwise).
-    disp = jnp.clip(data["kpL"][:, :, 0] - data["kpR"][:, :, 0], 1.0, None)
-    z_per_kp = data["f_px"][:, None] * baseline / disp           # (n,21)
-    vmask = data["validL"] > 0.5
-    z_masked = jnp.where(vmask, z_per_kp, jnp.nan)
-    z0 = jnp.nanmedian(z_masked, axis=1)                        # (n,)
-    z0 = jnp.nan_to_num(z0, nan=0.5)
-    # back-project the crop centre at z0 → x,y (centre ray is ~optical axis)
-    t_init = jnp.stack([jnp.zeros(n), jnp.zeros(n), z0], axis=1)
+    # init: WiLoR pose; translation from the triangulated point P (left-fisheye
+    # frame) expressed in the LEFT-VIRTUAL frame: t0 = Rv_l^T @ P. The MANO root
+    # is wrist-centred and root-relative, so placing the root at P (≈ hand centre)
+    # is a good start. Far cleaner than the old z-from-disparity init.
+    t_init = jnp.asarray(np.einsum("nij,nj->ni", Rvl_arr.transpose(0, 2, 1), P_arr))
 
     import time
     # Solve in fixed-size CHUNKS. With temporal off, frames are independent, so
@@ -328,6 +358,7 @@ def main():
     beta = np.array(data["beta0"])  # frozen to WiLoR's estimate
     valid_np = np.array(data["validL"])  # (n,21) inlier mask
     kpL_np = np.array(data["kpL"]); kpR_np = np.array(data["kpR"]); fpx_np = np.array(fpx)
+    R_lr_np = np.array(data["R_lr"]); t_lr_np = np.array(data["t_lr"])
 
     mirror = 1.0 if want_right else -1.0
     def fk_R(quat_i, beta_i):
@@ -336,20 +367,21 @@ def main():
         j[:, 0] *= mirror                                            # left-hand x-mirror
         return j
 
-    def reproj_px(quat_i, beta_i, t_i, fpx_i, bx):
-        j = fk_R(quat_i, beta_i)
-        cam = j + t_i[None] - np.array([bx, 0, 0])[None]
+    def reproj_px(quat_i, beta_i, t_i, fpx_i, R_e, t_e):
+        x = fk_R(quat_i, beta_i) + t_i[None]            # left-virtual frame
+        cam = x @ R_e.T + t_e[None]                     # → this eye's frame
         c = (out_size - 1) / 2.0
         return np.stack([fpx_i * cam[:, 0] / cam[:, 2] + c,
                          fpx_i * cam[:, 1] / cam[:, 2] + c], 1)
 
     # --- detailed diagnostics --------------------------------------------
     # per-keypoint reproj error, split inlier vs outlier, both eyes
+    I3 = np.eye(3); z3 = np.zeros(3)
     perkp_in, perkp_out = [], []
     frame_med_in = []
     for i in range(n):
-        pL = reproj_px(quat[i], beta[i], trans[i], fpx_np[i], 0.0)
-        pR = reproj_px(quat[i], beta[i], trans[i], fpx_np[i], baseline)
+        pL = reproj_px(quat[i], beta[i], trans[i], fpx_np[i], I3, z3)
+        pR = reproj_px(quat[i], beta[i], trans[i], fpx_np[i], R_lr_np[i], t_lr_np[i])
         eL = np.linalg.norm(pL - kpL_np[i], axis=1)
         eR = np.linalg.norm(pR - kpR_np[i], axis=1)
         m = valid_np[i] > 0.5
@@ -359,7 +391,12 @@ def main():
             frame_med_in.append(np.concatenate([eL[m], eR[m]]).mean())
     perkp_in = np.array(perkp_in); perkp_out = np.array(perkp_out)
     fmi = np.array(frame_med_in)
-    d_arr = trans[:, 2]
+    # report depth in the LEFT-FISHEYE frame (optical-axis z), not the per-frame
+    # left-virtual z whose axis is tilted toward the hand. j_fish below uses the
+    # same Rv_l transform.
+    root_virtual = trans                                         # (n,3) left-virt
+    root_fish = np.einsum("nij,nj->ni", Rvl_arr, root_virtual)   # → left-fisheye
+    d_arr = root_fish[:, 2]
     # geodesic drift from WiLoR init: per-frame RMS of per-joint rotation angles
     rel = jax.vmap(lambda a, b: (jaxlie.SO3(a).inverse() @ jaxlie.SO3(b)).log())(
         jnp.asarray(quat0_np), jnp.asarray(quat))         # (n,16,3)
@@ -392,14 +429,25 @@ def main():
         print(f"  depth jump (mm): median={np.median(dj):.1f} {pct(dj,(50,90,99)).replace('p','p')}")
     print("==========================================================\n")
 
+    # Convert results from the per-frame LEFT-VIRTUAL frame back to the common
+    # LEFT-FISHEYE (optical-axis) frame so they're comparable across frames and
+    # ready for temporal/world lifting:
+    #   joints_fish = Rv_l @ (joints_virtual + t)
+    #   global_orient_fish = Rv_l @ R_global   (rotate the wrist rotation in too)
     with open(args.out, "w") as f:
         for i, fr in enumerate(frames):
-            joints = fk_R(quat[i], beta[i])
-            j_world = joints + trans[i][None]
+            joints_v = fk_R(quat[i], beta[i]) + trans[i][None]      # left-virtual
+            j_fish = joints_v @ Rvl_arr[i].T                        # → left-fisheye
+            # wrist (global) rotation carried into the fisheye frame
+            R_glob_v = np.array(jaxlie.SO3(jnp.asarray(quat[i][0])).as_matrix())
+            R_glob_fish = Rvl_arr[i] @ R_glob_v
             f.write(json.dumps({
                 "frame": int(fr), "is_right": want_right,
-                "trans": trans[i].tolist(), "depth_m": float(trans[i][2]),
-                "joints_3d_cam": j_world.tolist(),  # rectified-left-crop frame
+                "trans": root_fish[i].tolist(),          # root in left-fisheye frame
+                "depth_m": float(root_fish[i][2]),       # optical-axis depth
+                "joints_3d_cam": j_fish.tolist(),        # LEFT-FISHEYE frame
+                "Rv_l": Rvl_arr[i].tolist(),             # virtual→fisheye (for ref)
+                "global_orient_R": R_glob_fish.tolist(),  # wrist rot in fisheye frame
             }) + "\n")
     print(f"wrote {args.out}")
 
