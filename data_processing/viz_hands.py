@@ -152,24 +152,32 @@ def main():
     def update(_=None):
         with _update_lock:
             fr = int(gui_frame.value)
+            # decode OUTSIDE atomic() (it's slow / holds the decoder lock); only
+            # the scene/gui mutations need to be batched.
+            img = left_frame(fr) if left_frame is not None else None
+            verts = {}
             lines = [f"frame {fr}"]
             for name, (meta, frames, color) in tracks.items():
                 h = frames.get(fr)
                 if h is None:
-                    mesh_h[name].visible = False
                     continue
-                v = mesh_verts(M, faces, h["quat"], h["trans_virtual"], h["Rv_l"],
-                               beta_for(meta), meta["mirror"])
-                mesh_h[name].vertices = v.astype(np.float32)   # update in place
-                mesh_h[name].visible = True
+                verts[name] = mesh_verts(
+                    M, faces, h["quat"], h["trans_virtual"], h["Rv_l"],
+                    beta_for(meta), meta["mirror"]).astype(np.float32)
                 dist = float(np.linalg.norm(h["trans"]))   # from camera origin
                 lines.append(f"  {name}: dist {dist:.2f}m")
-            gui_info.value = "\n".join(lines)
-            # left-eye frame → frustum image plane + sidebar (update in place)
-            if left_frame is not None:
-                img = left_frame(fr)
-                frustum_h.image = img
-                gui_img.image = img
+            # apply everything in ONE atomic batch so meshes + image move together
+            with server.atomic():
+                for name in tracks:
+                    if name in verts:
+                        mesh_h[name].vertices = verts[name]
+                        mesh_h[name].visible = True
+                    else:
+                        mesh_h[name].visible = False
+                gui_info.value = "\n".join(lines)
+                if img is not None:
+                    frustum_h.image = img
+                    gui_img.image = img
 
     gui_frame.on_update(update)
     gui_beta.on_update(update)
