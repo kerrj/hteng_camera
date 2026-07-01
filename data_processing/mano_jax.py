@@ -122,3 +122,46 @@ def mano_forward_R(M, R, betas):
     j21 = jnp.concatenate([j16, tips], axis=0)[M["joint_map"]]                  # (21,3)
     # root-relative (wilor pred_keypoints_3d are centred on the wrist joint 0)
     return j21 - j21[0]
+
+
+def _lbs_transforms(M, R, betas):
+    """Shared LBS machinery: returns (G_rel (16,4,4), pose_feat (135,), J (16,3),
+    root j21[0] used for root-relative output). Mirrors mano_forward_R steps 1-4."""
+    J = M["J_tmpl"] + jnp.einsum("jck,k->jc", M["J_shapedirs"], betas)
+    pose_feat = (R[1:] - jnp.eye(3)).reshape(-1)
+    parents = [int(p) for p in np.asarray(M["parents"])]
+    G = [jnp.eye(4).at[:3, :3].set(R[0]).at[:3, 3].set(J[0])]
+    for i in range(1, 16):
+        local = jnp.eye(4).at[:3, :3].set(R[i]).at[:3, 3].set(J[i] - J[parents[i]])
+        G.append(G[parents[i]] @ local)
+    G = jnp.stack(G, axis=0)
+    J0 = jnp.concatenate([J, jnp.zeros((16, 1))], axis=1)
+    offset = jnp.einsum("iab,ib->ia", G, J0)[:, :3]
+    G_rel = G.at[:, :3, 3].add(-offset)
+    return G_rel, pose_feat, J
+
+
+def mano_mesh_R(M, R, betas):
+    """Full 778-vertex MANO mesh for ONE hand, from rotation matrices.
+
+    For VISUALIZATION only (the optimizer uses the fast fingertip-only forward).
+    Skins all 778 vertices via LBS. Returns vertices root-relative to the wrist
+    (joint 0), matching mano_forward_R's joint convention so the mesh and the
+    21 joints share an origin. Faces are M["faces"] (1538,3).
+
+    Returns:
+        verts: (778, 3) root-relative vertices, metres.
+    """
+    G_rel, pose_feat, J = _lbs_transforms(M, R, betas)
+    # shape + pose blend on ALL vertices
+    v_posed = (M["v_template"]
+               + jnp.einsum("vck,k->vc", M["shapedirs"], betas)
+               + jnp.einsum("vck,k->vc", M["posedirs"], pose_feat))             # (778,3)
+    T = jnp.einsum("vj,jab->vab", M["weights"], G_rel)                          # (778,4,4)
+    v_h = jnp.concatenate([v_posed, jnp.ones((778, 1))], axis=1)               # (778,4)
+    verts = jnp.einsum("vab,vb->va", T, v_h)[:, :3]                            # (778,3)
+    # root-relative to wrist joint (j16[0]), matching mano_forward_R origin
+    J_h = jnp.concatenate([J, jnp.ones((16, 1))], axis=1)
+    j16 = jnp.einsum("iab,ib->ia", G_rel, J_h)[:, :3]
+    root = jnp.concatenate([j16, jnp.zeros((5, 3))], axis=0)[M["joint_map"]][0]
+    return verts - root
