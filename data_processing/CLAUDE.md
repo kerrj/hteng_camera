@@ -247,6 +247,93 @@ into both eyes + temporal coupling), which is the efficient design.
 TODO: firmer temporal weight to suppress the residual ~276mm spikes; run full
 video; lift joints_3d_cam back to a world/head frame; then head pose.
 
+## Scene depth via Fast-FoundationStereo (branch `depth_understanding`, 2026-06-30)
+
+**New machine reality:** this work runs on host **sphynx** (2x RTX A6000-48GB,
+system CUDA 13.0, driver 580), conda env **`eyeball`** — NOT chungus/eyeball211.
+`eyeball` = py3.10, **torch 2.10.0+cu126**, numpy 2.2.6, opencv-python 4.13,
+triton 3.6, timm/einops/omegaconf present. `long-test1/` was copied here to
+`~/hteng_camera/long-test1/`.
+
+**Goal:** wide-FOV *metric scene* depth (not just hands). A learned *monocular*
+model on raw frames can't do it (scale+shift ambiguity → warped cloud; fisheye
+is out-of-domain; per-frame scale flicker). The metric anchor must be the
+calibrated stereo baseline (70.8 mm). Plan: render a **grid of baseline-aligned
+PARALLEL pinhole stereo pairs** (tangent planes tiling the fisheye FOV; reuse
+`fisheye_pinhole.baseline_aligned_R` + `Intrinsics.undistort_maps`), run
+FoundationStereo per tile, back-project, fuse in the left-camera frame.
+Key geometry caveat: baseline is fixed at the physical centres — per look dir the
+usable baseline is the component ⟂ the optical axis, so tiles looking along ±x
+(toward the epipole) degrade to zero baseline (no depth there). Use the *parallel*
+(shared-orientation) rectification per tile, not the *verged* `render_stereo_crop`.
+
+**Fast-FoundationStereo install (DONE, `install_fast_foundationstereo.sh`):**
+- Vendored as a **pinned git submodule**: `data_processing/third_party/Fast-FoundationStereo`
+  @ `a290ba0` (master, 2026-05-26). It is clone-and-run (no setup.py); add its
+  root to `sys.path` and import `core` / `Utils`. Keep the submodule pristine —
+  weights live OUTSIDE it.
+- Two deps added to `eyeball` (constraints-pinned so torch/numpy didn't move):
+  **scikit-image 0.25.2**, **xformers 0.0.35** (the cu126 wheel matches torch
+  2.10). Deliberately **skipped opencv-contrib-python** (no aruco/contrib use;
+  avoids a 2nd cv2). Everything else FFS needs was already present.
+- Weights (~900 MB, gitignored) in `data_processing/weights/`: checkpoints
+  `23-36-37` (most accurate) · **`20-26-39` (balanced, our default)** ·
+  `20-30-48` (fastest) · `15-44-51`, each `cfg.yaml` + `model_best_bp2_serialize.pth`,
+  plus `onnx/` exports. From the repo's Drive folder via `gdown --folder`.
+- Fast path: `model.forward(l, r, iters=8, test_mode=True, optimize_build_volume='pytorch1')`
+  (Triton GWC kernel — JITs at runtime, needs NO nvcc/TRT build). Inputs are
+  `InputPadder(divis_by=32)`-padded float CHW tensors; depth = `fx*baseline/disp`.
+- **Smoke test (demo pair, 540x960, A6000):** loads in ~2.6s, forward 6.7s first
+  call (Triton compile) then **~70 ms warm**, **1.1 GB** GPU; clean disparity
+  (med 95.5px → depth med 0.498 m). Verified visually (desk/keyboard/mug scene).
+- GOTCHA: `scripts/run_demo.py` blocks headless — `cv2.imshow`+`waitKey(0)` (line
+  106) and an open3d Visualizer window (line ~139). Use the no-GUI forward (see
+  the install script's verify block) for batch work.
+- The *original* FoundationStereo (CVPR'25) is ALSO pip-installed in `eyeball`
+  (`foundation-stereo 1.0.0`, from the kushtimusPrime fork, module
+  `foundation_stereo`). Different package, no collision with the Fast submodule;
+  leave it unless it gets in the way.
+
+### Scene-depth mosaic — BUILT + validated (`ffs_scene_depth.py`, 2026-07-01)
+
+Single-frame wide-FOV metric depth via the tangent-plane mosaic. Renders a
+VERTICAL fan of baseline-aligned PARALLEL pinhole tiles (pitched about the
+baseline axis so each stays ⟂ baseline → full 70.8mm baseline, clean horizontal
+disparity), runs FFS per tile, back-projects `depth = fx*baseline/disp`, fuses in
+the left-cam frame. Reuses `fisheye_pinhole.sample_fisheye` + `baseline_aligned_R`
+(the NON-verged sibling of `render_stereo_crop`: right cam = `Rs @ Rv_l`, one
+shared world orientation). Horizontal coverage is the tile WIDTH (off-centre
+columns = yawed rays), NOT yaw-tiling; we do not yaw (breaks rectification).
+
+Defaults: 5 pitch tiles [-60,-30,0,30,60]°, each 960×384, hfov 100° / vfov 52°,
+fx≈403, max_disp 192, weights 20-26-39. Frame decode = cv2 on
+`left_stereo_8bit.mp4` (side-by-side; left half=left eye=serial ...008).
+Outputs (to `data_processing/out/`, gitignored): `_cloud.ply` (fused, left-cam
+metric), `_range.npy`+`_depth.png` (reprojected to left fisheye), `_tiles.png`
+(--debug: per-tile color|disp montage).
+
+**Validation (frame 3000, egocentric kitchen scene):** per-tile FFS depth is
+clean/sharp on real fisheye (container edges, arms, sink, TV all resolve; smooth
+surfaces). Depth medians track pitch sensibly: down −30°→0.61m (hands/counter),
+fwd→0.82m, up +30/+60°→2.2/2.9m (room). Fused 1.78M pts, depth p5/50/95 =
+0.40/2.05/4.64m. Top-down/side ortho shows coherent room geometry, no seam
+doubling. ~1–2s/frame on one A6000.
+
+**Confirmed via `motion_probe.py`:** the rig TRANSLATES (essential>homography,
+parallax 0.5–1.3° at low-rotation windows, up to ~4°/s) AND rotates hard/fast
+(up to 54°/0.3s, motion blur likely). So temporal fill (phase 2) is viable and
+its vertical/forward baselines can fill the horizontal epipole cones — but needs
+VO/pose + calm-window selection.
+
+**Known gaps / next (in priority):** (1) fusion is naive z-buffer-nearest — add
+confidence-weighted blending (downweight tile edges, near-epipole yaw, low
+texture); (2) mask blown-out windows / textureless / far-field (baseline-limited)
+noise — biggest visible-quality win; (3) fisheye reprojection is sparse/speckled
+(tiles lower-res than the 2448px fisheye) → render clean per-pixel map via
+higher-res tiles or radius/mesh splat; (4) coverage 29.7% is part artifact
+(sparse splat) + genuine epipole cones; (5) only 1 frame tested — try a calm and
+a blurry frame. THEN phase 2 (temporal) / phase 3 (mono fill).
+
 ### Before/after + outlier viz — `render_stereo_compare.py`
 
 2x2 panel video (L/R eyes x BEFORE/AFTER). BEFORE = WiLoR raw kp (epipolar

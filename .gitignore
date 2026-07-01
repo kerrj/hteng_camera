@@ -20,3 +20,6 @@ wb_measurement_*
 
 # WiLoR hand-pose outputs (large, regenerable on chungus)
 data_processing/out/
+
+# Fast-FoundationStereo model weights (~900 MB, fetched via install script)
+data_processing/weights/

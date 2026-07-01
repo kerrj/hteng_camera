@@ -1,0 +1,3 @@
+[submodule "data_processing/third_party/Fast-FoundationStereo"]
+	path = data_processing/third_party/Fast-FoundationStereo
+	url = https://github.com/NVlabs/Fast-FoundationStereo.git
