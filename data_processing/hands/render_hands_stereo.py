@@ -14,8 +14,8 @@ Produces TWO mp4s over the same frames, each a 2x2 grid:
 Each hand is rendered in its OWN bbox-centred rectified pinhole pair (so the two
 hands don't share an eye image). Both videos are written in one decode pass.
 
-    python render_hands_stereo.py --video long-test1/left_stereo_8bit.mp4 \
-        --calib-dir long-test1 --pinhole out/pinhole_stereo/hands.jsonl \
+    python render_hands_stereo.py --video ../../long-test1/left_stereo_8bit.mp4 \
+        --calib-dir ../../long-test1 --pinhole out/pinhole_stereo/hands.jsonl \
         --stereo3d-right out/hands3d_full_right.jsonl \
         --stereo3d-left  out/hands3d_full_left.jsonl \
         --raw-out out/hands_raw.mp4 --opt-out out/hands_opt.mp4
@@ -27,6 +27,9 @@ import cv2
 import numpy as np
 import torch
 
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import fisheye_pinhole as FP
 import wilor_hands_batched as W
 
@@ -37,7 +40,7 @@ def parse_args():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--video", required=True)
-    ap.add_argument("--calib-dir", default="long-test1")
+    ap.add_argument("--calib-dir", default="../../long-test1")
     ap.add_argument("--pinhole", required=True, help="pinhole hands.jsonl")
     ap.add_argument("--stereo3d-right", required=True)
     ap.add_argument("--stereo3d-left", required=True)

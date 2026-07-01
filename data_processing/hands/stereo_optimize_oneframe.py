@@ -14,6 +14,9 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import jaxls
 import mano_jax as MJ
 import fisheye_pinhole as FP
@@ -49,8 +52,8 @@ def draw(img, kp, color, thick=1):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--video", default="long-test1/left_stereo_8bit.mp4")
-    ap.add_argument("--calib-dir", default="long-test1")
+    ap.add_argument("--video", default="../../long-test1/left_stereo_8bit.mp4")
+    ap.add_argument("--calib-dir", default="../../long-test1")
     ap.add_argument("--mano", default="/tmp/mano_jax.npz")
     ap.add_argument("--frame", type=int, default=6750)
     ap.add_argument("--hand", choices=["left", "right"], default="right")

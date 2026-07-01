@@ -13,6 +13,7 @@ authors = [{ name = "Justin Kerr" }]
 dependencies = [
     "numpy>=1.20",
     "opencv-python>=4.5",
+    "pyserial>=3.5",
 ]
 
 [project.optional-dependencies]

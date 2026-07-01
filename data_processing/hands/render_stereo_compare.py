@@ -12,8 +12,8 @@ Reads the pinhole `hands.jsonl` (crop geometry + WiLoR kp) and the stereo3d
 `hands3d.jsonl` (optimized joints_3d_cam in the rectified-left frame). Re-renders
 the crops from the video so the overlays sit on real imagery.
 
-    python render_stereo_compare.py --video long-test1/left_stereo_8bit.mp4 \
-        --calib-dir long-test1 --pinhole out/pinhole_stereo/hands.jsonl \
+    python render_stereo_compare.py --video ../../long-test1/left_stereo_8bit.mp4 \
+        --calib-dir ../../long-test1 --pinhole out/pinhole_stereo/hands.jsonl \
         --stereo3d out/hands3d_30s_right.jsonl --hand right \
         --frame-max 900 --out out/stereo_cmp_right.mp4
 """
@@ -24,6 +24,9 @@ import cv2
 import numpy as np
 import torch
 
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import fisheye_pinhole as FP
 import wilor_hands_batched as W
 
@@ -34,7 +37,7 @@ def parse_args():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--video", required=True)
-    ap.add_argument("--calib-dir", default="long-test1")
+    ap.add_argument("--calib-dir", default="../../long-test1")
     ap.add_argument("--pinhole", required=True, help="pinhole hands.jsonl")
     ap.add_argument("--stereo3d", required=True, help="optimized hands3d.jsonl")
     ap.add_argument("--out", required=True)

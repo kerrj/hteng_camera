@@ -371,7 +371,7 @@ def main():
     ap.add_argument("--jsonl", required=True)
     ap.add_argument("--mano", default="/tmp/mano_jax.npz")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--calib-dir", default="../long-test1")
+    ap.add_argument("--calib-dir", default="../../long-test1")
     ap.add_argument("--left-serial", default="046060323008")
     ap.add_argument("--right-serial", default="046060323001")
     ap.add_argument("--hand", choices=["left", "right"], default="right",

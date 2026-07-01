@@ -88,7 +88,7 @@ def main():
         speed_dropdown = server.gui.add_dropdown(
             "Frame speed", options=("Low", "Mid", "High"), initial_value="High")
 
-    # -- Software AE (the record_stereo controller, testable live here) -----
+    # -- Software AE (the record_ego controller, testable live here) --------
     # Gain-first, centre-weighted, EMA-smoothed — the policy we want for the
     # ego stereo rig: exposure stays pinned short (stable fps / sync), gain does
     # the work. When on, it drives exp_slider/gain_slider every frame so you can

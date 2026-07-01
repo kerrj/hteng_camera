@@ -30,7 +30,7 @@ def project(x, f_px, out_size):
 def main():
     dev = torch.device("cpu")
     Kl, Dl, Kr, Dr, Rs, ts, b_hat, baseline = load_calib(
-        "../long-test1", "046060323008", "046060323001", dev)
+        "../../long-test1", "046060323008", "046060323001", dev)
     Rs = np.array(Rs); ts = np.array(ts).reshape(3)
 
     rows = [json.loads(l) for l in open("out/pinhole_verged_test/hands.jsonl")]

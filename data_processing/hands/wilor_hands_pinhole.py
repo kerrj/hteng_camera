@@ -33,6 +33,8 @@ import time
 import numpy as np
 import torch
 
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import fisheye_pinhole as FP
 import wilor_hands_batched as W
 
@@ -49,7 +51,7 @@ def parse_args():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("video", help="8-bit stereo video (left|right side-by-side)")
     p.add_argument("--out", required=True)
-    p.add_argument("--calib-dir", default="long-test1")
+    p.add_argument("--calib-dir", default="../../long-test1")
     p.add_argument("--left-serial", default="046060323008")
     p.add_argument("--right-serial", default="046060323001")
     p.add_argument("--chunk", type=int, default=64)

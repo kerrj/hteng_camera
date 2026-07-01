@@ -6,8 +6,8 @@ twice — once on the raw square crop, once on the de-warped pinhole crop — an
 draw both back on the fisheye frame. Output is an mp4 (mp4v; re-encode to h264
 to transfer).
 
-    python wilor_pinhole_compare.py long-test1/left_stereo_8bit.mp4 \
-        --calib-dir long-test1 --out out/pinhole_cmp.mp4 --downscale 2
+    python wilor_pinhole_compare.py ../../long-test1/left_stereo_8bit.mp4 \
+        --calib-dir ../../long-test1 --out out/pinhole_cmp.mp4 --downscale 2
 """
 import argparse
 import json
@@ -17,6 +17,8 @@ import cv2
 import numpy as np
 import torch
 
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import fisheye_pinhole as FP
 import wilor_hands_batched as W
 
@@ -27,7 +29,7 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("video")
-    p.add_argument("--calib-dir", default="long-test1")
+    p.add_argument("--calib-dir", default="../../long-test1")
     p.add_argument("--out", required=True)
     p.add_argument("--left-serial", default="046060323008")
     p.add_argument("--right-serial", default="046060323001")

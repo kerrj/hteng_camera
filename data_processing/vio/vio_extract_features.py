@@ -1,0 +1,178 @@
+"""VIO pipeline stage 1: SuperPoint feature extraction with a fisheye FOV mask,
+cached to HDF5 for reuse by the (separately re-runnable) matching stage.
+
+Extraction is the GPU-heavy, non-reprocessable-cheaply step, so its output is
+cached independently of matches: changing the matching pair set (e.g. a wider
+temporal window) later doesn't require re-running this stage.
+
+Run (from data_processing/vio/, matching this pipeline's CWD convention):
+    python vio_extract_features.py ../../long-test1 --out ../../long-test1/features.h5
+"""
+import argparse
+import json
+import os
+
+import cv2
+import h5py
+import numpy as np
+import torch
+
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import fisheye_pinhole as FP
+
+from lightglue import SuperPoint
+
+FORMAT_TAG = "hteng-camera-vio-features/1"
+DESCRIPTOR_DIM = 256
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("recording", help="recording dir with left.mp4/right.mp4/recording.json")
+    p.add_argument("--out", default=None, help="output .h5 (default: <recording>/features.h5)")
+    p.add_argument("--left-serial", default=None, help="default: read from recording.json")
+    p.add_argument("--right-serial", default=None)
+    p.add_argument("--fov-deg", type=float, default=130.0,
+                    help="full FOV kept (keypoints beyond this angle are dropped)")
+    p.add_argument("--max-keypoints", type=int, default=512)
+    p.add_argument("--max-frames", type=int, default=None)
+    p.add_argument("--device", default="cuda")
+    return p.parse_args()
+
+
+def load_intrinsics(recording_dir, serial, device):
+    calib = json.load(open(os.path.join(recording_dir, f"calib_{serial}.json")))
+    intr = calib["intrinsics"]
+    t = lambda x: torch.tensor(x, device=device, dtype=torch.float32)
+    return t(intr["K"]), t(intr["dist"])
+
+
+def fov_mask(keypoints_xy, K, dist, theta_max):
+    """Boolean mask: True where a keypoint's angle from the optical axis is
+    <= theta_max (radians). Reuses fisheye_pinhole's KB inversion (already
+    validated for pinhole-crop rendering) rather than re-deriving it."""
+    if keypoints_xy.shape[0] == 0:
+        return torch.zeros(0, dtype=torch.bool, device=keypoints_xy.device)
+    rays = FP.fisheye_unproject(keypoints_xy[:, 0], keypoints_xy[:, 1], K, dist)
+    theta = torch.arccos(rays[:, 2].clamp(-1, 1))
+    return theta <= theta_max
+
+
+def fov_crop_box(K, dist, theta_max, img_w, img_h):
+    """Pixel bounding box (x0, y0, x1, y1) tight around the FOV mask circle,
+    clipped to the frame. Cropping to this BEFORE running SuperPoint (rather
+    than resizing the full frame, most of which gets masked out anyway) buys
+    real effective resolution in the kept region for free: SuperPoint always
+    resizes its input's long side to a fixed budget, so shrinking the input
+    to just the region we keep means more of that budget is spent on pixels
+    we actually use, and the crop is also strictly cheaper to resize (fewer
+    total input pixels)."""
+    K_np = K.cpu().numpy().astype(np.float64)
+    dist_np = dist.cpu().numpy().astype(np.float64).reshape(4, 1)
+    az = np.linspace(0, 2 * np.pi, 360, endpoint=False)
+    rays = np.stack([
+        np.sin(theta_max) * np.cos(az), np.sin(theta_max) * np.sin(az),
+        np.full_like(az, np.cos(theta_max)),
+    ], axis=-1).reshape(-1, 1, 3)
+    px, _ = cv2.fisheye.projectPoints(rays, np.zeros((3, 1)), np.zeros((3, 1)), K_np, dist_np)
+    px = px.reshape(-1, 2)
+    cx, cy = K_np[0, 2], K_np[1, 2]
+    r = float(np.sqrt(((px - [cx, cy]) ** 2).sum(axis=1)).max())
+    x0, y0 = max(0, int(cx - r)), max(0, int(cy - r))
+    x1, y1 = min(img_w, int(cx + r) + 1), min(img_h, int(cy + r) + 1)
+    return x0, y0, x1, y1
+
+
+def read_frames_rgb(path, max_frames=None):
+    cap = cv2.VideoCapture(path)
+    n = 0
+    while max_frames is None or n < max_frames:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        yield cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        n += 1
+    cap.release()
+
+
+def to_tensor(img, device):
+    return torch.from_numpy(img).float().permute(2, 0, 1).to(device) / 255.0
+
+
+def extract_eye(f, eye, video_path, K, D, theta_max, extractor, device, max_frames):
+    cap = cv2.VideoCapture(video_path)
+    n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    img_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    img_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    n_frames = min(n_total, max_frames) if max_frames else n_total
+
+    x0, y0, x1, y1 = fov_crop_box(K, D, theta_max, img_w, img_h)
+    print(f"  {eye}: cropping to ({x0},{y0})-({x1},{y1}) "
+          f"[{x1-x0}x{y1-y0}] before extraction (native {img_w}x{img_h})")
+
+    grp = f.create_group(eye)
+    vlen_f32 = h5py.vlen_dtype(np.dtype("float32"))
+    vlen_f16 = h5py.vlen_dtype(np.dtype("float16"))
+    kp_ds = grp.create_dataset("keypoints", (n_frames,), dtype=vlen_f32)
+    sc_ds = grp.create_dataset("scores", (n_frames,), dtype=vlen_f32)
+    de_ds = grp.create_dataset("descriptors", (n_frames,), dtype=vlen_f16)
+    n_ds = grp.create_dataset("counts", (n_frames,), dtype=np.int32)
+
+    for i, img in enumerate(read_frames_rgb(video_path, n_frames)):
+        crop = img[y0:y1, x0:x1]
+        with torch.no_grad():
+            feat = extractor.extract(to_tensor(crop, device))
+        kp = feat["keypoints"][0]
+        kp = kp + kp.new_tensor([x0, y0])  # crop-local -> full-frame coords
+        sc = feat["keypoint_scores"][0]
+        de = feat["descriptors"][0]
+        mask = fov_mask(kp, K, D, theta_max)
+        kp, sc, de = kp[mask], sc[mask], de[mask]
+
+        kp_ds[i] = kp.cpu().numpy().astype(np.float32).ravel()
+        sc_ds[i] = sc.cpu().numpy().astype(np.float32)
+        de_ds[i] = de.cpu().numpy().astype(np.float16).ravel()
+        n_ds[i] = kp.shape[0]
+
+        if i % 200 == 0:
+            print(f"  {eye} {i}/{n_frames}: kept {kp.shape[0]} keypoints")
+
+    print(f"{eye}: {n_frames} frames done")
+
+
+def main():
+    args = parse_args()
+    device = args.device
+
+    rec = json.load(open(os.path.join(args.recording, "recording.json")))
+    ls = args.left_serial or rec["left"]["serial"]
+    rs = args.right_serial or rec["right"]["serial"]
+    Kl, Dl = load_intrinsics(args.recording, ls, device)
+    Kr, Dr = load_intrinsics(args.recording, rs, device)
+    theta_max = np.radians(args.fov_deg / 2.0)
+
+    extractor = SuperPoint(max_num_keypoints=args.max_keypoints).eval().to(device)
+
+    out_path = args.out or os.path.join(args.recording, "features.h5")
+    with h5py.File(out_path, "w") as f:
+        f.attrs["format"] = FORMAT_TAG
+        f.attrs["fov_deg"] = args.fov_deg
+        f.attrs["max_keypoints"] = args.max_keypoints
+        f.attrs["descriptor_dim"] = DESCRIPTOR_DIM
+        f.attrs["left_serial"] = ls
+        f.attrs["right_serial"] = rs
+        f.attrs["fps"] = rec.get("fps", 30)
+
+        extract_eye(f, "left", os.path.join(args.recording, "left.mp4"),
+                    Kl, Dl, theta_max, extractor, device, args.max_frames)
+        extract_eye(f, "right", os.path.join(args.recording, "right.mp4"),
+                    Kr, Dr, theta_max, extractor, device, args.max_frames)
+
+    print(f"wrote {out_path}")
+
+
+if __name__ == "__main__":
+    main()
