@@ -447,14 +447,7 @@ def main():
                          "beyond). With the shape prior, inlier reproj is p90~4.5px, "
                          "so 5px robustifies the noisy mid-tail; was 10px (barely "
                          "active). Normalized internally to match residual scale.")
-    ap.add_argument("--iters", type=int, default=100,
-                    help="phase-1 LM iters: per-frame fit, NO temporal coupling "
-                         "→ PoseVar block-diagonal → Schur-eliminated (cheap per "
-                         "iter), so run it hard.")
-    ap.add_argument("--iters-temporal", type=int, default=20,
-                    help="phase-2 LM iters: warm-start from phase 1, ADD the accel "
-                         "smoother (banded, not eliminable) and polish. Short — "
-                         "it only has to smooth, not re-fit.")
+    ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--frame-min", type=int, default=None)
     ap.add_argument("--frame-max", type=int, default=None)
     ap.add_argument("--linear", default="conjugate_gradient",
@@ -472,15 +465,14 @@ def main():
     out_size = data["out_size"]
 
     import time
-    # TWO-PHASE solve. Phase 1: per-frame fit with NO temporal coupling, so the
-    # PoseVar (and TransVar) Hessian blocks are block-DIAGONAL and jaxls Schur-
-    # eliminates PoseVar (the 94%-of-tangent-dim block) → a tiny reduced system,
-    # cheap per iteration → run it hard (--iters, default 100) to converge the
-    # fit. Phase 2: warm-start from phase 1, ADD the accel smoother (couples
-    # adjacent frames → banded, NOT eliminable → CG on the full system) and do a
-    # SHORT polish (--iters-temporal, default 20): it only has to smooth jitter,
-    # not re-fit from scratch. Trades the (expensive, un-eliminable) coupled
-    # iterations for many cheap eliminated ones + a few coupled ones.
+    # ONE big coupled solve over all n frames (reproj into both eyes + the accel
+    # smoother). This is the design that worked well; a two-phase (eliminable
+    # fit, then add smoothing) variant was tried and reverted — phase 1 at high
+    # iters DIVERGED (one global LM lambda, poisoned by the few singular/negative-
+    # depth frames), so the extra complexity bought nothing but instability. With
+    # the accel smoother on, PoseVar/TransVar are temporally coupled (banded),
+    # so jaxls Schur-eliminates NOTHING and CG solves the full banded system;
+    # that's fine (matrix-free, exploits the sparsity). ~50 LM iters converges.
     beta_var = args.optimize_beta
     beta_frozen = None if beta_var else jnp.mean(data["beta0"], axis=0)
     fids = jnp.arange(n)
@@ -492,48 +484,39 @@ def main():
         init_vars.append(BetaVar(0).with_value(jnp.mean(data["beta0"], axis=0)))
     init = jaxls.VarValues.make(init_vars)
 
-    def run_phase(costs, init_vals, iters, tag):
-        prob = jaxls.LeastSquaresProblem(costs, var_list).analyze()
-        elim = prob._elimination
-        if elim is None:
-            print(f"[{tag}] SCHUR: no elimination (full {prob._tangent_dim} dims)")
-        else:
-            print(f"[{tag}] SCHUR: reduced {elim.reduced_dim} of "
-                  f"{prob._tangent_dim} dims (PoseVar eliminated)")
-        t = time.time()
-        # LM trust region required (plain Gauss-Newton diverges to NaN here).
-        sol, summary = prob.solve(
-            init_vals, trust_region=jaxls.TrustRegionConfig(),
-            linear_solver=args.linear,
-            termination=jaxls.TerminationConfig(max_iterations=iters),
-            verbose=True, return_summary=True)
-        n_it = int(summary.iterations)
-        ch = np.array(summary.cost_history)[:n_it + 1]
-        lh = np.array(summary.lambda_history)[:n_it + 1]
-        crit = np.array(summary.termination_criteria)  # [cost, gradient, param]
-        why = ["cost", "gradient", "parameter"]
-        stopped = ", ".join(w for w, c in zip(why, crit) if c) or "max_iters"
-        print(f"[{tag}] {n_it} LM iters (max {iters}) in {time.time()-t:.1f}s; "
-              f"stopped on: {stopped}")
-        print(f"[{tag}]   cost: {ch[0]:.3e} -> {ch[-1]:.3e} "
-              f"({ch[-1]/ch[0]*100:.1f}% of init)   "
-              f"lambda: {lh[0]:.1e} -> {lh[-1]:.1e}")
-        return sol
-
-    # phase 1 — no temporal coupling (eliminable, fast per iter)
-    costs1, _ = make_costs(M, data, args.huber_px, args.w_shape,
-                           args.w_accel_pose, args.w_accel_pose_global,
-                           args.w_accel_trans, args.w_beta,
-                           beta_frozen=beta_frozen, temporal=False)
-    sol = run_phase(costs1, init, args.iters, "phase1/fit")
-
-    # phase 2 — warm-start from phase 1, add the accel smoother, short polish
-    if args.iters_temporal > 0 and (args.w_accel_pose > 0 or args.w_accel_trans > 0):
-        costs2, _ = make_costs(M, data, args.huber_px, args.w_shape,
-                               args.w_accel_pose, args.w_accel_pose_global,
-                               args.w_accel_trans, args.w_beta,
-                               beta_frozen=beta_frozen, temporal=True)
-        sol = run_phase(costs2, sol, args.iters_temporal, "phase2/smooth")
+    costs, _ = make_costs(M, data, args.huber_px, args.w_shape,
+                          args.w_accel_pose, args.w_accel_pose_global,
+                          args.w_accel_trans, args.w_beta,
+                          beta_frozen=beta_frozen, temporal=True)
+    prob = jaxls.LeastSquaresProblem(costs, var_list).analyze()
+    # report what Schur elimination chose (analyze() logs it too). With temporal
+    # smoothing on this is "no elimination"; printed to make it explicit.
+    elim = prob._elimination
+    if elim is None:
+        print(f"SCHUR: no elimination (full {prob._tangent_dim}-dim banded "
+              f"system; expected with the accel smoother on)")
+    else:
+        print(f"SCHUR: reduced {elim.reduced_dim} of {prob._tangent_dim} dims")
+    t = time.time()
+    # LM trust region required (plain Gauss-Newton diverges to NaN here).
+    sol, summary = prob.solve(
+        init, trust_region=jaxls.TrustRegionConfig(),
+        linear_solver=args.linear,
+        termination=jaxls.TerminationConfig(max_iterations=args.iters),
+        verbose=True, return_summary=True)
+    # structured convergence trace (return_summary=True) instead of scraping the
+    # verbose stdout: iters actually run, per-iter cost + LM lambda.
+    n_it = int(summary.iterations)
+    ch = np.array(summary.cost_history)[:n_it + 1]
+    lh = np.array(summary.lambda_history)[:n_it + 1]
+    crit = np.array(summary.termination_criteria)   # [cost, gradient, parameter]
+    why = ["cost", "gradient", "parameter"]
+    stopped = ", ".join(w for w, c in zip(why, crit) if c) or "max_iters"
+    print(f"solved {n} frames in {time.time()-t:.1f}s")
+    print(f"CONVERGENCE: {n_it} LM iters (max {args.iters}); stopped on: {stopped}")
+    print(f"  cost:   {ch[0]:.3e} -> {ch[-1]:.3e}  ({ch[-1]/ch[0]*100:.1f}% of init)")
+    print(f"  lambda: {lh[0]:.1e} -> {lh[-1]:.1e}  "
+          f"(min {lh.min():.1e}, max {lh.max():.1e})")
 
     quat = np.array(sol[PoseVar])
     trans = np.array(sol[TransVar])
@@ -599,8 +582,7 @@ def main():
     def pct(a, ps=(50, 90, 99)):
         return "  ".join(f"p{p}={np.percentile(a,p):.2f}" for p in ps)
     print("\n================ OPTIMIZATION DIAGNOSTICS ================")
-    print(f"frames solved: {n}   iters: {args.iters}(fit)+{args.iters_temporal}"
-          f"(smooth)   linear: {args.linear}")
+    print(f"frames solved: {n}   iters: {args.iters}   linear: {args.linear}")
     beta_mode = ("optimized beta" if args.optimize_beta else "FROZEN beta (WiLoR)")
     print(f"weights: accel[pose={args.w_accel_pose} global={args.w_accel_pose_global} "
           f"trans={args.w_accel_trans}] shape={args.w_shape} "
