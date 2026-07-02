@@ -39,6 +39,29 @@ batch_size > 1 -- the reference LightGlue implementation's adaptive
 point-pruning optimization has a genuine indexing bug for batch>1 (crashes
 with the default config; confirmed by direct testing, not a config choice).
 
+MATCHING PRECISION/COMPILE (defaults locked in via the bench_lightglue*.py
+sweeps on this recording, 300 frames / 8152 pairs, batch_size=16):
+  - mp=True (LightGlue's autocast flag): ~1.7x on the matching phase, 99.9%
+    match agreement vs fp32. The single dominant lever -- attention was
+    already fp16 via the flash path; this extends fp16 to the GNN's
+    projections/MLPs. TF32 ("high" matmul precision) was also swept: 1.37x
+    at 100% agreement standalone, but it does NOT stack with autocast (both
+    accelerate the same GEMMs; once autocast has them in fp16, TF32 has
+    nothing left), so mp subsumes it.
+  - matcher.compile(mode="reduce-overhead") was evaluated and REJECTED (not
+    even offered as a flag): its speed edge over eager+mp was unstable
+    across repeated sweeps (+13% to -40%; eager numbers were rock-stable in
+    the same sweeps), it pays a ~40s warmup that dominates short runs, and
+    an isolated A/B in this script (200 frames, everything else identical)
+    showed its pad-and-mask numerics shift ~5% of post-RANSAC gate
+    decisions vs eager. Also requires patching a batch>1 mask-broadcast
+    bug ([B,N,N] masks fed to SDPA, which needs [B,heads,N,N]-
+    broadcastable -- fix is .unsqueeze(1) per mask in masked_forward,
+    preserved in bench_lightglue_compile.py if ever revisited).
+  - depth_confidence (early-stop) stays at its default: disabling it
+    measured slightly SLOWER (batched early-exits do fire; the per-layer
+    confidence-head overhead pays for itself).
+
 TEMPORAL-PAIR RANSAC IS BATCHED SEPARATELY FROM LIGHTGLUE, AT A MUCH LARGER,
 FULLY DECOUPLED BATCH SIZE (--ransac-batch-size, --ransac-m-pad). There's no
 correctness reason for the two to match -- LightGlue's --batch-size is tuned
@@ -90,6 +113,18 @@ def parse_args():
     p.add_argument("--min-raw-matches", type=int, default=10,
                     help="reject a whole pair if fewer than this many matches survive "
                          "the confidence threshold -- too few for RANSAC to be meaningful")
+    p.add_argument("--min-gate-inliers", type=int, default=15,
+                    help="reject a TEMPORAL pair entirely (all matches moved to "
+                         "rejected) if the RANSAC gate's winning model kept fewer than "
+                         "this many inliers -- a 5-DOF model that only 'explains' 6-7 "
+                         "points is a fit to noise/repetitive texture, not evidence of "
+                         "consistent geometry. Found via a real 44s monster track in "
+                         "stage 3 welded together by exactly such pairs (n_geom 6-7, "
+                         "gaps 30-50) during fast head motion; see "
+                         "vio_build_tracks.py's docstring, defense 2. min_raw_matches "
+                         "can't catch this: it bounds RAW LightGlue matches, and these "
+                         "pairs had plenty -- it's the SURVIVING inlier count that "
+                         "exposes the degenerate fit.")
     p.add_argument("--epipolar-px-thresh", type=float, default=3.0)
     p.add_argument("--dense-max", type=int, default=3)
     p.add_argument("--mid-max", type=int, default=10)
@@ -465,6 +500,12 @@ def gate_temporal_all(accum, theta_tol_ours, args, out_f):
             # scored points over an untested tail").
             full_inlier = np.zeros(idx.shape[0], dtype=bool)
             full_inlier[:valid_n] = g
+            # too few surviving inliers = degenerate fit, reject the whole
+            # pair (see --min-gate-inliers help text; the record is still
+            # written, with everything in rejected_*, so the visualizer can
+            # show what was filtered -- same convention as min_raw_matches).
+            if int(full_inlier.sum()) < args.min_gate_inliers:
+                full_inlier[:] = False
             rec = {
                 "eye_a": eye_a, "frame_a": i, "eye_b": eye_b, "frame_b": j,
                 "pair_type": "temporal", "gap": gap,
@@ -523,7 +564,10 @@ def main():
     # implementation's adaptive point-pruning has a genuine indexing bug for
     # batch>1 (confirmed by direct testing -- crashes with the default
     # config), not a speed/quality tradeoff we're choosing here.
-    matcher = LightGlue(features="superpoint", width_confidence=-1).eval().to(args.device)
+    # mp=True: see "MATCHING PRECISION/COMPILE" in the module docstring for
+    # the sweep numbers behind this default (~1.7x, 99.9% agreement).
+    matcher = LightGlue(features="superpoint", width_confidence=-1,
+                        mp=True).eval().to(args.device)
 
     # ONE global threshold for ALL temporal pairs regardless of eye -- matches
     # the exact methodology relpose_5pt_jaxls.py's own sweeps were validated

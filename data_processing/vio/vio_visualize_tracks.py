@@ -52,7 +52,8 @@ def parse_args():
     p.add_argument("--tracks-per-frame", type=int, default=100,
                     help="target number of tracks drawn per frame, selected locally "
                          "from whatever's active in that frame's tail window -- "
-                         "not a single fixed set for the whole video")
+                         "not a single fixed set for the whole video. 0 = no cap, "
+                         "draw every active track every frame")
     p.add_argument("--tail-length", type=int, default=20)
     p.add_argument("--out", default=None)
     return p.parse_args()
@@ -136,7 +137,7 @@ def main():
 
         active_ti = list(active_count.keys())
         n_active_total = len(active_ti)
-        if len(active_ti) > args.tracks_per_frame:
+        if args.tracks_per_frame and len(active_ti) > args.tracks_per_frame:
             active_ti.sort(key=lambda ti: -len(tracks[ti]["frames"]))
             active_ti = active_ti[:args.tracks_per_frame]
 

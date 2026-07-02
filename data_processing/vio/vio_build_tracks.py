@@ -6,7 +6,7 @@ correspondences.
 Node = one observation, (eye, frame, keypoint_idx). Edge = one accepted
 match from stage 2 (rejected matches are never added as edges).
 
-TWO defenses against a bad edge corrupting a track, found necessary by
+THREE defenses against a bad edge corrupting a track, all found necessary by
 direct investigation (not anticipated up front):
 
 1. CONFLICT-AWARE union-find, not naive connected components: plain
@@ -20,7 +20,23 @@ direct investigation (not anticipated up front):
    would create two different node keys sharing the same (eye,frame) in the
    resulting component.
 
-2. DISPLACEMENT-RATE gate on temporal edges: (1) alone doesn't catch a
+2. MINIMUM POST-GATE INLIER COUNT on temporal pairs: a temporal pair whose
+   RANSAC gate kept only a handful of inliers (e.g. 6-7) is not evidence of
+   consistent geometry -- a 5-DOF essential-matrix model fit to noise or
+   repetitive texture can "explain" that few points by chance. Found by
+   direct investigation of a 2007-observation monster track spanning 44s of
+   obviously-different physical points (floor -> sink -> cabinet): it was
+   4-5 legitimate tracks welded together by ~3 long-gap (30-50 frame)
+   bridge edges from pairs with n_geom of just 6-7, out of 21k healthy
+   edges. Defense (1) can't catch these: the bridged segments live in
+   DISJOINT frame ranges, so no (eye,frame) conflict ever arises. Filter
+   the whole pair (all its edges) when n_geom < --min-gate-inliers. Stage 2
+   applies the same filter at generation time (its min_raw_matches
+   pre-filter only bounds RAW LightGlue matches, not surviving inliers);
+   it's applied here too so pre-existing matches files can be re-filtered
+   without a re-match, and as defense-in-depth.
+
+3. DISPLACEMENT-RATE gate on temporal edges: (1) alone doesn't catch a
    different failure mode, also observed directly -- a single bad detection
    at one frame gets stitched into an otherwise-perfect track (e.g. a track
    drifting smoothly frame to frame that briefly "teleports" 600+ px away
@@ -78,6 +94,13 @@ def parse_args():
                          "above real ego-motion (~30-60px/frame even during fast head "
                          "motion in this recording) and well below observed bad edges "
                          "(300-600+ px/frame)")
+    p.add_argument("--min-gate-inliers", type=int, default=15,
+                    help="drop a temporal pair's edges entirely if its RANSAC gate "
+                         "kept fewer than this many inliers (n_geom) -- defense 2 in "
+                         "the module docstring. Redundant with stage 2's identical "
+                         "post-gate filter for newly-generated matches files, but "
+                         "kept here as defense-in-depth and so pre-existing files "
+                         "can be re-filtered without re-matching.")
     return p.parse_args()
 
 
@@ -125,7 +148,7 @@ class ConflictAwareUnionFind:
 
 def prune_spike_outliers(obs_for_eye, max_px_per_frame):
     """Remove an interior observation whose transitions to BOTH neighbors are
-    implausible (see module docstring, defense 2) but whose neighbors are
+    implausible (see module docstring, defense 3) but whose neighbors are
     consistent with EACH OTHER once it's skipped -- the exact signature of a
     lone bad detection wedged into an otherwise-clean track via a multi-hop
     bridge (each hop individually plausible, so the per-edge check in main()
@@ -191,10 +214,14 @@ def main():
         n_edges = 0
         n_rejected_conflict = 0
         n_rejected_implausible = 0
+        n_pairs_low_inliers = 0
         for r in recs:
             ea, fa, eb, fb = r["eye_a"], r["frame_a"], r["eye_b"], r["frame_b"]
             is_temporal = r["pair_type"] == "temporal"
             gap = r.get("gap") or 0
+            if is_temporal and r["n_geom"] < args.min_gate_inliers:
+                n_pairs_low_inliers += 1
+                continue
             for ia, ib in zip(r["idx_a"], r["idx_b"]):
                 n_edges += 1
                 if is_temporal:
@@ -207,9 +234,10 @@ def main():
                 if not uf.union(a, b):
                     n_rejected_conflict += 1
 
-        print(f"{len(recs)} matched pairs, {len(node_id)} distinct observations, "
-              f"{n_edges} edges ({n_rejected_implausible} rejected as implausible motion, "
-              f"{n_rejected_conflict} rejected as conflicting)")
+        print(f"{len(recs)} matched pairs ({n_pairs_low_inliers} temporal pairs dropped "
+              f"for < {args.min_gate_inliers} gate inliers), {len(node_id)} distinct "
+              f"observations, {n_edges} edges ({n_rejected_implausible} rejected as "
+              f"implausible motion, {n_rejected_conflict} rejected as conflicting)")
 
         by_root = {}
         for key, idx in node_id.items():
