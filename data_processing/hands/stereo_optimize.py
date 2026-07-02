@@ -451,16 +451,44 @@ def main():
     ])
     prob = jaxls.LeastSquaresProblem(
         costs, [PoseVar(fids), TransVar(fids), BetaVar(0)]).analyze()
+    # Report what Schur elimination actually chose (analyze() logs it too, but
+    # the log line is easy to miss). With the accel smoother ON, each accel
+    # factor couples 3 consecutive PoseVars/TransVars, so NEITHER is block-
+    # diagonal and can't be eliminated; BetaVar (10 dims) is below the 5% floor
+    # -> auto picks NOTHING and CG solves the full banded system. Turning the
+    # smoother off makes PoseVar block-diagonal again (eliminated -> tiny
+    # reduced system). Printing reduced_dim vs tangent_dim makes this explicit.
+    elim = prob._elimination
+    if elim is None:
+        print(f"SCHUR: no elimination (full {prob._tangent_dim}-dim system; "
+              f"expected with accel smoothing on)")
+    else:
+        print(f"SCHUR: reduced system {elim.reduced_dim} of {prob._tangent_dim} "
+              f"tangent dims")
     t = time.time()
     # LM trust region required (plain Gauss-Newton diverges to NaN here).
-    sol = prob.solve(init, trust_region=jaxls.TrustRegionConfig(),
-                     linear_solver=args.linear,
-                     termination=jaxls.TerminationConfig(max_iterations=args.iters),
-                     verbose=True)
+    sol, summary = prob.solve(
+        init, trust_region=jaxls.TrustRegionConfig(),
+        linear_solver=args.linear,
+        termination=jaxls.TerminationConfig(max_iterations=args.iters),
+        verbose=True, return_summary=True)
     quat = np.array(sol[PoseVar])
     trans = np.array(sol[TransVar])
     beta_solved = np.array(sol[BetaVar]).reshape(-1)[:10]   # (10,) shared shape
     print(f"solved {n} frames in {time.time()-t:.1f}s")
+    # structured convergence trace (return_summary=True) instead of scraping the
+    # verbose stdout: iters actually run, per-iter cost + LM lambda. cost_history
+    # / lambda_history are max_iterations-long, zero-padded past `iterations`.
+    n_it = int(summary.iterations)
+    ch = np.array(summary.cost_history)[:n_it + 1]
+    lh = np.array(summary.lambda_history)[:n_it + 1]
+    crit = np.array(summary.termination_criteria)   # [cost, gradient, parameter]
+    why = ["cost", "gradient", "parameter"]
+    stopped = ", ".join(w for w, c in zip(why, crit) if c) or "max_iters"
+    print(f"CONVERGENCE: {n_it} LM iters (max {args.iters}); stopped on: {stopped}")
+    print(f"  cost:   {ch[0]:.3e} -> {ch[-1]:.3e}  ({ch[-1]/ch[0]*100:.1f}% of init)")
+    print(f"  lambda: {lh[0]:.1e} -> {lh[-1]:.1e}  "
+          f"(min {lh.min():.1e}, max {lh.max():.1e})")
     print(f"shared betas: WiLoR-mean={np.mean(np.array(data['beta0']),0).round(2)}")
     print(f"              optimized ={beta_solved.round(2)}")
 
