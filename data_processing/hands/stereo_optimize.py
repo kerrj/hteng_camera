@@ -100,8 +100,19 @@ def kp_weights(w_wrist, w_mcp, w_pip, w_tip):
 
 
 def make_costs(M, data, huber_px, w_shape,
-               w_accel_pose, w_accel_pose_global, w_accel_trans, w_beta):
-    """Build batched jaxls costs from the per-frame stacked arrays in ``data``."""
+               w_accel_pose, w_accel_pose_global, w_accel_trans, w_beta,
+               beta_frozen=None, temporal=True):
+    """Build batched jaxls costs from the per-frame stacked arrays in ``data``.
+
+    beta_frozen: if a (10,) array, MANO shape is a CONSTANT (not solved) — the
+    default, since a shared free beta absorbs pose error and blows up; trust
+    WiLoR. If None, beta is a single shared BetaVar(0) with the w_beta prior.
+
+    temporal: include the acceleration smoother (couples adjacent frames). Set
+    False for the fast phase-1 solve — with no pose↔pose / trans↔trans coupling,
+    PoseVar is block-diagonal so jaxls Schur-eliminates it (tiny reduced system,
+    cheap per-iter). Phase 2 re-runs with temporal=True to polish smoothness.
+    """
     n = data["pose0"].shape[0]
     fids = jnp.arange(n)
 
@@ -156,15 +167,31 @@ def make_costs(M, data, huber_px, w_shape,
     # what forward-mode AD differentiates through) runs ONCE per frame; the
     # shared joints are then projected into each eye. Two separate per-eye costs
     # would run FK + its Jacobian twice.
+    # beta handling: FROZEN (a constant closed over here) is the default — a
+    # shared free beta absorbs pose/detection error and blows up (β₀→2.8 on the
+    # full video), so trust WiLoR's per-frame shape. If beta_frozen is None,
+    # beta is a shared BetaVar(0) solved with the w_beta prior (opt-in).
+    beta_is_var = beta_frozen is None
+    beta_const = None if beta_is_var else jnp.asarray(beta_frozen)
+
     @jaxls.Cost.factory(jac_mode="forward")
-    def reproj(vals, pose_v, t_v, beta_v,
-               obsL, fL, RL, tL, obsR, fR, RR, tR, conf):
+    def reproj_var_beta(vals, pose_v, t_v, beta_v,
+                        obsL, fL, RL, tL, obsR, fR, RR, tR, conf):
         R = jaxlie.SO3(vals[pose_v]).as_matrix()           # (16,4)quat -> (16,3,3)
-        # beta_v is ONE shared BetaVar(0) — every frame's cost reads the same
-        # shape, so the joint solve fits a single video-wide hand shape.
-        joints = MJ.mano_forward_R(M, R, vals[beta_v])
+        joints = MJ.mano_forward_R(M, R, vals[beta_v])     # shared shape var
         joints = joints.at[:, 0].multiply(mirror)          # left-hand x-mirror
         x = joints + vals[t_v][None, :]                    # left-virtual frame
+        rL = eye_residual(x, obsL, conf, fL, RL, tL)
+        rR = eye_residual(x, obsR, conf, fR, RR, tR)
+        return jnp.concatenate([rL.ravel(), rR.ravel()])
+
+    @jaxls.Cost.factory(jac_mode="forward")
+    def reproj_frozen_beta(vals, pose_v, t_v,
+                           obsL, fL, RL, tL, obsR, fR, RR, tR, conf):
+        R = jaxlie.SO3(vals[pose_v]).as_matrix()
+        joints = MJ.mano_forward_R(M, R, beta_const)       # constant shape
+        joints = joints.at[:, 0].multiply(mirror)
+        x = joints + vals[t_v][None, :]
         rL = eye_residual(x, obsL, conf, fL, RL, tL)
         rR = eye_residual(x, obsR, conf, fR, RR, tR)
         return jnp.concatenate([rL.ravel(), rR.ravel()])
@@ -219,22 +246,26 @@ def make_costs(M, data, huber_px, w_shape,
     eye_0 = jnp.zeros((n, 3))
     # one cost, both eyes: left = (I,0) (pose+t already in left-virtual frame),
     # right = (R_lr, t_lr) (verged rigid transform into the right-virtual frame).
-    # BetaVar(0) is ONE shared shape var broadcast across all n frames.
-    beta_ids = jnp.zeros(n, dtype=jnp.int32)
-    costs.append(reproj(PoseVar(fids), TransVar(fids), BetaVar(beta_ids),
-                        data["kpL"], data["f_px"], eye_I, eye_0,
-                        data["kpR"], data["f_px"], data["R_lr"], data["t_lr"],
-                        data["confL"]))
-    if w_beta > 0:
-        costs.append(beta_prior(BetaVar(0)))
+    reproj_args = (data["kpL"], data["f_px"], eye_I, eye_0,
+                   data["kpR"], data["f_px"], data["R_lr"], data["t_lr"],
+                   data["confL"])
+    if beta_is_var:
+        beta_ids = jnp.zeros(n, dtype=jnp.int32)   # ONE shared BetaVar(0), all frames
+        costs.append(reproj_var_beta(PoseVar(fids), TransVar(fids),
+                                     BetaVar(beta_ids), *reproj_args))
+        if w_beta > 0:
+            costs.append(beta_prior(BetaVar(0)))
+    else:
+        costs.append(reproj_frozen_beta(PoseVar(fids), TransVar(fids), *reproj_args))
     # shape prior: internal finger pose toward the two-eye geodesic mean
     if w_shape > 0:
         costs.append(shape_prior(PoseVar(fids), data["shape_mean"]))
     # acceleration smoother over consecutive-in-time triples. Couples adjacent
-    # frames → the pose Hessian is block-TRIDIAGONAL (banded), which Schur + CG
-    # still handle efficiently (one global solve = optimal sliding-window smooth).
+    # frames → the pose Hessian is block-TRIDIAGONAL (banded) so PoseVar is no
+    # longer block-diagonal / Schur-eliminable; CG solves the full banded system.
+    # Skipped entirely when temporal=False (phase-1 fast solve stays eliminable).
     i0, i1, i2 = data["accel_i0"], data["accel_i1"], data["accel_i2"]
-    if (w_accel_pose > 0 or w_accel_trans > 0) and i0.shape[0] > 0:
+    if temporal and (w_accel_pose > 0 or w_accel_trans > 0) and i0.shape[0] > 0:
         if w_accel_pose > 0:
             costs.append(accel_pose(PoseVar(i0), PoseVar(i1), PoseVar(i2)))
         if w_accel_trans > 0:
@@ -391,10 +422,15 @@ def main():
                          "Sweep (2026-06-29): 0->54px reproj p99 & 6rad pose drift; "
                          "0.1 -> 1.9px p50 / 10px p99 / 0.3rad drift; 1.0 over-"
                          "constrains. 0.1 is the knee.")
+    ap.add_argument("--optimize-beta", action="store_true",
+                    help="solve ONE shared MANO shape for the whole video (with "
+                         "the --w-beta prior). DEFAULT is OFF: beta is FROZEN to "
+                         "WiLoR's per-frame mean, because a free shared beta "
+                         "absorbs pose/detection error and blows up (β₀→2.8 on the "
+                         "full video vs WiLoR's 0.11).")
     ap.add_argument("--w-beta", type=float, default=0.5,
-                    help="prior keeping the single shared MANO shape near 0 (mean "
-                         "hand). Shape is now OPTIMIZED (one beta for the whole "
-                         "video), not frozen; set 0 to disable the prior.")
+                    help="prior keeping the shared MANO shape near 0 (mean hand). "
+                         "Only used with --optimize-beta; set 0 to disable.")
     # per-keypoint reprojection group weights (residual-space; cost ∝ w²).
     # wrist high: it's root-relative (0,0,0) so it only constrains translation
     # → lets stereo disparity fix metric depth. tips low: noisy + pose-sensitive.
@@ -411,7 +447,14 @@ def main():
                          "beyond). With the shape prior, inlier reproj is p90~4.5px, "
                          "so 5px robustifies the noisy mid-tail; was 10px (barely "
                          "active). Normalized internally to match residual scale.")
-    ap.add_argument("--iters", type=int, default=30)
+    ap.add_argument("--iters", type=int, default=100,
+                    help="phase-1 LM iters: per-frame fit, NO temporal coupling "
+                         "→ PoseVar block-diagonal → Schur-eliminated (cheap per "
+                         "iter), so run it hard.")
+    ap.add_argument("--iters-temporal", type=int, default=20,
+                    help="phase-2 LM iters: warm-start from phase 1, ADD the accel "
+                         "smoother (banded, not eliminable) and polish. Short — "
+                         "it only has to smooth, not re-fit.")
     ap.add_argument("--frame-min", type=int, default=None)
     ap.add_argument("--frame-max", type=int, default=None)
     ap.add_argument("--linear", default="conjugate_gradient",
@@ -429,68 +472,77 @@ def main():
     out_size = data["out_size"]
 
     import time
-    # ONE big solve over all n frames. jaxls's Schur elimination (analyze's
-    # default "auto") eliminates the per-frame PoseVar block — for the
-    # block-diagonal (no-temporal) system the reduced system is just the small
-    # TransVar block, factored directly by dense_cholesky. This is ~16x faster
-    # than the old chunked CG path (189s -> ~12s for 4400 frames) AND
-    # deterministic (CG's shared-lambda + Eisenstat-Walker gave 5-80s variance).
-    # It also transfers cleanly to temporal smoothing: a banded coupled system
-    # Schur-eliminates the same way, whereas chunking would sever smoothness
-    # edges at boundaries.
+    # TWO-PHASE solve. Phase 1: per-frame fit with NO temporal coupling, so the
+    # PoseVar (and TransVar) Hessian blocks are block-DIAGONAL and jaxls Schur-
+    # eliminates PoseVar (the 94%-of-tangent-dim block) → a tiny reduced system,
+    # cheap per iteration → run it hard (--iters, default 100) to converge the
+    # fit. Phase 2: warm-start from phase 1, ADD the accel smoother (couples
+    # adjacent frames → banded, NOT eliminable → CG on the full system) and do a
+    # SHORT polish (--iters-temporal, default 20): it only has to smooth jitter,
+    # not re-fit from scratch. Trades the (expensive, un-eliminable) coupled
+    # iterations for many cheap eliminated ones + a few coupled ones.
+    beta_var = args.optimize_beta
+    beta_frozen = None if beta_var else jnp.mean(data["beta0"], axis=0)
     fids = jnp.arange(n)
-    costs, _ = make_costs(M, data, args.huber_px, args.w_shape,
-                          args.w_accel_pose, args.w_accel_pose_global,
-                          args.w_accel_trans, args.w_beta)
-    # init the shared shape to the per-frame mean of WiLoR's betas
-    beta_init = jnp.mean(data["beta0"], axis=0)                  # (10,)
-    init = jaxls.VarValues.make([
-        PoseVar(fids).with_value(data["quat0"]),
-        TransVar(fids).with_value(t_init),
-        BetaVar(0).with_value(beta_init),
-    ])
-    prob = jaxls.LeastSquaresProblem(
-        costs, [PoseVar(fids), TransVar(fids), BetaVar(0)]).analyze()
-    # Report what Schur elimination actually chose (analyze() logs it too, but
-    # the log line is easy to miss). With the accel smoother ON, each accel
-    # factor couples 3 consecutive PoseVars/TransVars, so NEITHER is block-
-    # diagonal and can't be eliminated; BetaVar (10 dims) is below the 5% floor
-    # -> auto picks NOTHING and CG solves the full banded system. Turning the
-    # smoother off makes PoseVar block-diagonal again (eliminated -> tiny
-    # reduced system). Printing reduced_dim vs tangent_dim makes this explicit.
-    elim = prob._elimination
-    if elim is None:
-        print(f"SCHUR: no elimination (full {prob._tangent_dim}-dim system; "
-              f"expected with accel smoothing on)")
-    else:
-        print(f"SCHUR: reduced system {elim.reduced_dim} of {prob._tangent_dim} "
-              f"tangent dims")
-    t = time.time()
-    # LM trust region required (plain Gauss-Newton diverges to NaN here).
-    sol, summary = prob.solve(
-        init, trust_region=jaxls.TrustRegionConfig(),
-        linear_solver=args.linear,
-        termination=jaxls.TerminationConfig(max_iterations=args.iters),
-        verbose=True, return_summary=True)
+    var_list = [PoseVar(fids), TransVar(fids)]
+    init_vars = [PoseVar(fids).with_value(data["quat0"]),
+                 TransVar(fids).with_value(t_init)]
+    if beta_var:
+        var_list.append(BetaVar(0))
+        init_vars.append(BetaVar(0).with_value(jnp.mean(data["beta0"], axis=0)))
+    init = jaxls.VarValues.make(init_vars)
+
+    def run_phase(costs, init_vals, iters, tag):
+        prob = jaxls.LeastSquaresProblem(costs, var_list).analyze()
+        elim = prob._elimination
+        if elim is None:
+            print(f"[{tag}] SCHUR: no elimination (full {prob._tangent_dim} dims)")
+        else:
+            print(f"[{tag}] SCHUR: reduced {elim.reduced_dim} of "
+                  f"{prob._tangent_dim} dims (PoseVar eliminated)")
+        t = time.time()
+        # LM trust region required (plain Gauss-Newton diverges to NaN here).
+        sol, summary = prob.solve(
+            init_vals, trust_region=jaxls.TrustRegionConfig(),
+            linear_solver=args.linear,
+            termination=jaxls.TerminationConfig(max_iterations=iters),
+            verbose=True, return_summary=True)
+        n_it = int(summary.iterations)
+        ch = np.array(summary.cost_history)[:n_it + 1]
+        lh = np.array(summary.lambda_history)[:n_it + 1]
+        crit = np.array(summary.termination_criteria)  # [cost, gradient, param]
+        why = ["cost", "gradient", "parameter"]
+        stopped = ", ".join(w for w, c in zip(why, crit) if c) or "max_iters"
+        print(f"[{tag}] {n_it} LM iters (max {iters}) in {time.time()-t:.1f}s; "
+              f"stopped on: {stopped}")
+        print(f"[{tag}]   cost: {ch[0]:.3e} -> {ch[-1]:.3e} "
+              f"({ch[-1]/ch[0]*100:.1f}% of init)   "
+              f"lambda: {lh[0]:.1e} -> {lh[-1]:.1e}")
+        return sol
+
+    # phase 1 — no temporal coupling (eliminable, fast per iter)
+    costs1, _ = make_costs(M, data, args.huber_px, args.w_shape,
+                           args.w_accel_pose, args.w_accel_pose_global,
+                           args.w_accel_trans, args.w_beta,
+                           beta_frozen=beta_frozen, temporal=False)
+    sol = run_phase(costs1, init, args.iters, "phase1/fit")
+
+    # phase 2 — warm-start from phase 1, add the accel smoother, short polish
+    if args.iters_temporal > 0 and (args.w_accel_pose > 0 or args.w_accel_trans > 0):
+        costs2, _ = make_costs(M, data, args.huber_px, args.w_shape,
+                               args.w_accel_pose, args.w_accel_pose_global,
+                               args.w_accel_trans, args.w_beta,
+                               beta_frozen=beta_frozen, temporal=True)
+        sol = run_phase(costs2, sol, args.iters_temporal, "phase2/smooth")
+
     quat = np.array(sol[PoseVar])
     trans = np.array(sol[TransVar])
-    beta_solved = np.array(sol[BetaVar]).reshape(-1)[:10]   # (10,) shared shape
-    print(f"solved {n} frames in {time.time()-t:.1f}s")
-    # structured convergence trace (return_summary=True) instead of scraping the
-    # verbose stdout: iters actually run, per-iter cost + LM lambda. cost_history
-    # / lambda_history are max_iterations-long, zero-padded past `iterations`.
-    n_it = int(summary.iterations)
-    ch = np.array(summary.cost_history)[:n_it + 1]
-    lh = np.array(summary.lambda_history)[:n_it + 1]
-    crit = np.array(summary.termination_criteria)   # [cost, gradient, parameter]
-    why = ["cost", "gradient", "parameter"]
-    stopped = ", ".join(w for w, c in zip(why, crit) if c) or "max_iters"
-    print(f"CONVERGENCE: {n_it} LM iters (max {args.iters}); stopped on: {stopped}")
-    print(f"  cost:   {ch[0]:.3e} -> {ch[-1]:.3e}  ({ch[-1]/ch[0]*100:.1f}% of init)")
-    print(f"  lambda: {lh[0]:.1e} -> {lh[-1]:.1e}  "
-          f"(min {lh.min():.1e}, max {lh.max():.1e})")
-    print(f"shared betas: WiLoR-mean={np.mean(np.array(data['beta0']),0).round(2)}")
-    print(f"              optimized ={beta_solved.round(2)}")
+    if beta_var:
+        beta_solved = np.array(sol[BetaVar]).reshape(-1)[:10]
+    else:
+        beta_solved = np.array(beta_frozen)                 # frozen WiLoR mean
+    print(f"betas ({'optimized' if beta_var else 'FROZEN to WiLoR mean'}): "
+          f"{beta_solved.round(2)}")
 
     quat0_np = np.array(data["quat0"])
     beta = np.broadcast_to(beta_solved, (n, 10))        # shared shape, per frame
@@ -547,11 +599,13 @@ def main():
     def pct(a, ps=(50, 90, 99)):
         return "  ".join(f"p{p}={np.percentile(a,p):.2f}" for p in ps)
     print("\n================ OPTIMIZATION DIAGNOSTICS ================")
-    print(f"frames solved: {n}   iters: {args.iters}   linear: {args.linear}")
+    print(f"frames solved: {n}   iters: {args.iters}(fit)+{args.iters_temporal}"
+          f"(smooth)   linear: {args.linear}")
+    beta_mode = ("optimized beta" if args.optimize_beta else "FROZEN beta (WiLoR)")
     print(f"weights: accel[pose={args.w_accel_pose} global={args.w_accel_pose_global} "
-          f"trans={args.w_accel_trans}] shape={args.w_shape} beta={args.w_beta} "
+          f"trans={args.w_accel_trans}] shape={args.w_shape} "
           f"huber_px={args.huber_px}  ({len(np.asarray(data['accel_i1']))} accel "
-          f"triples; ONE shared optimized beta; NO global/depth prior)")
+          f"triples; {beta_mode}; NO global/depth prior)")
     print(f"\nREPROJ ERR inliers (px, {len(perkp_in)} kp): "
           f"mean={perkp_in.mean():.2f}  {pct(perkp_in)}")
     if len(perkp_out):
