@@ -7,16 +7,18 @@ Pairs matched, per frame i:
               covering ~2s (60 frames @ 30fps) with progressively sparser
               stride at longer range (dense nearby, sparse far away, since a
               wide gap only needs occasional coverage for long-baseline
-              constraints -- see build_temporal_gaps). Gated via RANSAC
-              essential-matrix estimation (no known relative pose exists
-              between two arbitrary frames).
+              constraints -- see build_temporal_gaps). Gated via a GPU-batched
+              jaxls relative-pose RANSAC (see relpose_5pt_jaxls.py) -- no
+              known relative pose exists between two arbitrary frames, so
+              this can't reuse the stereo gate's known-geometry shortcut.
 
 Both gates operate on UNPROJECTED RAYS (fisheye_pinhole.fisheye_unproject),
 not raw distorted pixels -- fisheye epipolar lines are curves in pixel space,
 not the straight "same row" shortcut a rectified rig would give. A pixel
 tolerance (--epipolar-px-thresh) is converted to an angular/normalized
-tolerance via focal length for both gates, so both use the same effective
-strictness.
+tolerance via focal length for both gates (the temporal gate additionally
+scales this by --ransac-threshold-scale, see relpose_5pt_jaxls.py's
+docstring for why 0.75 is the locked-in default, not 1.0).
 
 Two-stage filter before a match reaches a track: (1) cheap LightGlue
 match-confidence threshold, (2) the geometric gate above. Matches that pass
@@ -37,6 +39,23 @@ batch_size > 1 -- the reference LightGlue implementation's adaptive
 point-pruning optimization has a genuine indexing bug for batch>1 (crashes
 with the default config; confirmed by direct testing, not a config choice).
 
+TEMPORAL-PAIR RANSAC IS BATCHED SEPARATELY FROM LIGHTGLUE, AT A MUCH LARGER,
+FULLY DECOUPLED BATCH SIZE (--ransac-batch-size, --ransac-m-pad). There's no
+correctness reason for the two to match -- LightGlue's --batch-size is tuned
+to minimize its OWN truncation waste (16 already captures ~all the speedup,
+see above), while jaxls's RANSAC solve gets STRICTLY faster per pair as batch
+size grows (confirmed by direct sweep on this recording: 64->2048 pairs/batch
+took cv2-relative speedup from ~3.5x to ~27x, plateauing past ~1024) and pays
+its one-time jit-compile cost ONCE per process regardless of how large the
+batch is, so there's no reason not to go as large as the eligible temporal-
+pair pool allows. Concretely: LightGlue matching still proceeds chunk-by-chunk
+as before (unchanged), and stereo pairs are still gated and written
+immediately per chunk (cheap, no RANSAC), but every eligible TEMPORAL pair's
+rays are instead accumulated across the ENTIRE video into one buffer; only
+after the last chunk's matching finishes does the RANSAC gate run, in as few
+--ransac-batch-size-sized (fixed-shape, padded) batches as needed to cover
+the whole accumulated set -- see gate_temporal_all().
+
 Run (from data_processing/vio/):
     python vio_match_pairs.py ../../long-test1 --features ../../long-test1/features.h5 \
         --out ../../long-test1/matches.jsonl --max-frames 30
@@ -45,16 +64,19 @@ import argparse
 import json
 import os
 
-import cv2
 import h5py
 import numpy as np
 import torch
+
+import jax
+import jax.numpy as jnp
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import fisheye_pinhole as FP
 
 from lightglue import LightGlue
+import relpose_5pt_jaxls as R5
 
 
 def parse_args():
@@ -84,6 +106,29 @@ def parse_args():
                     help="pairs per LightGlue batch call -- 16 captures ~all the "
                          "available speedup (see module docstring sweep); larger "
                          "batches add truncation waste for negligible extra speed")
+    p.add_argument("--ransac-batch-size", type=int, default=2048,
+                    help="pairs per jaxls RANSAC batch call, COMPLETELY DECOUPLED "
+                         "from --batch-size (LightGlue) -- see module docstring. As "
+                         "large as possible: speed strictly improves with batch size "
+                         "(confirmed 64->2048 sweep, ~3.5x->~27x vs cv2, plateauing "
+                         "past ~1024) and the one-time jit-compile cost is paid once "
+                         "regardless of batch size, so there's no downside to going "
+                         "large other than memory.")
+    p.add_argument("--ransac-n-hyp", type=int, default=100,
+                    help="RANSAC hypotheses per pair -- nearly free, see "
+                         "relpose_5pt_jaxls.py's docstring sweep")
+    p.add_argument("--ransac-max-iters", type=int, default=10,
+                    help="LM iterations per hypothesis -- the dominant accuracy "
+                         "lever, NOT n_hyp, see relpose_5pt_jaxls.py's docstring sweep")
+    p.add_argument("--ransac-m-pad", type=int, default=512,
+                    help="fixed point-count every temporal pair is padded/truncated "
+                         "to for the RANSAC batch -- keeps jaxls's jit cache hit for "
+                         "the WHOLE run (one compile total), see relpose_5pt_jaxls.py")
+    p.add_argument("--ransac-threshold-scale", type=float, default=0.75,
+                    help="multiplies the epipolar-px-derived threshold for the "
+                         "temporal RANSAC gate ONLY (not the stereo gate) -- 0.75 is "
+                         "the locked-in false-positive/false-negative balance point, "
+                         "see relpose_5pt_jaxls.py's docstring threshold sweep")
     p.add_argument("--device", default="cuda")
     return p.parse_args()
 
@@ -130,8 +175,53 @@ class FeatureStore:
             self._cache[key] = (kp, sc, de)
         return self._cache[key]
 
+    def prefetch_range(self, eye, start, end):
+        """Bulk-read keypoints/scores/descriptors for frames [start,end) in
+        ONE h5py slice call each (3 total), instead of up to (end-start)
+        individual per-frame `get()` reads. Confirmed by direct testing this
+        matters a lot: a full ~7000-frame run with per-frame reads was still
+        stuck partway through its FIRST 300-frame chunk after 2+ hours
+        (verified via py-spy: genuinely alternating between real LightGlue
+        compute and HDF5 `__getitem__` calls, not hung) -- the earlier fast
+        200-frame test (40s) almost certainly benefited from OS page-cache
+        locality built up from repeated testing on that same byte range, not
+        from anything about the code itself; a full-video run touches far
+        more of the 3.3GB file and hits mostly cold reads. Populates the same
+        `_cache` dict `get()` reads from, so `get()` itself is unchanged --
+        this is purely a batching optimization, same idea as `count()`'s
+        fix, just for the (much larger) keypoint/score/descriptor arrays
+        instead of the tiny per-frame count."""
+        end = min(end, self.n_frames(eye))
+        if end <= start:
+            return
+        g = self.f[eye]
+        kp_all = g["keypoints"][start:end]
+        sc_all = g["scores"][start:end]
+        de_all = g["descriptors"][start:end]
+        for offset, i in enumerate(range(start, end)):
+            key = (eye, i)
+            if key in self._cache:
+                continue
+            n = self.count(eye, i)
+            kp = kp_all[offset].reshape(n, 2).astype(np.float32)
+            sc = sc_all[offset].astype(np.float32)
+            de = de_all[offset].reshape(n, -1).astype(np.float32)
+            self._cache[key] = (kp, sc, de)
+
     def count(self, eye, i):
-        return int(self.f[eye]["counts"][i])
+        # Cache the WHOLE counts array per eye on first use -- a naive
+        # per-call `self.f[eye]["counts"][i]` HDF5 slice read is fine for a
+        # handful of calls, but the chunk-building step calls this twice per
+        # candidate pair spec (thousands of specs for a multi-hundred-frame
+        # chunk), and that many individual small HDF5 reads was confirmed by
+        # direct testing to take MULTIPLE MINUTES (a 200-frame run stalled
+        # for 20+ min before the very next step printed anything) -- purely
+        # from this, not from any actual matching/RANSAC work. The whole
+        # array is tiny (one int per frame), so caching it is strictly a win.
+        key = f"_counts_{eye}"
+        if key not in self._cache:
+            self._cache[key] = self.f[eye]["counts"][:]
+        return int(self._cache[key][i])
 
     def n_frames(self, eye):
         return self.f[eye]["counts"].shape[0]
@@ -165,23 +255,6 @@ def gate_stereo(rays_l, rays_r, R, t, theta_tol):
     n = n / norms
     residual = np.abs(np.sum(rays_r * n, axis=1))
     return residual < np.sin(theta_tol)
-
-
-def gate_temporal_ransac(rays_a, rays_b, theta_tol):
-    """RANSAC essential-matrix inlier gate on normalized ray bearings (no
-    known relative pose between two arbitrary frames, unlike the stereo
-    pair). cameraMatrix=I because rays are already unit bearings, so
-    `threshold` is in the same normalized/angular units as theta_tol."""
-    if rays_a.shape[0] < 8:
-        return np.zeros(rays_a.shape[0], dtype=bool)
-    pts_a = (rays_a[:, :2] / rays_a[:, 2:3]).astype(np.float64)
-    pts_b = (rays_b[:, :2] / rays_b[:, 2:3]).astype(np.float64)
-    E, mask = cv2.findEssentialMat(pts_a, pts_b, cameraMatrix=np.eye(3),
-                                    method=cv2.RANSAC, prob=0.999,
-                                    threshold=theta_tol)
-    if mask is None:
-        return np.zeros(rays_a.shape[0], dtype=bool)
-    return mask.ravel().astype(bool)
 
 
 def top_k_order(scores, k):
@@ -252,18 +325,14 @@ def write_reject_too_few(eye_a, i, eye_b, j, pair_type, gap, idx, out_f):
     out_f.write(json.dumps(rec) + "\n")
 
 
-def gate_chunk(store, eligible, cams, args, out_f):
-    """eligible: list of (eye_a, i, eye_b, j, pair_type, gap, idx, scores),
-    already past the min-raw-matches filter. Does ONE ray-unprojection call
-    per eye for the WHOLE chunk (not one per pair per side -- see
-    unproject_batch), then the existing per-pair RANSAC/stereo gate and
-    write, unchanged."""
-    # gather every point needing unprojection, grouped by EYE (not by
-    # "side a/b" -- unprojection only depends on which eye's K/dist to use,
-    # so a pair's side-a and side-b points can land in either eye's group).
+def _unproject_pairs(store, pairs, cams, device):
+    """Shared helper: pairs is a list of (eye_a, i, eye_b, j, pair_type, gap,
+    idx, scores). Does ONE ray-unprojection call per eye for the WHOLE list
+    (not one per pair per side -- see unproject_batch), regardless of
+    pair_type. Returns rays_by_pair_side keyed by (list-local index, "a"/"b")."""
     buf_pts = {"left": [], "right": []}
     buf_meta = {"left": [], "right": []}  # (pair_idx, side, n) in append order
-    for pair_idx, (ea, i, eb, j, pair_type, gap, idx, scores) in enumerate(eligible):
+    for pair_idx, (ea, i, eb, j, pair_type, gap, idx, scores) in enumerate(pairs):
         kpa, _, _ = store.get(ea, i)
         kpb, _, _ = store.get(eb, j)
         pts_a, pts_b = kpa[idx[:, 0]], kpb[idx[:, 1]]
@@ -276,26 +345,29 @@ def gate_chunk(store, eligible, cams, args, out_f):
             continue
         all_pts = np.concatenate(buf_pts[eye], axis=0)
         K, D = cams[eye]
-        all_rays = unproject_batch(all_pts, K, D, args.device)
+        all_rays = unproject_batch(all_pts, K, D, device)
         offset = 0
         for pair_idx, side, n in buf_meta[eye]:
             rays_by_pair_side[(pair_idx, side)] = all_rays[offset:offset + n]
             offset += n
+    return rays_by_pair_side
 
-    for pair_idx, (eye_a, i, eye_b, j, pair_type, gap, idx, scores) in enumerate(eligible):
+
+def gate_stereo_chunk(store, eligible_stereo, cams, args, out_f):
+    """eligible_stereo: list of (eye_a, i, eye_b, j, "stereo", gap, idx,
+    scores) for ONE chunk. Cheap known-geometry gate, no RANSAC -- gated and
+    written immediately per chunk, unlike temporal pairs (see
+    collect_temporal_pairs / gate_temporal_all)."""
+    rays_by_pair_side = _unproject_pairs(store, eligible_stereo, cams, args.device)
+    R, t = cams["stereo"]
+    for pair_idx, (eye_a, i, eye_b, j, pair_type, gap, idx, scores) in enumerate(eligible_stereo):
         rays_a = rays_by_pair_side[(pair_idx, "a")]
         rays_b = rays_by_pair_side[(pair_idx, "b")]
         Ka, Da = cams[eye_a]
         Kb, Db = cams[eye_b]
         f_avg = (Ka[0, 0] + Ka[1, 1] + Kb[0, 0] + Kb[1, 1]) / 4.0
         theta_tol = args.epipolar_px_thresh / f_avg
-
-        if pair_type == "stereo":
-            R, t = cams["stereo"]
-            inlier = gate_stereo(rays_a, rays_b, R, t, theta_tol)
-        else:
-            inlier = gate_temporal_ransac(rays_a, rays_b, theta_tol)
-
+        inlier = gate_stereo(rays_a, rays_b, R, t, theta_tol)
         rec = {
             "eye_a": eye_a, "frame_a": i, "eye_b": eye_b, "frame_b": j,
             "pair_type": pair_type, "gap": gap,
@@ -304,6 +376,107 @@ def gate_chunk(store, eligible, cams, args, out_f):
             "rejected_idx_a": idx[~inlier, 0].tolist(), "rejected_idx_b": idx[~inlier, 1].tolist(),
         }
         out_f.write(json.dumps(rec) + "\n")
+
+
+def collect_temporal_pairs(store, eligible_temporal, cams, args, accum):
+    """eligible_temporal: list of (eye_a, i, eye_b, j, "temporal", gap, idx,
+    scores) for ONE chunk. Does the same per-chunk ray-unprojection
+    consolidation as gate_stereo_chunk (cheap, no reason to defer), but
+    APPENDS (eye_a, i, eye_b, j, gap, idx, pts_a2d, pts_b2d) to the GLOBAL
+    `accum` list instead of gating immediately -- RANSAC gating is deferred
+    until the whole video's temporal pairs are collected, so it can batch as
+    aggressively as possible (see gate_temporal_all / module docstring)."""
+    rays_by_pair_side = _unproject_pairs(store, eligible_temporal, cams, args.device)
+    for pair_idx, (eye_a, i, eye_b, j, pair_type, gap, idx, scores) in enumerate(eligible_temporal):
+        rays_a = rays_by_pair_side[(pair_idx, "a")]
+        rays_b = rays_by_pair_side[(pair_idx, "b")]
+        # (x/z, y/z) normalized bearings -- exactly what relpose_ransac wants,
+        # and 1/3 less memory than keeping the full 3D ray across the whole
+        # video's worth of accumulated pairs.
+        pts_a2d = (rays_a[:, :2] / rays_a[:, 2:3]).astype(np.float32)
+        pts_b2d = (rays_b[:, :2] / rays_b[:, 2:3]).astype(np.float32)
+        accum.append((eye_a, i, eye_b, j, gap, idx, pts_a2d, pts_b2d))
+
+
+def gate_temporal_all(accum, theta_tol_ours, args, out_f):
+    """accum: list of (eye_a, i, eye_b, j, gap, idx, pts_a2d, pts_b2d) for
+    EVERY temporal pair in the WHOLE VIDEO (gathered by collect_temporal_pairs
+    across all chunks). Runs the jaxls RANSAC gate in --ransac-batch-size-
+    sized fixed-shape batches -- completely decoupled from the LightGlue
+    --batch-size/--chunk-frames (see module docstring for why: no correctness
+    reason they need to match, and larger RANSAC batches are strictly faster
+    per pair). Pads every batch (point count to --ransac-m-pad, pair count to
+    --ransac-batch-size for the last partial batch) with a validity mask so
+    every call to relpose_ransac uses the IDENTICAL shape -- jaxls/jax jit
+    compiles once for the whole run, not once per batch (see
+    relpose_5pt_jaxls.py's docstring "CRITICAL gotcha")."""
+    if not accum:
+        return
+    B = args.ransac_batch_size
+    Mp = args.ransac_m_pad
+    n_hyp = args.ransac_n_hyp
+    max_iters = args.ransac_max_iters
+
+    # sort by point count first -- minimizes truncation waste for the (rare)
+    # pairs with more than Mp points, same rationale as LightGlue's batching.
+    order = sorted(range(len(accum)), key=lambda k: accum[k][6].shape[0])
+
+    n_full_batches = -(-len(order) // B)  # ceil division
+    key = jax.random.PRNGKey(0)
+    n_written = 0
+    for bi in range(0, len(order), B):
+        batch_order = order[bi:bi + B]
+        pa_list, pb_list, mask_list = [], [], []
+        for k in batch_order:
+            _, _, _, _, _, _, pts_a2d, pts_b2d = accum[k]
+            valid_n = min(pts_a2d.shape[0], Mp)
+            pa = pts_a2d[:valid_n]
+            pb = pts_b2d[:valid_n]
+            if valid_n < Mp:
+                pad = np.zeros((Mp - valid_n, 2), dtype=np.float32)
+                pa = np.concatenate([pa, pad], axis=0)
+                pb = np.concatenate([pb, pad], axis=0)
+            mask = np.zeros(Mp, dtype=bool)
+            mask[:valid_n] = True
+            pa_list.append(pa); pb_list.append(pb); mask_list.append(mask)
+        # pad the LAST partial batch up to B with dummy all-invalid entries
+        # so every call keeps the exact same (B, Mp) shape.
+        n_real = len(batch_order)
+        for _ in range(B - n_real):
+            pa_list.append(np.zeros((Mp, 2), dtype=np.float32))
+            pb_list.append(np.zeros((Mp, 2), dtype=np.float32))
+            mask_list.append(np.zeros(Mp, dtype=bool))
+
+        pts_a_t = jnp.asarray(np.stack(pa_list))
+        pts_b_t = jnp.asarray(np.stack(pb_list))
+        mask_t = jnp.asarray(np.stack(mask_list))
+        key, sub = jax.random.split(key)
+        inlier, _ = R5.relpose_ransac(pts_a_t, pts_b_t, sub, n_hyp, theta_tol_ours, max_iters,
+                                       valid_mask=mask_t)
+        inlier_np = np.asarray(inlier)
+
+        for row, k in enumerate(batch_order):
+            eye_a, i, eye_b, j, gap, idx, pts_a2d, pts_b2d = accum[k]
+            valid_n = min(pts_a2d.shape[0], Mp)
+            g = inlier_np[row][:valid_n]
+            # idx has idx.shape[0] rows; valid_n == min(idx.shape[0], Mp) --
+            # if idx.shape[0] > Mp (truncated), the tail beyond Mp was never
+            # scored, so treat it as rejected (consistent with "trust fewer,
+            # scored points over an untested tail").
+            full_inlier = np.zeros(idx.shape[0], dtype=bool)
+            full_inlier[:valid_n] = g
+            rec = {
+                "eye_a": eye_a, "frame_a": i, "eye_b": eye_b, "frame_b": j,
+                "pair_type": "temporal", "gap": gap,
+                "n_raw": idx.shape[0], "n_geom": int(full_inlier.sum()),
+                "idx_a": idx[full_inlier, 0].tolist(), "idx_b": idx[full_inlier, 1].tolist(),
+                "rejected_idx_a": idx[~full_inlier, 0].tolist(),
+                "rejected_idx_b": idx[~full_inlier, 1].tolist(),
+            }
+            out_f.write(json.dumps(rec) + "\n")
+            n_written += 1
+        print(f"  temporal RANSAC batch {bi // B + 1}/{n_full_batches} done "
+              f"({n_written}/{len(accum)} pairs written)", flush=True)
 
 
 def chunk_pair_specs(chunk_start, chunk_end, n_frames, gaps):
@@ -352,11 +525,35 @@ def main():
     # config), not a speed/quality tradeoff we're choosing here.
     matcher = LightGlue(features="superpoint", width_confidence=-1).eval().to(args.device)
 
+    # ONE global threshold for ALL temporal pairs regardless of eye -- matches
+    # the exact methodology relpose_5pt_jaxls.py's own sweeps were validated
+    # with (a single f_avg combining both eyes' K), and the resulting per-eye
+    # error is negligible (the two cameras have near-identical focal lengths)
+    # -- see relpose_5pt_jaxls.py's docstring for the threshold-scale sweep
+    # this 0.75 default comes from.
+    Kl_, Dl_ = cams["left"]
+    Kr_, Dr_ = cams["right"]
+    f_avg_global = (Kl_[0, 0] + Kl_[1, 1] + Kr_[0, 0] + Kr_[1, 1]) / 4.0
+    theta_tol_ours = (args.epipolar_px_thresh / f_avg_global) * args.ransac_threshold_scale
+    print(f"temporal RANSAC threshold: {theta_tol_ours:.6f} "
+          f"(epipolar-px-thresh {args.epipolar_px_thresh} / f_avg {f_avg_global:.1f} "
+          f"x scale {args.ransac_threshold_scale})")
+
     n_pairs = 0
+    temporal_accum = []  # (eye_a, i, eye_b, j, gap, idx, pts_a2d, pts_b2d) -- WHOLE VIDEO
     with open(out_path, "w") as out_f:
         for chunk_start in range(0, n_frames, args.chunk_frames):
             chunk_end = min(chunk_start + args.chunk_frames, n_frames)
             specs = chunk_pair_specs(chunk_start, chunk_end, n_frames, gaps)
+
+            # Bulk-prefetch every frame this chunk's specs can touch BEFORE
+            # the per-pair store.get() calls in match_batch -- temporal pairs
+            # look up to max(gaps) frames past chunk_end, so the prefetch
+            # window extends that far too. See prefetch_range's docstring for
+            # why this matters (a LOT, for a full-video run).
+            prefetch_end = min(chunk_end + max(gaps), n_frames)
+            store.prefetch_range("left", chunk_start, prefetch_end)
+            store.prefetch_range("right", chunk_start, prefetch_end)
 
             # sort by keypoint count so batches group similarly-sized frames
             # together -- minimizes truncation waste vs arbitrary/sequential
@@ -365,10 +562,10 @@ def main():
             counted.sort(key=lambda x: (x[1], x[2]))
 
             # Collect every batch's match results for the WHOLE chunk before
-            # gating -- lets gate_chunk do just 2 ray-unprojection calls
-            # (one per eye) for potentially thousands of pairs, instead of
-            # 2-per-pair (see gate_chunk / unproject_batch docstrings).
-            eligible = []
+            # gating -- lets gate_stereo_chunk/collect_temporal_pairs do just
+            # 2 ray-unprojection calls (one per eye) for potentially thousands
+            # of pairs, instead of 2-per-pair (see unproject_batch docstring).
+            eligible_stereo, eligible_temporal = [], []
             for bi in range(0, len(counted), args.batch_size):
                 batch = counted[bi:bi + args.batch_size]
                 batch_specs = [(ea, fa, eb, fb) for (ea, fa, eb, fb, _, _), _, _ in batch]
@@ -378,13 +575,28 @@ def main():
                         continue
                     if idx.shape[0] < args.min_raw_matches:
                         write_reject_too_few(ea, fa, eb, fb, pair_type, gap, idx, out_f)
+                    elif pair_type == "stereo":
+                        eligible_stereo.append((ea, fa, eb, fb, pair_type, gap, idx, scores))
                     else:
-                        eligible.append((ea, fa, eb, fb, pair_type, gap, idx, scores))
+                        eligible_temporal.append((ea, fa, eb, fb, pair_type, gap, idx, scores))
                     n_pairs += 1
 
-            gate_chunk(store, eligible, cams, args, out_f)
+            # stereo: cheap known-geometry gate, no reason to defer -- gated
+            # and written immediately, same as before.
+            gate_stereo_chunk(store, eligible_stereo, cams, args, out_f)
+            # temporal: unproject now (cheap, per-chunk consolidation is
+            # already efficient) but defer RANSAC gating -- accumulated
+            # across ALL chunks so it can batch as aggressively as possible,
+            # decoupled from --chunk-frames/--batch-size (see module
+            # docstring and gate_temporal_all).
+            collect_temporal_pairs(store, eligible_temporal, cams, args, temporal_accum)
 
-            print(f"chunk [{chunk_start},{chunk_end}) done, {n_pairs} pairs so far")
+            print(f"chunk [{chunk_start},{chunk_end}) done, {n_pairs} pairs so far "
+                  f"({len(temporal_accum)} temporal pairs accumulated for RANSAC)")
+
+        print(f"\nrunning batched temporal RANSAC over all {len(temporal_accum)} "
+              f"accumulated pairs (batch size {args.ransac_batch_size})...")
+        gate_temporal_all(temporal_accum, theta_tol_ours, args, out_f)
 
     store.close()
     print(f"wrote {n_pairs} pairs to {out_path}")
