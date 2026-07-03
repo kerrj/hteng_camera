@@ -491,7 +491,7 @@ class _MarkerPanel:
     def __init__(self, server, writer: "_MarkerCsvWriter") -> None:
         self._server = server
         self._writer = writer
-        self.share_url: Optional[str] = None   # set by build() if --viser-share
+        self.share_url: Optional[str] = None   # set by build() once the share URL resolves
         self._lock = threading.Lock()
         self._live = False
         self._t0 = time.perf_counter()      # for the elapsed-time readout
@@ -517,14 +517,14 @@ class _MarkerPanel:
 
     @classmethod
     def build(cls, writer: "_MarkerCsvWriter", host: str, port: int,
-              share: bool = False):
+              share: bool = True):
         """Construct the viser server + panel, or return None if viser is
         missing / the server can't bind. Never raises into the caller.
 
-        ``share=True`` also requests a public tunnel URL from viser's external
-        share server so a phone off the laptop's network can reach the GUI. It
+        Always requests a public tunnel URL from viser's external share
+        server so a phone off the laptop's network can reach the GUI. It
         blocks a few seconds on first connect and depends on that third-party
-        server, so it's opt-in; a failure degrades to the LAN URL only."""
+        server; a failure degrades to the LAN URL only."""
         try:
             import viser  # noqa: F401  (module-level name used by the class)
             globals().setdefault("viser", viser)
@@ -1390,13 +1390,6 @@ def main() -> None:
         "--viser-port", type=int, default=8080,
         help="Port for the viser marker GUI.",
     )
-    ap.add_argument(
-        "--viser-share", action="store_true",
-        help="Also request a public viser SHARE URL so a phone off the "
-             "laptop's network can reach the GUI (tunnels via viser's external "
-             "share server). Adds a few seconds at startup and depends on that "
-             "third-party server; a failure degrades to the LAN URL only.",
-    )
     args = ap.parse_args()
 
     if args.sync_buffer < 1:
@@ -1710,7 +1703,7 @@ def main() -> None:
     if not args.no_viser:
         marker_csv = _MarkerCsvWriter(out_dir / "markers.csv")
         marker_panel = _MarkerPanel.build(
-            marker_csv, args.viser_host, args.viser_port, share=args.viser_share)
+            marker_csv, args.viser_host, args.viser_port, share=True)
         if marker_panel is None:
             marker_csv.close()               # GUI failed to start — no writer needed
             marker_csv = None
