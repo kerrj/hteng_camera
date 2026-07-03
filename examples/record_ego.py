@@ -491,6 +491,7 @@ class _MarkerPanel:
     def __init__(self, server, writer: "_MarkerCsvWriter") -> None:
         self._server = server
         self._writer = writer
+        self.share_url: Optional[str] = None   # set by build() if --viser-share
         self._lock = threading.Lock()
         self._live = False
         self._t0 = time.perf_counter()      # for the elapsed-time readout
@@ -515,9 +516,15 @@ class _MarkerPanel:
         self._refresh()
 
     @classmethod
-    def build(cls, writer: "_MarkerCsvWriter", host: str, port: int):
+    def build(cls, writer: "_MarkerCsvWriter", host: str, port: int,
+              share: bool = False):
         """Construct the viser server + panel, or return None if viser is
-        missing / the server can't bind. Never raises into the caller."""
+        missing / the server can't bind. Never raises into the caller.
+
+        ``share=True`` also requests a public tunnel URL from viser's external
+        share server so a phone off the laptop's network can reach the GUI. It
+        blocks a few seconds on first connect and depends on that third-party
+        server, so it's opt-in; a failure degrades to the LAN URL only."""
         try:
             import viser  # noqa: F401  (module-level name used by the class)
             globals().setdefault("viser", viser)
@@ -531,7 +538,20 @@ class _MarkerPanel:
             print(f"[warn] could not start viser server on {host}:{port}: {e}. "
                   "Recording without the marker GUI.")
             return None
-        return cls(server, writer)
+        panel = cls(server, writer)
+        if share:
+            try:
+                print("[info] marker GUI: requesting public share URL "
+                      "(may take a few seconds)…")
+                url = server.request_share_url(verbose=False)
+                panel.share_url = url or None
+                if not url:
+                    print("[warn] marker GUI: share URL request failed — "
+                          "LAN URL only.")
+            except Exception as e:
+                print(f"[warn] marker GUI: share URL request errored ({e}) — "
+                      "LAN URL only.")
+        return panel
 
     def _set_live(self, live: bool) -> None:
         """Start/Stop handler: flip state, stamp a boundary marker, reflect it."""
@@ -1370,6 +1390,13 @@ def main() -> None:
         "--viser-port", type=int, default=8080,
         help="Port for the viser marker GUI.",
     )
+    ap.add_argument(
+        "--viser-share", action="store_true",
+        help="Also request a public viser SHARE URL so a phone off the "
+             "laptop's network can reach the GUI (tunnels via viser's external "
+             "share server). Adds a few seconds at startup and depends on that "
+             "third-party server; a failure degrades to the LAN URL only.",
+    )
     args = ap.parse_args()
 
     if args.sync_buffer < 1:
@@ -1683,13 +1710,16 @@ def main() -> None:
     if not args.no_viser:
         marker_csv = _MarkerCsvWriter(out_dir / "markers.csv")
         marker_panel = _MarkerPanel.build(
-            marker_csv, args.viser_host, args.viser_port)
+            marker_csv, args.viser_host, args.viser_port, share=args.viser_share)
         if marker_panel is None:
             marker_csv.close()               # GUI failed to start — no writer needed
             marker_csv = None
         else:
             print(f"[info] marker GUI on http://{args.viser_host}:{args.viser_port} "
                   "(open it on your phone; tap Start/Stop demo — GREEN=live, RED=idle).")
+            if marker_panel.share_url:
+                print(f"[info] marker GUI share URL: {marker_panel.share_url} "
+                      "(works off the laptop's network).")
 
     # ── Wait for duration / Ctrl+C ───────────────────────────────────────────
     # Handle SIGINT ourselves so Ctrl+C tears down in the SAME order as the
