@@ -114,14 +114,27 @@ sketched before any code existed).
 | 1. Feature extraction | `vio_extract_features.py` | left/right mp4 | `features.h5` | HDF5, per-eye group with `keypoints`/`scores`/`descriptors` (h5py `vlen` dtype, ragged per frame after FOV mask) + `counts`. Crops to the FOV bbox before extraction (see above), FOV-masked (in full-frame coords) after. Cached separately from matches — extraction is the GPU-heavy, non-reprocessable-cheaply step; matching is cheap so pair sets can change without re-extracting. |
 | 2. Pairwise matching + gating | `vio_match_pairs.py` | `features.h5` | `matches.jsonl` | One line per attempted pair (frame ids, eyes, matched index pairs + rejected pairs, geometric-gate pass/fail counts). Temporal gap schedule: dense nearby, sparser further out (`build_temporal_gaps`) — default `[1,2,3,4,6,8,10,15,20,25,30,40,50,60]`, i.e. up to 2s @ 30fps. GOTCHA hit in the full-video run: left/right mp4s can have slightly different frame counts (long-test1: 7007 vs 7006) — bound the frame loop by `min()` of both eyes, not just the left eye's count, or the last frame(s) crash with an out-of-range H5 read. NOT currently batched across pairs — one LightGlue forward call per pair (see Optimization TODO below). |
 | 3. Track building | `vio_build_tracks.py` | `matches.jsonl` | `tracks.jsonl` | Conflict-aware union-find (see above) → one line per landmark (list of `{frame, eye, kp_idx, px}` observations). COLMAP-style landmark DB, sorted longest-track-first. 3D triangulation deliberately deferred to stage 5 (needs the triangulation logic anyway as its LM init step). |
-| 4. IMU relative factors | `vio_imu_prior.py` | `imu_log.csv`, `sync_log.csv` | `imu_relative.npz` | NOT YET BUILT. Per consecutive-frame-pair relative rotation (strapdown gyro integration between the two frames' soft-synced timestamps), NOT a global orientation stream. |
-| 5. Global BA | `vio_bundle_adjust.py` | `tracks.jsonl`, `imu_relative.npz`, stereo calib | `trajectory.npz` | NOT YET BUILT. jaxls: SE3 pose Var per left-frame (right pose derived deterministically from the fixed stereo transform), xyz Var per landmark, reprojection factors, IMU relative-rotation factors, Huber loss. |
+| 4. IMU relative factors | `vio_imu_prior.py` | `imu_log.csv`, `sync_log.csv`, `recording.json` | `imu_relative.npz` | Per consecutive-frame-pair relative rotation (strapdown gyro integration between soft-synced timestamps, NOT a global orientation stream) plus a per-frame gravity direction + confidence weight (windowed raw-accel average, weighted by deviation from 1g). IMU→camera extrinsic is a FIXED CAD-derived rotation constant (`R_CI`), not calibrated. Also flags invalid (bad-timestamp) frames generically via non-monotonicity, not a hardcoded index. |
+| 5. Global BA | `vio_bundle_adjust.py` | `tracks.jsonl`, `imu_relative.npz`, stereo calib, `features.h5` | `trajectory.npz` | jaxls: SE3 pose Var per left-frame (right pose via kinematic chain `T_wr = T_stereo @ T_wl`, not a separate Var), xyz Var per landmark, a per-observation scale Var (GLOMAP's `d_ik`). GLOMAP-style bounded positioning cost (Pan et al. 2024 / BATA), not reprojection error — reprojection error diverged under the random-ball init this cost needs (IMU/gravity alone don't fix scale/position). Solver: jaxls default trust-region LM — Gauss-Newton diverges here (tested twice). Frames with invalid timestamps are dropped from the pose list entirely. See script docstring for the known negative-depth issue and speed profiling notes. |
 
-Visualizers exist alongside each stage (`vio_visualize_features.py`,
-`vio_visualize_matches.py`, `vio_visualize_tracks.py`) — same pattern as the
-hand pipeline's render scripts. Tracks are rendered as colored "comet" dots
-(golden-ratio hue spacing per track) with fading trajectory tails, capped to
-the longest N tracks to stay legible over a multi-second clip.
+Visualizers: `vio_visualize_features.py`, `vio_visualize_matches.py`,
+`vio_visualize_tracks.py` (same pattern as the hand pipeline's render
+scripts — see below for tracks specifically), plus two viser-based ones for
+stages 4/5: `vio_visualize_imu_prior.py` (gravity arrow + naive cumulative-
+rotation triad + synced video thumbnail — a fixed-camera acceptance check
+since there's no pose chain at that stage yet) and
+`vio_visualize_trajectory.py` (optimized camera trajectory as left/right
+stereo frustums, colored by eye, + landmark point cloud colored by each
+landmark's ACTUAL sampled video pixel — much more informative than a
+synthetic depth colormap for spotting real-vs-degenerate reconstructions;
+orients viser's up-direction using stage 4's measured gravity, since world
+frame here is the anchor pose's camera frame, not gravity-aligned, and
+naively assuming `+z` is up renders a level camera pointing straight up).
+
+Tracks (stage 3's viz) are rendered as colored "comet" dots (golden-ratio
+hue spacing per track) with fading trajectory tails — `--tracks-per-frame 0`
+draws every active track every frame, the confirmed-preferred default over
+an earlier hard cap.
 
 ## Optimization TODO (deliberately deferred until the full-video pass works end to end)
 
@@ -139,13 +152,15 @@ the longest N tracks to stay legible over a multi-second clip.
   optimize — don't want to debug a new batching path and pipeline correctness
   at the same time.
 
-## Status (2026-07-01)
+## Status (2026-07-02)
 
-Stages 1-3 built and validated on `long-test1`. Full-video run (all ~7007
-frames) in progress on sphynx — stage 1 complete, stage 2 hit the
-frame-count-mismatch bug above partway through (~99% done) and was resumed
-from stage 2 after the fix (stage 1's `features.h5` didn't need re-running).
-Stages 4 (IMU) and 5 (BA) not yet built. Motion blur robustness still
-untested on a real head-motion segment (`testnewcamsblur*` recordings exist
-for this) — `long-test1`'s tested portion so far is a mostly-static desk
-scene.
+Stages 1-3 validated on `long-test1`. All 5 stages now run end-to-end on
+`testimu` (~30s/897-frame handheld clip with real IMU data — `long-test1`
+has none). Stage 5 output looks visually plausible in
+`vio_visualize_trajectory.py` after fixing the stereo-baseline bug (see
+`vio_bundle_adjust.py` docstring). Open: ~18.6% negative-depth landmarks
+(partially explained by tracks near the clip's end), and per-iteration
+solve cost grows over a long run — both detailed in the script's own
+docstring. Track-quality-weighted costs flagged as worth trying, not yet
+implemented. Motion blur robustness still untested (`testnewcamsblur*`
+recordings exist for this).
