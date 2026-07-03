@@ -126,12 +126,12 @@ def parse_args():
                          "pairs had plenty -- it's the SURVIVING inlier count that "
                          "exposes the degenerate fit.")
     p.add_argument("--epipolar-px-thresh", type=float, default=3.0)
-    p.add_argument("--dense-max", type=int, default=3)
-    p.add_argument("--mid-max", type=int, default=10)
+    p.add_argument("--dense-max", type=int, default=20)
+    p.add_argument("--mid-max", type=int, default=30)
     p.add_argument("--mid-stride", type=int, default=2)
-    p.add_argument("--far-max", type=int, default=30)
+    p.add_argument("--far-max", type=int, default=40)
     p.add_argument("--far-stride", type=int, default=5)
-    p.add_argument("--longest-max", type=int, default=60)
+    p.add_argument("--longest-max", type=int, default=70)
     p.add_argument("--longest-stride", type=int, default=10)
     p.add_argument("--chunk-frames", type=int, default=300,
                     help="frames processed per chunk before re-sorting for batching -- "

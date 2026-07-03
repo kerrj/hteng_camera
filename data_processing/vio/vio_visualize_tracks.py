@@ -114,7 +114,10 @@ def main():
     cap = cv2.VideoCapture(os.path.join(args.recording, f"{args.eye}.mp4"))
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    # avc1 (H.264) so the mp4 plays in QuickTime/browsers without re-encoding.
+    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"avc1"), fps, (w, h))
+    if not writer.isOpened():  # fall back if this OpenCV build lacks the H.264 encoder
+        writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
 
     # observations-currently-in-window count per track index; a track is
     # "active" at frame i iff its count here is > 0.
@@ -163,7 +166,7 @@ def main():
 
     cap.release()
     writer.release()
-    print(f"wrote {out_path} (mp4v -- re-encode with ffmpeg to h264 before transferring)")
+    print(f"wrote {out_path}")
 
 
 if __name__ == "__main__":

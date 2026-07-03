@@ -89,13 +89,16 @@ def parse_args():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("recording")
     p.add_argument("--matches", default=None, nargs="+",
-                    help="one or more match files, concatenated before track "
-                         "building (default: <recording>/matches.jsonl). Pass "
-                         "loop_matches.jsonl as a 2nd file to add loop closure "
-                         "-- no separate cat/rebuild step needed")
+                    help="one or more match files, concatenated (default: "
+                         "<recording>/matches.jsonl). Add loop_matches.jsonl as a "
+                         "2nd file for loop closure")
     p.add_argument("--features", default=None, help="default: <recording>/features.h5")
     p.add_argument("--out", default=None, help="default: <recording>/tracks.jsonl")
     p.add_argument("--min-observations", type=int, default=3)
+    p.add_argument("--min-frames", type=int, default=15,
+                    help="drop tracks seen in fewer than this many DISTINCT frames "
+                         "(eye-independent), keeping only well-tracked stable "
+                         "landmarks; 0 disables")
     p.add_argument("--max-px-per-frame", type=float, default=100.0,
                     help="reject a temporal edge if its implied displacement rate "
                          "(px distance / frame gap) exceeds this -- calibrated well "
@@ -264,6 +267,7 @@ def main():
 
         n_written = 0
         n_dropped_short = 0
+        n_dropped_few_frames = 0
         n_pruned_obs = 0
         with open(out_path, "w") as out_f:
             for obs_keys in ordered:
@@ -286,13 +290,17 @@ def main():
                 if len(kept) < args.min_observations:
                     n_dropped_short += 1
                     continue
+                if len({o["frame"] for o in kept}) < args.min_frames:
+                    n_dropped_few_frames += 1
+                    continue
                 kept.sort(key=lambda o: (o["frame"], o["eye"]))
                 rec = {"track_id": n_written, "n_obs": len(kept), "observations": kept}
                 out_f.write(json.dumps(rec) + "\n")
                 n_written += 1
 
     print(f"wrote {n_written} tracks (dropped {n_dropped_short} with "
-          f"< {args.min_observations} observations, pruned {n_pruned_obs} spike-outlier "
+          f"< {args.min_observations} observations, {n_dropped_few_frames} with "
+          f"< {args.min_frames} distinct frames, pruned {n_pruned_obs} spike-outlier "
           f"observations) to {out_path}")
 
 

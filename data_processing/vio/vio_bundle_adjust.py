@@ -1,59 +1,30 @@
-"""VIO pipeline stage 5: global bundle adjustment over camera poses + 3D
-landmarks, with IMU relative-rotation and gravity priors.
+"""VIO pipeline stage 5: global BA over camera poses + 3D landmarks, with IMU
+relative-rotation and gravity priors.
 
-Uses a GLOMAP-style bounded positioning cost (Pan et al. 2024, building on
-Zhuang et al.'s BATA) instead of classical reprojection error:
+GLOMAP-style bounded positioning cost (Pan et al. 2024 / BATA) instead of
+reprojection error:
 
     residual_ik = v_ik - d_ik * (X_k - c_i),   d_ik >= 0 (via d_ik=exp(s_ik))
 
-v_ik is the observed ray rotated into world frame, X_k the landmark, c_i the
-camera position, d_ik a free per-observation scale. At the optimal d_ik this
-residual's squared norm equals sin(theta) capped at 1 (theta = angle between
-v_ik and X_k-c_i) -- bounded to [0,1], unlike reprojection error, which blew
-up under random-ball init (needed since the IMU/gravity priors alone don't
-fix scale/position).
+v_ik = observed ray in world frame, X_k = landmark, c_i = camera center, d_ik
+= free per-observation scale. Squared norm = sin(theta) capped at 1, bounded
+to [0,1] (reprojection error diverges under the random init this needs).
 
-TWO-STAGE SOLVE, mirroring GLOMAP's actual pipeline (rotation averaging ->
-global positioning with rotations FROZEN -> full BA):
+Two-stage solve (mirrors GLOMAP: rotation averaging -> positioning with
+rotations frozen -> full BA):
+1. Positioning: rotations are constants from the integrated IMU relative-
+   rotation chain; variables are camera centers (CamCenterVar), points, scales.
+2. Refine: full SE3 BA from stage 1, with IMU relative-rotation + gravity costs.
 
-1. POSITIONING: rotations come from integrating the IMU relative-rotation
-   chain (our stand-in for GLOMAP's rotation averaging) and are baked into
-   the residuals as CONSTANTS -- they are not variables at all. v_ik and the
-   stereo right-eye center offset are precomputed; the variables are camera
-   CENTERS (CamCenterVar), points, and scales. Joint solves from random init
-   let early garbage-geometry gradients destroy a correct rotation init
-   (observed: 19-52 deg net rotation where the IMU says 177); freezing makes
-   the rotations a scaffold the positions organize around.
-2. REFINE: full SE3 bundle adjustment initialized from stage 1, with the
-   IMU relative-rotation + gravity costs keeping rotations honest. By now
-   every gradient is computed from near-correct geometry, so rotations only
-   polish.
+Gauge: no anchor cost; the translation null space is left to LM damping and the
+result recentered post-hoc to cam0 = origin (no rescale -- stereo baseline sets
+scale). Roll/pitch fixed by the gravity prior (world +z up); yaw is free.
 
-GAUGE, also GLOMAP-style: NO anchor cost. The 3-DOF global translation null
-space is left free in both stages (LM damping handles it -- GLOMAP does the
-same, with an explicit comment that anchoring hurts convergence), and the
-result is recentered post-hoc so cam0's center is the world origin
-(NormalizeReconstruction analog; no rescale -- the stereo baseline fixes
-metric scale). Rotation gauge: roll/pitch fixed by the gravity prior
-(world +z = up), yaw about gravity an intentional free gauge.
+Outliers: robust positioning loss (--robust-loss, default Cauchy) down-weights
+in-solve via IRLS (residual * sqrt of a stop_gradient'd weight); one solve over
+all observations. Per-landmark median residuals saved for the visualizer.
 
-Outlier handling: a single robust (--robust-loss, default Cauchy) positioning
-loss down-weights geometric outliers continuously during the solve, via
-jaxls's recommended IRLS reweighting (residual * sqrt of a stop_gradient'd
-weight). This replaces the old hard filter-and-resolve rounds -- there is now
-one solve over all observations, no problem rebuild/recompile per round.
-Per-landmark median residuals are still saved for the visualizer to threshold
-on.
-
-Optional --translation-smoothness-weight adds a 2nd-derivative (constant-
-velocity) prior over consecutive pose triples' camera position, to damp
-translation zigzag/cusps the IMU rotation factor doesn't touch (it only
-constrains rotation). Off by default (0); only touches SE3Var-SE3Var
-coupling, doesn't interact with Schur elimination of ScaleVar/Point3Var.
-
-SOLVER: trust-region LM (jaxls default). Plain Gauss-Newton diverges
-(tested twice, including after the stereo-scale fix below) -- LM's damping
-is load-bearing here, not overhead.
+Solver: trust-region LM (Gauss-Newton diverges here).
 
 Run (from data_processing/vio/):
     python vio_bundle_adjust.py ../../testimu --tracks ../../testimu/tracks.jsonl \
@@ -90,63 +61,46 @@ def parse_args():
                     help="time JIT compile vs. cached per-iteration solve separately")
     p.add_argument("--robust-loss", choices=("huber", "cauchy", "geman_mcclure"),
                     default="cauchy",
-                    help="M-estimator on the positioning residual: escalating "
-                         "outlier suppression huber < cauchy < geman_mcclure. "
-                         "cauchy's heavier 1/r^2 tail replaces the old hard "
-                         "filter-and-resolve rounds (now removed)")
+                    help="M-estimator on the positioning residual; escalating "
+                         "outlier suppression huber < cauchy < geman_mcclure")
     p.add_argument("--robust-scale", "--huber-delta", dest="robust_scale",
                     type=float, default=0.05,
-                    help="scale constant of the robust loss (weight=0.5 at "
-                         "residual=this). On the GLOMAP bounded-residual scale "
-                         "(residual is ~[0,1] sin-theta, inliers ~0.02-0.05 = "
-                         "1-3deg), NOT pixels or unit-variance -- so it is much "
-                         "smaller than the guide's c=2.385 default; ~0.05 (~3deg) "
-                         "sits at the inlier/outlier knee")
+                    help="robust loss scale (weight=0.5 at residual=this). On the "
+                         "bounded sin-theta residual (inliers ~0.02-0.05 = 1-3deg), "
+                         "NOT pixels")
     p.add_argument("--imu-rot-weight", type=float, default=100.0,
                     help="weight on the IMU relative-rotation residual")
     p.add_argument("--gravity-weight", type=float, default=1.0,
                     help="weight on the gravity-direction prior (times per-frame "
-                         "confidence) -- kept low, a weak roll/pitch anchor only")
+                         "confidence)")
     p.add_argument("--translation-smoothness-weight", type=float, default=0.0,
-                    help="weight on a 2nd-derivative (acceleration) prior over "
-                         "camera position across each consecutive pose triple -- "
-                         "damps position zigzag/cusps; 0 disables. Widens the "
-                         "pose-pose coupling from immediate-neighbor to "
-                         "skip-one, so watch --profile-compile if raising this")
+                    help="weight on a 2nd-derivative prior over camera position "
+                         "across consecutive pose triples; 0 disables")
     p.add_argument("--pose-init-noise", type=float, default=1.0,
-                    help="std (m) of the random camera-center init (GLOMAP-style "
-                         "random positions; rotations come from the IMU chain "
-                         "and are frozen in stage 1)")
+                    help="std (m) of the random camera-center init")
     p.add_argument("--landmark-init-noise", type=float, default=1.0,
                     help="std (m) of random landmark init, centered at --init-depth")
     p.add_argument("--init-depth", type=float, default=1.0,
                     help="landmark init ball center depth (m)")
     p.add_argument("--pose-init-seed", type=int, default=0)
     p.add_argument("--max-iterations", type=int, default=15,
-                    help="iteration cap for stage 1 (frozen-rotation positioning). "
-                         "Stage 1 is well-conditioned and converges fast -- on "
-                         "testimu it is flat by ~iter 8, so 15 has margin")
+                    help="iteration cap for stage 1 (frozen-rotation positioning)")
     p.add_argument("--refine-iterations", type=int, default=3,
-                    help="iteration cap for stage 2 (full SE3 refine). Stage 2 "
-                         "starts already in the basin from stage 1 and only "
-                         "polishes -- flat by ~iter 2, and each iter is ~15x more "
-                         "expensive than stage 1, so keep this small. 0 skips "
-                         "refine entirely (pure GLOMAP positioning output)")
+                    help="iteration cap for stage 2 (full SE3 refine); each iter is "
+                         "~15x costlier than stage 1. 0 skips refine")
     p.add_argument("--linear-solver", choices=("conjugate_gradient", "dense_cholesky", "cholmod"),
                     default="conjugate_gradient",
-                    help="dense_cholesky is impractical here (reduced system too "
-                         "large to materialize dense); cholmod is CPU-bound sparse-"
-                         "direct and was far slower in practice than CG")
+                    help="CG is fastest here; dense_cholesky can't materialize the "
+                         "reduced system, cholmod is CPU-bound and slower")
     p.add_argument("--gauss-newton", action="store_true",
-                    help="trust_region=None -- NOT recommended, diverges (see module docstring)")
-    p.add_argument("--no-early-termination", action="store_true",
-                    help="run all --max-iterations steps instead of stopping on "
-                         "jaxls's tolerances -- use when inspecting the loss curve; "
-                         "default early termination can trigger a false-positive "
-                         "stop on this problem's large parameter vector")
+                    help="trust_region=None -- diverges here, not recommended")
+    p.add_argument("--early-termination", action="store_true",
+                    help="stop on jaxls's tolerances instead of running all "
+                         "iterations. OFF by default: it false-positives on this "
+                         "problem, halting at ~2 iters and leaving positions "
+                         "under-solved (scrunched trajectory)")
     p.add_argument("--loss-plot", default=None,
-                    help="PNG path for the per-iteration cost curve -- default: "
-                         "<recording>/loss_curve.png when --no-early-termination is set")
+                    help="PNG path for the cost curve (always written)")
     p.add_argument("--device", default="cuda")
     return p.parse_args()
 
@@ -201,21 +155,16 @@ class Point3Var(jaxls.Var[jax.Array], default_factory=lambda: jnp.zeros(3)):
 
 
 class CamCenterVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.zeros(3)):
-    """Stage-1 variable: LEFT camera center in world frame (rotations frozen,
-    so the pose's only remaining DOF is its center -- matches GLOMAP's global
-    positioning, which optimizes camera centers, never rotations)."""
+    """Stage-1 variable: left camera center in world frame (rotations frozen)."""
 
 
 class ScaleVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.zeros(())):
-    """GLOMAP's per-observation d_ik, as exp(s_ik) so d_ik>=0 smoothly."""
+    """GLOMAP's per-observation d_ik, as exp(s_ik) so d_ik>=0."""
 
 
 def _robust_weight(residual, robust_scale, robust_kind):
-    """IRLS robust reweighting (jaxls's recommended pattern: residual * sqrt
-    of a stop_gradient'd weight). robust_kind escalates outlier suppression:
-    0=Huber (~1/r tail), 1=Cauchy (~1/r^2), 2=Geman-McClure (~1/r^4).
-    robust_scale is on the GLOMAP bounded-residual scale (residual is ~[0,1]
-    sin-theta at the optimal d_ik), NOT pixels."""
+    """IRLS robust reweight (residual * sqrt of a stop_gradient'd weight).
+    robust_kind: 0=Huber, 1=Cauchy, 2=Geman-McClure."""
     abs_r = jnp.linalg.norm(residual) + 1e-9
     x2 = (abs_r / robust_scale) ** 2
     w_huber = jnp.where(abs_r > robust_scale, robust_scale / abs_r, 1.0)
@@ -227,21 +176,13 @@ def _robust_weight(residual, robust_scale, robust_kind):
 @jaxls.Cost.factory
 def positioning_cost(vals, pose, center, point_var, scale_var, ray_cam,
                      rel_wxyz_xyz, robust_scale, robust_kind):
-    """GLOMAP positioning residual, shared by both stages via jaxls's
-    var-or-constant factory args (a Var arg is looked up in vals; a plain
-    array is baked in as a constant -- the isinstance branch below is
-    resolved once at problem-construction time, not per iteration):
-
-      stage 1 (frozen rotations): pose = constant wxyz quats from the IMU
-        chain, center = CamCenterVar being optimized. Rotations are not
-        parameter blocks at all -- exactly GLOMAP's global_positioning.cc.
-      stage 2 (refine): pose = free SE3Var, center = unused dummy constant.
-
-    T_wc = T_rel @ T_wl: proper SE3 kinematic chain to the observing camera
-    (T_rel = identity for left eye, the calibrated stereo transform for
-    right) -- NOT a position offset, so the stereo baseline is never
-    dropped. Both parameterizations reduce to the same center form:
-    cam_pos = c_left - R_wc^-1 t_rel, ray_world = R_wc^-1 ray_cam."""
+    """GLOMAP positioning residual, shared by both stages via var-or-constant
+    factory args (a Var arg is optimized, a plain array is baked in constant;
+    the isinstance branch is resolved once at problem-construction time):
+      stage 1: pose = constant IMU-chain quats, center = CamCenterVar optimized.
+      stage 2: pose = free SE3Var, center = unused dummy constant.
+    T_wc = T_rel @ T_wl (T_rel = identity for left eye, stereo transform for
+    right, so the baseline is never dropped)."""
     T_rel = jaxlie.SE3(rel_wxyz_xyz)
     if isinstance(pose, jaxls.Var):
         T_wl = vals[pose]
@@ -260,9 +201,8 @@ def positioning_cost(vals, pose, center, point_var, scale_var, ray_cam,
 
 @jaxls.Cost.factory
 def imu_rotation_cost(vals, pose_i, pose_j, delta_R_wxyz, weight):
-    """Between-factor vs IMU-integrated relative rotation. SE3Var convention
-    is WORLD->CAMERA, so actual relative rotation is R_i @ R_j.inverse()
-    (matches vio_imu_prior.py's rel_quat convention), not R_i.inverse() @ R_j."""
+    """Residual vs IMU-integrated relative rotation. SE3Var is WORLD->CAMERA,
+    so the actual relative rotation is R_i @ R_j.inverse()."""
     R_i = vals[pose_i].rotation()
     R_j = vals[pose_j].rotation()
     delta_R = jaxlie.SO3(delta_R_wxyz)
@@ -273,13 +213,9 @@ def imu_rotation_cost(vals, pose_i, pose_j, delta_R_wxyz, weight):
 
 @jaxls.Cost.factory
 def gravity_cost(vals, pose_var, world_gravity_dir, measured_down_cam, weight):
-    """Absolute roll/pitch prior (not yaw): the world is gravity-aligned with
-    world +z UP, so gravity/down is world -z (world_gravity_dir = [0,0,-1]).
-    Every frame's rotation should map that world-down onto its own IMU-measured
-    down. Applies to ALL frames incl. frame 0 -- world orientation is defined by
-    gravity, not by pinning cam0 to identity. Yaw about gravity is unconstrained
-    here (a global yaw rotation leaves this residual unchanged). Weighted by
-    --gravity-weight * per-frame confidence."""
+    """Roll/pitch prior (not yaw): world is +z up, so world-down is -z; each
+    frame's rotation should map world-down onto its IMU-measured down. Applies
+    to all frames; yaw about gravity is left unconstrained."""
     R_wl = vals[pose_var].rotation()
     down_pred_cam = R_wl @ world_gravity_dir
     return (down_pred_cam - measured_down_cam) * weight
@@ -288,9 +224,7 @@ def gravity_cost(vals, pose_var, world_gravity_dir, measured_down_cam, weight):
 @jaxls.Cost.factory
 def translation_smoothness_cost(vals, pose_a, pose_b, pose_c, weight):
     """Second-derivative (acceleration) prior on camera position across three
-    consecutive poses -- damps position zigzag/cusps without fighting steady
-    motion, unlike a zero-velocity closeness prior between just two poses
-    (which would resist any real translation, not just noise)."""
+    consecutive poses -- damps position zigzag without fighting steady motion."""
     def cam_pos(pose_var):
         if isinstance(pose_var, CamCenterVar):  # stage 1: already a center
             return vals[pose_var]
@@ -324,9 +258,7 @@ def main():
         gravity_cam = gravity_cam[:n]
         gravity_weight = gravity_weight[:n]
 
-    # Drop invalid-timestamp frames from the pose list entirely -- leaving
-    # one in produces a pose with no IMU tie to its neighbor, visibly
-    # detached from the rest of the trajectory.
+    # Drop invalid-timestamp frames entirely (they have no IMU tie to neighbors).
     n_dropped = int((~frame_valid).sum())
     if n_dropped:
         print(f"dropping {n_dropped} frame(s) with invalid timestamps "
@@ -396,17 +328,10 @@ def main():
     rel_wxyz_xyz = np.where(
         obs_is_right[:, None], rel_wxyz_xyz_right[None, :], rel_wxyz_xyz_left[None, :])
 
-    # FROZEN ROTATIONS for stage 1: integrate the IMU relative-rotation chain
-    # from a gravity-aligned cam-0 seed (see below). This is the IMU analog of
-    # GLOMAP's rotation averaging (there: MST-propagate relative rotations;
-    # here: propagate the measured inter-frame gyro rotations). Stage 1 treats
-    # these as constants; stage 2 refines them.
-    #
-    # SE3Var is WORLD->CAMERA, so imu_rotation_cost's delta = R_a @ R_b^-1 for a
-    # consecutive edge a->b (b == a+1), giving R_b = delta^-1 @ R_a. Build a
-    # per-pose "delta from previous" quat (identity where a consecutive valid IMU
-    # edge is missing -- e.g. across a dropped-timestamp frame, so the chain just
-    # holds the last rotation), then left-fold it in one O(n) lax.scan.
+    # Frozen stage-1 rotations: integrate the IMU relative-rotation chain from a
+    # gravity-aligned cam-0 seed. SE3Var is WORLD->CAMERA, so R_b = delta^-1 @ R_a
+    # for a consecutive edge a->b. Build a per-pose "delta from previous" quat
+    # (identity where a valid consecutive edge is missing), then left-fold it.
     delta_prev = np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (n_frames, 1))
     consec = (new_edge_b == new_edge_a + 1) & rel_valid_orig
     delta_prev[new_edge_b[consec]] = new_rel_quat[consec]
@@ -415,11 +340,8 @@ def main():
         R_k = jaxlie.SO3(delta_wxyz).inverse() @ jaxlie.SO3(R_prev_wxyz)
         return R_k.wxyz, R_k.wxyz
 
-    # Seed cam-0's rotation so world-down (-z) maps to its measured down
-    # (shortest-arc; yaw about gravity left at 0 -- it's a free gauge), so the
-    # gravity-aligned chain starts consistent with the gravity prior. cam-0 is
-    # therefore generally NOT identity rotation. Half-arc quat from a=[0,0,-1]
-    # to b=g0 is [1 + a.b, a x b] normalized (falls back to 180deg if antipar.).
+    # Seed cam-0 so world-down (-z) maps to its measured down (shortest-arc,
+    # yaw 0). Half-arc quat from a=[0,0,-1] to b=g0 is [1 + a.b, a x b].
     g0 = np.asarray(gravity_cam[0], dtype=np.float64)
     g0 = g0 / (np.linalg.norm(g0) + 1e-12)
     a_down = np.array([0.0, 0.0, -1.0])
@@ -431,8 +353,7 @@ def main():
         _chain_step, r0_wxyz, jnp.asarray(delta_prev[1:], dtype=jnp.float32))
     rot_init_wxyz = jnp.concatenate([r0_wxyz[None, :], rot_rest], axis=0)
 
-    # Random inits, GLOMAP-style: camera centers and landmarks both random
-    # (no anchor -- translation gauge left free, recentered post-hoc).
+    # Random init for camera centers and landmarks (no anchor; recentered later).
     key = jax.random.PRNGKey(args.pose_init_seed)
     key, sub = jax.random.split(key)
     center_init = jax.random.normal(sub, (n_frames, 3)) * args.pose_init_noise
@@ -442,9 +363,7 @@ def main():
 
     keep_edge = rel_valid_orig
     print(f"{int(keep_edge.sum())} IMU relative-rotation edges")
-    # World is gravity-aligned, +z UP -> gravity/down is world -z. Every frame's
-    # gravity_cost pulls its rotation to map this onto its measured down.
-    world_gravity_dir = jnp.array([[0.0, 0.0, -1.0]], dtype=jnp.float32)
+    world_gravity_dir = jnp.array([[0.0, 0.0, -1.0]], dtype=jnp.float32)  # +z up
     per_frame_weight = args.gravity_weight * gravity_weight
 
     robust_kind = {"huber": 0, "cauchy": 1, "geman_mcclure": 2}[args.robust_loss]
@@ -456,8 +375,8 @@ def main():
         print(f"[timing] analyze(): {time.time() - t0:.2f}s")
 
         if args.profile_compile:
-            # Two calls with IDENTICAL max_iterations (a Static[int] jit key
-            # in jaxls) -- first pays compile, second hits the cache.
+            # Two calls at identical max_iterations (a static jit key): first
+            # pays compile, second is cached.
             probe_iters = min(max_iterations, 5)
             probe_term = jaxls.TerminationConfig(max_iterations=probe_iters, early_termination=False)
             probe_trust_region = None if args.gauss_newton else jaxls.TrustRegionConfig()
@@ -480,7 +399,7 @@ def main():
             trust_region=None if args.gauss_newton else jaxls.TrustRegionConfig(),
             termination=jaxls.TerminationConfig(
                 max_iterations=max_iterations,
-                early_termination=not args.no_early_termination,
+                early_termination=args.early_termination,
             ),
             return_summary=True,
         )
@@ -491,8 +410,7 @@ def main():
         cost_history = np.asarray(summary.cost_history)[:n_iters]
         print(f"cost history ({len(cost_history)} steps): "
               f"{cost_history[0]:.4g} -> {cost_history[-1]:.4g}")
-        # Convergence trace: cost every few iters + relative per-iter drop,
-        # to judge whether the iteration budget is too small/large.
+        # Convergence trace: cost + relative drop at ~10 points.
         stride = max(1, len(cost_history) // 10)
         for k in range(0, len(cost_history), stride):
             rel = (0.0 if k == 0 else
@@ -507,9 +425,9 @@ def main():
         return solution, cost_history
 
     def positioning_and_smoothness_costs(pose_arg, center_arg, cam_pos_vars):
-        """Costs shared by both stages. pose_arg/center_arg are the var-or-
-        constant pair for positioning_cost; cam_pos_vars the per-frame var
-        type for the smoothness triples (CamCenterVar or SE3Var)."""
+        """Costs shared by both stages. pose_arg/center_arg = the var-or-constant
+        pair for positioning_cost; cam_pos_vars = per-frame var type for the
+        smoothness triples (CamCenterVar or SE3Var)."""
         costs = [positioning_cost(
             pose_arg,
             center_arg,
@@ -529,11 +447,8 @@ def main():
             ))
         return costs
 
-    # ---- STAGE 1: global positioning, rotations FROZEN (GLOMAP-style). ----
-    # The IMU-chain rotations enter only as constants baked into the
-    # residuals; the rotation-dependent costs (imu_rotation, gravity) would be
-    # constants too, so they are simply absent. Variables: centers, points,
-    # per-obs scales. No gauge anchor -- translation null space left to LM.
+    # Stage 1: global positioning, rotations frozen as constants. The rotation-
+    # dependent costs (imu_rotation, gravity) are constant here so are absent.
     print("=== stage 1: frozen-rotation global positioning ===")
     center_vars = CamCenterVar(id=jnp.arange(n_frames))
     point_vars = Point3Var(id=jnp.arange(n_points))
@@ -559,9 +474,8 @@ def main():
             jaxlie.SO3(q), -(jaxlie.SO3(q) @ c))
     )(rot_init_wxyz, centers1)
 
-    # ---- STAGE 2: full SE3 refine (GLOMAP's final BA analog). Rotations ----
-    # now free, tethered by the IMU relative-rotation + gravity costs; every
-    # gradient is computed from near-correct stage-1 geometry.
+    # Stage 2: full SE3 refine, rotations now free and tethered by the IMU
+    # relative-rotation + gravity costs.
     refine_iters = (args.max_iterations if args.refine_iterations is None
                     else args.refine_iterations)
     if refine_iters > 0:
@@ -601,10 +515,8 @@ def main():
         poses_out = pose_from_stage1
         points_out = solution1[Point3Var]
 
-    # NormalizeReconstruction analog (no anchor cost fixed the gauge in-solve):
-    # recenter so cam0's center is the world origin. No rescale -- the stereo
-    # baseline fixes metric scale. Rotations untouched (gravity fixed them).
-    # For WORLD->CAM poses, shifting the world by -c0 changes t to t + R c0.
+    # Recenter cam0's center to the world origin (no in-solve anchor). For
+    # WORLD->CAM poses, shifting the world by -c0 changes t to t + R c0.
     poses_np = np.asarray(poses_out.wxyz_xyz)
     points_np = np.asarray(points_out)
     R0 = np.asarray(jaxlie.SO3(poses_np[0, :4]).as_matrix())
@@ -637,9 +549,8 @@ def main():
         cos = np.einsum("ni,ni->n", dir_cam, ray_cam[m])
         return np.degrees(np.arccos(np.clip(cos, -1, 1))), p_cam[:, 2]
 
-    # Per-landmark median angular residual for the visualizer to threshold on
-    # (the robust loss already down-weighted outliers in-solve; nothing is
-    # dropped here). point_alive flags landmarks with >=2 observations.
+    # Per-landmark median angular residual for the visualizer; point_alive flags
+    # landmarks with >=2 observations.
     ang, _ = angular_residuals(poses_np, points_np)
     point_alive = np.bincount(point_ids, minlength=n_points) >= 2
     point_med_ang = np.full(n_points, np.nan)
@@ -654,9 +565,7 @@ def main():
           f"median angular residual "
           f"{np.nanmedian(point_med_ang[point_alive]):.3f} deg")
 
-    loss_plot_path = args.loss_plot
-    if loss_plot_path is None and args.no_early_termination:
-        loss_plot_path = os.path.join(args.recording, "loss_curve.png")
+    loss_plot_path = args.loss_plot or os.path.join(args.recording, "loss_curve.png")
     if loss_plot_path:
         import matplotlib
         matplotlib.use("Agg")

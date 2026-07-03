@@ -76,8 +76,12 @@ def main():
 
         w = int(caps[eyes[0]].get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(caps[eyes[0]].get(cv2.CAP_PROP_FRAME_HEIGHT))
-        writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"),
+        # avc1 (H.264) so the mp4 plays in QuickTime/browsers without re-encoding.
+        writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"avc1"),
                                   fps, (w * len(eyes), h))
+        if not writer.isOpened():
+            writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                      fps, (w * len(eyes), h))
 
         for i in range(n_frames):
             panels = []
@@ -98,7 +102,7 @@ def main():
         for cap in caps.values():
             cap.release()
 
-    print(f"wrote {out_path} (mp4v — re-encode with ffmpeg to h264 before transferring)")
+    print(f"wrote {out_path}")
 
 
 if __name__ == "__main__":

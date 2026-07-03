@@ -111,9 +111,9 @@ sketched before any code existed).
 
 | Stage | Script | Input | Output | Notes |
 |---|---|---|---|---|
-| 1. Feature extraction | `vio_extract_features.py` | left/right mp4 | `features.h5` | HDF5, per-eye group with `keypoints`/`scores`/`descriptors` (h5py `vlen` dtype, ragged per frame after FOV mask) + `counts`. Crops to the FOV bbox before extraction (see above), FOV-masked (in full-frame coords) after. Cached separately from matches — extraction is the GPU-heavy, non-reprocessable-cheaply step; matching is cheap so pair sets can change without re-extracting. |
-| 2. Pairwise matching + gating | `vio_match_pairs.py` | `features.h5` | `matches.jsonl` | One line per attempted pair (frame ids, eyes, matched index pairs + rejected pairs, geometric-gate pass/fail counts). Temporal gap schedule: dense nearby, sparser further out (`build_temporal_gaps`) — default `[1,2,3,4,6,8,10,15,20,25,30,40,50,60]`, i.e. up to 2s @ 30fps. GOTCHA hit in the full-video run: left/right mp4s can have slightly different frame counts (long-test1: 7007 vs 7006) — bound the frame loop by `min()` of both eyes, not just the left eye's count, or the last frame(s) crash with an out-of-range H5 read. NOT currently batched across pairs — one LightGlue forward call per pair (see Optimization TODO below). |
-| 3. Track building | `vio_build_tracks.py` | `matches.jsonl` (+ optional `loop_matches.jsonl`) | `tracks.jsonl` | Conflict-aware union-find (see above) → one line per landmark (list of `{frame, eye, kp_idx, px}` observations). COLMAP-style landmark DB, sorted longest-track-first. 3D triangulation deliberately deferred to stage 5 (needs the triangulation logic anyway as its LM init step). `--matches` takes MULTIPLE files (concatenated before building) — so enabling loop closure is just adding `loop_matches.jsonl` as a 2nd `--matches` arg, no cat/rebuild step. |
+| 1. Feature extraction | `vio_extract_features.py` | left/right mp4 | `features.h5` | HDF5, per-eye group with `keypoints`/`scores`/`descriptors` (h5py `vlen` dtype, ragged per frame after FOV mask) + `counts`. Crops to the FOV bbox before extraction (see above), FOV-masked (in full-frame coords) after. Defaults: `--fov-deg 150`, `--max-keypoints 1024`, `--detection-threshold 0.001` (drops the weakest, jitteriest detections), `--resize 1500` (SuperPoint's long-side resize target; the FOV crop is ~2000px so this recovers real resolution over the old 1024). BATCHED (`--batch-size 16`) through `SuperPoint.forward` — crops are same-size so the conv backbone batches cleanly, ~1.3x+ over one-at-a-time; per-frame fallback if a batch has uneven keypoint counts. Cached separately from matches. |
+| 2. Pairwise matching + gating | `vio_match_pairs.py` | `features.h5` | `matches.jsonl` | One line per attempted pair (frame ids, eyes, matched index pairs + rejected pairs, geometric-gate pass/fail counts). Temporal gap schedule: dense nearby, sparser further out (`build_temporal_gaps`) — default dense-to-20 then thinning to a 70-frame tail: `[1..20,21,23,25,27,29,30,35,40,50,60,70]`. Dense-to-20 (vs the old dense-to-4) fixes track flicker (a track dropping out for a frame when its only scheduled gaps happen to fail the gate). GOTCHA: left/right mp4s can differ by a frame (long-test1: 7007 vs 7006) — bound the loop by `min()` of both eyes. BATCHED across pairs (`--batch-size`, LightGlue); this is now the pipeline bottleneck (matching >> extraction), so `--max-keypoints` matters (O(N²) attention). |
+| 3. Track building | `vio_build_tracks.py` | `matches.jsonl` (+ optional `loop_matches.jsonl`) | `tracks.jsonl` | Conflict-aware union-find (see above) → one line per landmark (list of `{frame, eye, kp_idx, px}` observations). COLMAP-style landmark DB, sorted longest-track-first. 3D triangulation deliberately deferred to stage 5. `--min-frames 15` (default) drops tracks seen in fewer than 15 DISTINCT frames (eye-independent) — keeps only stable, well-tracked landmarks; distinct from `--min-observations` which counts per-eye observations. `--matches` takes MULTIPLE files (concatenated) — enabling loop closure is just adding `loop_matches.jsonl` as a 2nd `--matches` arg, no cat/rebuild step. |
 | 3b. Loop closure (OPTIONAL) | `vio_loop_closure.py` | `features.h5` | `loop_matches.jsonl` | Exhaustive keyframe (stride 30, ~1/s) matching for pairs beyond stage 2's gap horizon (>60 frames), same LightGlue+RANSAC gate as stage 2, records with `pair_type="temporal"` + true gap so they concatenate straight into stage 3. **Off by default** — the stage-5 two-stage solver alone collapsed the ghost on testimu (see below), so this is only for large loops with real inter-visit drift. `--viz-out` writes a montage of accepted pairs to eyeball before trusting them. |
 | 4. IMU relative factors | `vio_imu_prior.py` | `imu_log.csv`, `sync_log.csv`, `recording.json` | `imu_relative.npz` | Per consecutive-frame-pair relative rotation (strapdown gyro integration between soft-synced timestamps, NOT a global orientation stream) plus a per-frame gravity direction + confidence weight (windowed raw-accel average, weighted by deviation from 1g). IMU→camera extrinsic is a FIXED CAD-derived rotation constant (`R_CI`), not calibrated. Also flags invalid (bad-timestamp) frames generically via non-monotonicity, not a hardcoded index. |
 | 5. Global BA | `vio_bundle_adjust.py` | `tracks.jsonl`, `imu_relative.npz`, stereo calib, `features.h5` | `trajectory.npz` | **Two-stage GLOMAP-faithful solve** (see below). jaxls: per-observation scale Var (GLOMAP's `d_ik`), xyz Var per landmark; GLOMAP bounded positioning cost (Pan et al. 2024 / BATA), not reprojection error. Cauchy robust loss (scale 0.05, on the bounded sin-θ residual) down-weights outliers in-solve — no filter-and-resolve rounds. Solver: jaxls trust-region LM (Gauss-Newton diverges). World is **gravity-aligned** (+z up, fixed by the gravity prior); global yaw + translation origin are free gauges, recentered post-hoc so cam0 = origin (no in-solve anchor cost — GLOMAP avoids it too). Frames with invalid timestamps dropped from the pose list. |
@@ -183,21 +183,27 @@ hue spacing per track) with fading trajectory tails — `--tracks-per-frame 0`
 draws every active track every frame, the confirmed-preferred default over
 an earlier hard cap.
 
-## Optimization TODO (deliberately deferred until the full-video pass works end to end)
+## Optimization TODO
 
-- **Batch LightGlue matching across pairs, not one pair at a time.** Confirmed
-  `LightGlue.forward` supports batched `[B x M x 2]` keypoints/descriptors —
-  we're just not using it (`vio_match_pairs.py` calls the matcher once per
-  pair, batch=1 every time). Per-pair overhead (~15-20ms) is likely dominated
-  by Python/CUDA-launch overhead and underused GPU parallelism, not actual
-  attention compute — same shape of win as WiLoR's batched-ViT speedup in
-  `../hands/CLAUDE.md` (16x/crop). Needs padding each frame's keypoints to a
-  common per-batch max count + a validity mask (LightGlue supports this as a
-  tensor shape; the padding/masking logic itself doesn't exist yet in
-  `vio_extract_features.py`'s storage or the stage-2 pair loop). Decided
-  2026-07-01 to debug/validate correctness on a full-video run FIRST, then
-  optimize — don't want to debug a new batching path and pipeline correctness
-  at the same time.
+Both extraction and matching are now batched (done 2026-07-03). Matching is the
+current bottleneck (>> extraction). Remaining ideas, roughly by payoff/effort:
+
+- **Keep features GPU-resident across the match loop.** `match_batch` reads
+  numpy from the FeatureStore and does a fresh `.to(device)` + fp16→fp32 per
+  batch; each frame participates in ~30 pairs, so its descriptors cross PCIe
+  ~30x. At 1024 kp × 256-d fp16 a whole eye-pair fits in a few GB on the A6000
+  — upload once per chunk, index/truncate on-device.
+- **Overlap CPU/GPU in the match loop.** It's serial: between matcher calls the
+  GPU idles during per-row `.cpu()` transfers, conf filtering, json.dumps, file
+  writes. Do the `keep = scores >= conf_thresh` mask on-GPU, batch the result
+  transfer, and move serialization/writes to a background thread.
+- **Binary match output** (npz/parquet per chunk) instead of ~200k `json.dumps`
+  — fold into the writer thread above.
+- **Autocast SuperPoint to fp16** — mp=True gave ~1.7x on LightGlue at 99.9%
+  agreement; the conv backbone should benefit similarly (A/B it).
+- **torchcodec GPU video decode** instead of cv2 — decode straight to a GPU
+  tensor, skip cv2's CPU decode + H2D. Cross-cutting (extraction + both video
+  visualizers), so do it as its own pass.
 
 ## Status (2026-07-03)
 
@@ -205,11 +211,17 @@ Stages 1-3 validated on `long-test1`. All 5 stages run end-to-end on `testimu`
 (~897-frame handheld clip with real IMU). Stage 5 reworked into the two-stage
 GLOMAP-faithful solve (see "Stage 5" above): tracks the IMU rotation truth to
 ~1° (was collapsing a 180° turn to ~19°), gravity-aligned world, no anchor
-cost, Cauchy robust loss. Runs in ~75s on testimu (stage1 15 iters + stage2 3
-iters; the old solver took ~14-29 min). Loop closure validated as optional and
-turned off by default. Motion blur robustness still untested (`testnewcamsblur*`
-recordings exist for this).
+cost, Cauchy robust loss. Loop closure validated as optional and off by
+default. Motion blur robustness still untested (`testnewcamsblur*` exist).
+
+Tuned defaults (2026-07-03, validated in viser on testimu): 150° FOV,
+1024 keypoints, detection-threshold 0.001, resize 1500, batched extraction;
+dense-to-20 / 70-frame-tail match schedule (fixes track flicker); min-frames 15
+track filter. End result: ~16k stable landmarks, 0.325° median angular residual.
+IMPORTANT: run stage 5 WITHOUT `--early-termination` (now the default) — it
+false-positives at ~2 iters and leaves positions under-solved (scrunched
+trajectory); stage 1 needs ~15 iters to converge.
 
 Prior open items to re-check against the new solver (were measured on the OLD
-one): ~18.6% negative-depth landmarks, and per-iteration cost growth over a
-long run. Track-quality-weighted costs still flagged as worth trying.
+one): negative-depth landmarks, per-iteration cost growth over a long run.
+Track-quality-weighted costs still flagged as worth trying.

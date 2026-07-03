@@ -34,9 +34,20 @@ def parse_args():
     p.add_argument("--out", default=None, help="output .h5 (default: <recording>/features.h5)")
     p.add_argument("--left-serial", default=None, help="default: read from recording.json")
     p.add_argument("--right-serial", default=None)
-    p.add_argument("--fov-deg", type=float, default=130.0,
+    p.add_argument("--fov-deg", type=float, default=150.0,
                     help="full FOV kept (keypoints beyond this angle are dropped)")
-    p.add_argument("--max-keypoints", type=int, default=512)
+    p.add_argument("--max-keypoints", type=int, default=1024)
+    p.add_argument("--detection-threshold", type=float, default=0.001,
+                    help="SuperPoint keypoint score threshold; raising it keeps "
+                         "only high-confidence, more repeatable (less jittery) "
+                         "keypoints at the cost of count")
+    p.add_argument("--resize", type=int, default=1500,
+                    help="SuperPoint resizes the crop's long side to this before "
+                         "detection; the FOV crop is often larger (130deg ~1785px), "
+                         "so raising this recovers real resolution. 0 = no resize")
+    p.add_argument("--batch-size", type=int, default=16,
+                    help="frames per SuperPoint forward pass (crops are same-size, "
+                         "so batching is a large speedup over one-at-a-time)")
     p.add_argument("--max-frames", type=int, default=None)
     p.add_argument("--device", default="cuda")
     return p.parse_args()
@@ -101,7 +112,21 @@ def to_tensor(img, device):
     return torch.from_numpy(img).float().permute(2, 0, 1).to(device) / 255.0
 
 
-def extract_eye(f, eye, video_path, K, D, theta_max, extractor, device, max_frames):
+def extract_batch(extractor, crops, resize):
+    """Run SuperPoint on a stack of same-size crops (B,3,H,W). All crops share
+    one resize scale, so preprocess the batch once and call forward directly
+    (extract() is batch=1 only). Returns per-image (kp, score, descriptor)."""
+    from lightglue.utils import ImagePreprocessor
+    conf = {} if resize <= 0 else {"resize": resize}
+    imgs, scales = ImagePreprocessor(**{**extractor.preprocess_conf, **conf})(crops)
+    with torch.no_grad():
+        feats = extractor.forward({"image": imgs})
+    kps = (feats["keypoints"] + 0.5) / scales[None] - 0.5
+    return kps, feats["keypoint_scores"], feats["descriptors"]
+
+
+def extract_eye(f, eye, video_path, K, D, theta_max, extractor, device, max_frames,
+                resize, batch_size):
     cap = cv2.VideoCapture(video_path)
     n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     img_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -120,22 +145,42 @@ def extract_eye(f, eye, video_path, K, D, theta_max, extractor, device, max_fram
     sc_ds = grp.create_dataset("scores", (n_frames,), dtype=vlen_f32)
     de_ds = grp.create_dataset("descriptors", (n_frames,), dtype=vlen_f16)
     n_ds = grp.create_dataset("counts", (n_frames,), dtype=np.int32)
+    off = torch.tensor([x0, y0], device=device, dtype=torch.float32)
 
-    for i, img in enumerate(read_frames_rgb(video_path, n_frames)):
-        crop = img[y0:y1, x0:x1]
-        with torch.no_grad():
-            feat = extractor.extract(to_tensor(crop, device))
-        kp = feat["keypoints"][0]
-        kp = kp + kp.new_tensor([x0, y0])  # crop-local -> full-frame coords
-        sc = feat["keypoint_scores"][0]
-        de = feat["descriptors"][0]
+    def store(i, kp, sc, de):
+        kp = kp + off  # crop-local -> full-frame coords
         mask = fov_mask(kp, K, D, theta_max)
         kp, sc, de = kp[mask], sc[mask], de[mask]
-
         kp_ds[i] = kp.cpu().numpy().astype(np.float32).ravel()
         sc_ds[i] = sc.cpu().numpy().astype(np.float32)
         de_ds[i] = de.cpu().numpy().astype(np.float16).ravel()
         n_ds[i] = kp.shape[0]
+
+    def flush(base, crops):
+        try:
+            kps, scs, des = extract_batch(extractor, torch.stack(crops), resize)
+            for j in range(len(crops)):
+                store(base + j, kps[j], scs[j], des[j])
+        except RuntimeError:
+            # forward() stacks per-frame results, so a batch with uneven
+            # keypoint counts (a low-texture frame below the cap) can't stack;
+            # fall back to per-frame extract() for this batch.
+            r = resize if resize > 0 else None
+            for j, crop in enumerate(crops):
+                feat = extractor.extract(crop, resize=r)
+                store(base + j, feat["keypoints"][0], feat["keypoint_scores"][0],
+                      feat["descriptors"][0])
+
+    batch, base = [], 0
+    for i, img in enumerate(read_frames_rgb(video_path, n_frames)):
+        batch.append(to_tensor(img[y0:y1, x0:x1], device))
+        if len(batch) == batch_size:
+            flush(base, batch)
+            base, batch = i + 1, []
+        if i % 200 == 0:
+            print(f"  {eye} {i}/{n_frames}")
+    if batch:
+        flush(base, batch)
 
         if i % 200 == 0:
             print(f"  {eye} {i}/{n_frames}: kept {kp.shape[0]} keypoints")
@@ -154,7 +199,8 @@ def main():
     Kr, Dr = load_intrinsics(args.recording, rs, device)
     theta_max = np.radians(args.fov_deg / 2.0)
 
-    extractor = SuperPoint(max_num_keypoints=args.max_keypoints).eval().to(device)
+    extractor = SuperPoint(max_num_keypoints=args.max_keypoints,
+                           detection_threshold=args.detection_threshold).eval().to(device)
 
     out_path = args.out or os.path.join(args.recording, "features.h5")
     with h5py.File(out_path, "w") as f:
@@ -166,10 +212,13 @@ def main():
         f.attrs["right_serial"] = rs
         f.attrs["fps"] = rec.get("fps", 30)
 
+        f.attrs["resize"] = args.resize
         extract_eye(f, "left", os.path.join(args.recording, "left.mp4"),
-                    Kl, Dl, theta_max, extractor, device, args.max_frames)
+                    Kl, Dl, theta_max, extractor, device, args.max_frames,
+                    args.resize, args.batch_size)
         extract_eye(f, "right", os.path.join(args.recording, "right.mp4"),
-                    Kr, Dr, theta_max, extractor, device, args.max_frames)
+                    Kr, Dr, theta_max, extractor, device, args.max_frames,
+                    args.resize, args.batch_size)
 
     print(f"wrote {out_path}")
 

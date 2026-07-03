@@ -2,13 +2,10 @@
 trajectory + landmark point cloud, plus a left-eye video thumbnail synced
 to the frame slider.
 
-Landmarks are colored by their actual video pixel at first observation
-(--color-mode pixel, default) rather than a synthetic depth colormap --
-easier to spot a degenerate reconstruction (noise vs. recognizable scene).
-Left (orange) + right (cyan) stereo frustums per frame, right pose derived
-via T_wr = T_stereo @ T_wl (no separate right-eye Var). Viser's up-direction
-is set from stage 4's measured gravity, since world frame here is the
-anchor pose's camera frame (+z forward), not gravity-aligned.
+Landmarks colored by their actual video pixel at first observation
+(--color-mode pixel, default) or a depth colormap. Left (orange) + right
+(cyan) stereo frustums per frame, right pose via T_wr = T_stereo @ T_wl.
+World is gravity-aligned (+z up), so viser's up-direction is +z.
 
 Run (from data_processing/vio/):
     python vio_visualize_trajectory.py ../../testimu --trajectory ../../testimu/trajectory.npz
@@ -75,7 +72,7 @@ def main():
                           "trajectory.npz's point_first_* fields, written by "
                           "vio_bundle_adjust.py). depth: percentile colormap.")
     ap.add_argument("--thumb-w", type=int, default=480)
-    ap.add_argument("--point-size", type=float, default=0.01)
+    ap.add_argument("--point-size", type=float, default=0.005)
     ap.add_argument("--robust-scale", type=float, default=0.05,
                     help="Cauchy scale used in the solve -- for the outlier "
                          "heatmap's weight reconstruction (match the BA run)")
@@ -211,25 +208,19 @@ def main():
     server = viser.ViserServer(port=args.port)
     server.scene.world_axes.visible = False
 
-    # The solver now optimizes in a gravity-aligned world (the gravity prior
-    # pins world +z = up), so viser's up-axis is just +z. (Older trajectories
-    # in the frame-0 camera world would need the measured-gravity tilt.)
-    server.scene.set_up_direction("+z")
+    server.scene.set_up_direction("+z")  # stage-5 world is gravity-aligned
 
-    # Outlier heatmap: reconstruct each landmark's Cauchy down-weight from its
-    # saved median angular residual (deg). The solve's robust residual is the
-    # bounded ~sin(theta), so r = sin(med_ang), w = 1/(1+(r/scale)^2) with the
-    # same --robust-scale as the BA run. w=1 = full inlier, w->0 = suppressed.
+    # Outlier heatmap: Cauchy down-weight reconstructed from each landmark's
+    # median angular residual, r = sin(med_ang), w = 1/(1+(r/scale)^2).
     heat_colors = None
     if "point_med_ang" in d:
         med_ang = np.asarray(d["point_med_ang"], dtype=np.float64)
         r = np.sin(np.radians(med_ang))
         w = 1.0 / (1.0 + (r / args.robust_scale) ** 2)
         w = np.where(np.isfinite(w), w, 1.0)
-        # Green (inlier, w=1) -> red (outlier, w=0); black where no residual.
-        heat_colors = np.zeros((len(points), 3))
-        heat_colors[:, 0] = 1.0 - w   # red rises as weight falls
-        heat_colors[:, 1] = w         # green for inliers
+        heat_colors = np.zeros((len(points), 3))  # green (inlier) -> red (outlier)
+        heat_colors[:, 0] = 1.0 - w
+        heat_colors[:, 1] = w
         finite = np.isfinite(med_ang) & keep_points
         if finite.any():
             for thr in (0.75, 0.5, 0.25, 0.1):
@@ -241,7 +232,7 @@ def main():
 
     pc = server.scene.add_point_cloud(
         "/landmarks", points=points[keep_points], colors=point_colors[keep_points],
-        point_size=args.point_size)
+        point_size=args.point_size, point_shape="circle")
 
     if heat_colors is not None:
         gui_outliers = server.gui.add_checkbox("outlier heatmap", False)
@@ -251,8 +242,7 @@ def main():
             pc.colors = (heat_colors if gui_outliers.value
                          else point_colors)[keep_points]
 
-    # ALL frustums drawn faintly so the whole trajectory shape is visible at
-    # a glance, plus one bright pair (left orange, right cyan) for the
+    # All frustums faint for the trajectory shape; one bright pair for the
     # current frame (updated below).
     for i in range(n_frames):
         server.scene.add_camera_frustum(
