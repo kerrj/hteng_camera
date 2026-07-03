@@ -71,6 +71,10 @@ purely the 2D observation graph.
 Run (from data_processing/vio/):
     python vio_build_tracks.py ../../long-test1 --matches ../../long-test1/matches.jsonl \
         --features ../../long-test1/features.h5 --out ../../long-test1/tracks.jsonl
+
+    # optional loop closure: add loop_matches.jsonl as a second --matches file
+    python vio_build_tracks.py ../../REC \
+        --matches ../../REC/matches.jsonl ../../REC/loop_matches.jsonl
 """
 import argparse
 import json
@@ -84,7 +88,11 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("recording")
-    p.add_argument("--matches", default=None, help="default: <recording>/matches.jsonl")
+    p.add_argument("--matches", default=None, nargs="+",
+                    help="one or more match files, concatenated before track "
+                         "building (default: <recording>/matches.jsonl). Pass "
+                         "loop_matches.jsonl as a 2nd file to add loop closure "
+                         "-- no separate cat/rebuild step needed")
     p.add_argument("--features", default=None, help="default: <recording>/features.h5")
     p.add_argument("--out", default=None, help="default: <recording>/tracks.jsonl")
     p.add_argument("--min-observations", type=int, default=3)
@@ -184,12 +192,18 @@ def edge_priority(rec):
 
 def main():
     args = parse_args()
-    matches_path = args.matches or os.path.join(args.recording, "matches.jsonl")
+    matches_paths = args.matches or [os.path.join(args.recording, "matches.jsonl")]
     features_path = args.features or os.path.join(args.recording, "features.h5")
     out_path = args.out or os.path.join(args.recording, "tracks.jsonl")
 
-    with open(matches_path) as fp:
-        recs = [json.loads(line) for line in fp]
+    recs = []
+    for mp in matches_paths:
+        with open(mp) as fp:
+            recs.extend(json.loads(line) for line in fp)
+    if len(matches_paths) > 1:
+        print(f"concatenated {len(matches_paths)} match files "
+              f"({', '.join(os.path.basename(p) for p in matches_paths)}) "
+              f"-> {len(recs)} match records")
     recs.sort(key=edge_priority)
 
     node_id = {}  # (eye, frame, kp_idx) -> int

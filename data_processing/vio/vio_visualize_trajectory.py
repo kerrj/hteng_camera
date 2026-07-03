@@ -76,6 +76,9 @@ def main():
                           "vio_bundle_adjust.py). depth: percentile colormap.")
     ap.add_argument("--thumb-w", type=int, default=480)
     ap.add_argument("--point-size", type=float, default=0.01)
+    ap.add_argument("--robust-scale", type=float, default=0.05,
+                    help="Cauchy scale used in the solve -- for the outlier "
+                         "heatmap's weight reconstruction (match the BA run)")
     ap.add_argument("--frustum-scale", type=float, default=0.03)
     ap.add_argument("--port", type=int, default=8081)
     args = ap.parse_args()
@@ -208,22 +211,45 @@ def main():
     server = viser.ViserServer(port=args.port)
     server.scene.world_axes.visible = False
 
-    # World frame is the anchor pose's camera frame (+z forward, NOT up),
-    # so orient viser's up-axis from the anchor frame's measured gravity
-    # instead of assuming +z (gravity_cam stores DOWN, negate for "up").
-    imu_relative_path = os.path.join(args.recording, "imu_relative.npz")
-    if os.path.exists(imu_relative_path):
-        up_dir = -np.load(imu_relative_path)["gravity_cam"][0]
-        server.scene.set_up_direction(tuple(up_dir))
-    else:
-        print(f"[warn] no {imu_relative_path} -- falling back to +z as up "
-              f"(likely wrong: world frame is frame 0's camera frame, not "
-              f"gravity-aligned)")
-        server.scene.set_up_direction("+z")
+    # The solver now optimizes in a gravity-aligned world (the gravity prior
+    # pins world +z = up), so viser's up-axis is just +z. (Older trajectories
+    # in the frame-0 camera world would need the measured-gravity tilt.)
+    server.scene.set_up_direction("+z")
 
-    server.scene.add_point_cloud(
+    # Outlier heatmap: reconstruct each landmark's Cauchy down-weight from its
+    # saved median angular residual (deg). The solve's robust residual is the
+    # bounded ~sin(theta), so r = sin(med_ang), w = 1/(1+(r/scale)^2) with the
+    # same --robust-scale as the BA run. w=1 = full inlier, w->0 = suppressed.
+    heat_colors = None
+    if "point_med_ang" in d:
+        med_ang = np.asarray(d["point_med_ang"], dtype=np.float64)
+        r = np.sin(np.radians(med_ang))
+        w = 1.0 / (1.0 + (r / args.robust_scale) ** 2)
+        w = np.where(np.isfinite(w), w, 1.0)
+        # Green (inlier, w=1) -> red (outlier, w=0); black where no residual.
+        heat_colors = np.zeros((len(points), 3))
+        heat_colors[:, 0] = 1.0 - w   # red rises as weight falls
+        heat_colors[:, 1] = w         # green for inliers
+        finite = np.isfinite(med_ang) & keep_points
+        if finite.any():
+            for thr in (0.75, 0.5, 0.25, 0.1):
+                frac = float((w[finite] < thr).mean())
+                print(f"  outlier weight < {thr}: {100*frac:5.1f}% of landmarks "
+                      f"({int((w[finite] < thr).sum())})")
+            print(f"  median Cauchy weight: {np.median(w[finite]):.3f}, "
+                  f"median residual: {np.median(med_ang[finite]):.2f} deg")
+
+    pc = server.scene.add_point_cloud(
         "/landmarks", points=points[keep_points], colors=point_colors[keep_points],
         point_size=args.point_size)
+
+    if heat_colors is not None:
+        gui_outliers = server.gui.add_checkbox("outlier heatmap", False)
+
+        @gui_outliers.on_update
+        def _(_=None):
+            pc.colors = (heat_colors if gui_outliers.value
+                         else point_colors)[keep_points]
 
     # ALL frustums drawn faintly so the whole trajectory shape is visible at
     # a glance, plus one bright pair (left orange, right cyan) for the
