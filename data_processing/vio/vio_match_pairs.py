@@ -39,6 +39,15 @@ batch_size > 1 -- the reference LightGlue implementation's adaptive
 point-pruning optimization has a genuine indexing bug for batch>1 (crashes
 with the default config; confirmed by direct testing, not a config choice).
 
+GPU-RESIDENT FEATURES (see FeatureStore): features are uploaded once and every
+batch is assembled with on-device gathers, cutting per-batch assembly from
+67.6% of stage-2 wall-clock to ~3% (a 3.1x speedup that leaves stage 2 GPU-
+bound: forward + temporal RANSAC). JSONL output goes through a background
+thread (AsyncJsonlWriter). Consequence of the fp16-native path: runs are no
+longer bit-reproducible (fp16 shifts LightGlue's match EMISSION ORDER, which
+reseeds RANSAC) -- but the raw match SET is identical and accept/reject flips
+on only ~0.03% of pairs (RANSAC noise).
+
 MATCHING PRECISION/COMPILE (defaults locked in via the bench_lightglue*.py
 sweeps on this recording, 300 frames / 8152 pairs, batch_size=16):
   - mp=True (LightGlue's autocast flag): ~1.7x on the matching phase, 99.9%
@@ -86,6 +95,8 @@ Run (from data_processing/vio/):
 import argparse
 import json
 import os
+import queue
+import threading
 
 import h5py
 import numpy as np
@@ -100,6 +111,47 @@ import fisheye_pinhole as FP
 
 from lightglue import LightGlue
 import relpose_5pt_jaxls as R5
+
+
+class AsyncJsonlWriter:
+    """Serializes record dicts to JSONL on a background thread so json.dumps +
+    file I/O stay off the matching critical path -- callers hand over plain
+    dicts, the worker owns the file. Otherwise per-pair dumps + writes for
+    ~200k pairs run on the main thread BETWEEN matcher batches, idling the GPU.
+    Queue is bounded so a slow disk applies back-pressure instead of piling
+    records up in RAM (only happens when we're I/O-bound anyway)."""
+
+    def __init__(self, path, maxsize=100000):
+        self._f = open(path, "w")
+        self._q = queue.Queue(maxsize=maxsize)
+        self._err = None
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    def _run(self):
+        try:
+            for rec in iter(self._q.get, None):
+                self._f.write(json.dumps(rec) + "\n")
+        except Exception as e:  # surfaced to the main thread on close()
+            self._err = e
+
+    def write(self, rec):
+        if self._err is not None:
+            raise self._err
+        self._q.put(rec)
+
+    def close(self):
+        self._q.put(None)
+        self._t.join()
+        self._f.close()
+        if self._err is not None:
+            raise self._err
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 def parse_args():
@@ -191,41 +243,80 @@ def load_stereo(recording_dir, ls, rs):
 
 
 class FeatureStore:
-    """Thin cache over the stage-1 HDF5 so repeated frame lookups (every
-    frame appears in ~O(len(gaps)) pairs) don't re-read from disk."""
+    """GPU-resident cache over the stage-1 HDF5. Every frame appears in
+    ~O(len(gaps)) pairs, so keypoints/scores/descriptors are read from disk and
+    uploaded to the GPU ONCE, then reused across all of that frame's pairs --
+    match_batch assembles LightGlue inputs with pure on-device gathers.
+
+    Replaces an older host-numpy store whose per-batch fp16->fp32 upcast +
+    per-pair argsort + np.stack + fresh fp32 .to(device) was 67.6% of stage-2
+    wall-clock (forward only 21% -- GPU idle waiting on the CPU; profiled
+    long-test1, 600 frames). Fixes, in order:
+      - descriptors stay fp16 (their on-disk dtype; the fp32 upcast recovered
+        no precision -- already fp16-quantized at extraction -- and LightGlue's
+        mp=True runs the GEMMs in fp16 anyway) -> no per-batch ~16MB H2D;
+      - descending score order argsorted ONCE per frame at load (was per pair
+        per side);
+      - top-k + batch stacking are on-GPU index_select/stack.
+    A tiny host-side numpy keypoint copy is also kept for the geometric gate
+    (_unproject_pairs needs pixel coords on the CPU; ~8KB/frame).
+
+    The WHOLE video stays resident (~5-6GB fp16 both eyes, fine on a 48GB
+    A6000). A much longer recording could need windowed eviction (frame i is
+    dead once chunk_start passes i + max(gaps)) -- not needed yet."""
 
     def __init__(self, h5_path, device):
         self.f = h5py.File(h5_path, "r")
         self.device = device
-        self._cache = {}
+        self._cache = {}   # (eye,i) -> (kp_np f32, kp_g f32, sc_g f32, de_g f16, order_g long)
 
-    def get(self, eye, i):
+    def _ingest(self, eye, i, kp_np, sc_np, de_np):
+        """Shared load path for get_gpu()/prefetch_range: upload one frame's
+        features to the GPU and precompute its descending score order."""
+        kp_g = torch.from_numpy(kp_np).to(self.device)                 # (n,2) f32
+        sc_g = torch.from_numpy(sc_np).to(self.device)                 # (n,)  f32
+        de_g = torch.from_numpy(de_np).to(self.device)                 # (n,D) f16
+        # np.argsort(-sc) on the host reproduces the OLD per-pair top_k_order
+        # tie-breaking EXACTLY (same array, same stable-ish argsort), so match
+        # selection is unchanged; upload the resulting order to index on-GPU.
+        order_g = torch.from_numpy(np.argsort(-sc_np)).to(self.device)  # (n,) long
+        self._cache[(eye, i)] = (kp_np, kp_g, sc_g, de_g, order_g)
+
+    def get_gpu(self, eye, i):
+        """(kp_g f32, sc_g f32, de_g f16, order_g long) on the device, loading
+        on demand. order_g is the full descending-score argsort; top-k is the
+        prefix order_g[:k] (sliced in match_batch's take())."""
         key = (eye, i)
         if key not in self._cache:
             g = self.f[eye]
             n = int(g["counts"][i])
             kp = g["keypoints"][i].reshape(n, 2).astype(np.float32)
             sc = g["scores"][i].astype(np.float32)
-            de = g["descriptors"][i].reshape(n, -1).astype(np.float32)
-            self._cache[key] = (kp, sc, de)
-        return self._cache[key]
+            de = g["descriptors"][i].reshape(n, -1)  # keep native fp16
+            self._ingest(eye, i, kp, sc, de)
+        _, kp_g, sc_g, de_g, order_g = self._cache[key]
+        return kp_g, sc_g, de_g, order_g
+
+    def get_kp(self, eye, i):
+        """Host-side (n,2) f32 pixel keypoints for the geometric gate."""
+        self.get_gpu(eye, i)  # ensure loaded
+        return self._cache[(eye, i)][0]
 
     def prefetch_range(self, eye, start, end):
         """Bulk-read keypoints/scores/descriptors for frames [start,end) in
         ONE h5py slice call each (3 total), instead of up to (end-start)
-        individual per-frame `get()` reads. Confirmed by direct testing this
-        matters a lot: a full ~7000-frame run with per-frame reads was still
-        stuck partway through its FIRST 300-frame chunk after 2+ hours
-        (verified via py-spy: genuinely alternating between real LightGlue
-        compute and HDF5 `__getitem__` calls, not hung) -- the earlier fast
-        200-frame test (40s) almost certainly benefited from OS page-cache
-        locality built up from repeated testing on that same byte range, not
-        from anything about the code itself; a full-video run touches far
-        more of the 3.3GB file and hits mostly cold reads. Populates the same
-        `_cache` dict `get()` reads from, so `get()` itself is unchanged --
-        this is purely a batching optimization, same idea as `count()`'s
-        fix, just for the (much larger) keypoint/score/descriptor arrays
-        instead of the tiny per-frame count."""
+        individual per-frame reads, then upload each to the GPU. Confirmed by
+        direct testing this matters a lot: a full ~7000-frame run with
+        per-frame reads was still stuck partway through its FIRST 300-frame
+        chunk after 2+ hours (verified via py-spy: genuinely alternating
+        between real LightGlue compute and HDF5 `__getitem__` calls, not hung)
+        -- the earlier fast 200-frame test (40s) almost certainly benefited
+        from OS page-cache locality built up from repeated testing on that
+        same byte range, not from anything about the code itself; a full-video
+        run touches far more of the 3.3GB file and hits mostly cold reads.
+        Populates the same `_cache` dict, so this is purely a disk-batching
+        optimization, same idea as `count()`'s fix, just for the (much larger)
+        keypoint/score/descriptor arrays instead of the tiny per-frame count."""
         end = min(end, self.n_frames(eye))
         if end <= start:
             return
@@ -240,8 +331,8 @@ class FeatureStore:
             n = self.count(eye, i)
             kp = kp_all[offset].reshape(n, 2).astype(np.float32)
             sc = sc_all[offset].astype(np.float32)
-            de = de_all[offset].reshape(n, -1).astype(np.float32)
-            self._cache[key] = (kp, sc, de)
+            de = de_all[offset].reshape(n, -1)  # keep native fp16
+            self._ingest(eye, i, kp, sc, de)
 
     def count(self, eye, i):
         # Cache the WHOLE counts array per eye on first use -- a naive
@@ -292,39 +383,55 @@ def gate_stereo(rays_l, rays_r, R, t, theta_tol):
     return residual < np.sin(theta_tol)
 
 
-def top_k_order(scores, k):
-    """Indices (into the ORIGINAL 0..len(scores)-1 array) of the k
-    highest-scored keypoints, or all of them if there are <= k."""
-    if scores.shape[0] <= k:
-        return np.arange(scores.shape[0])
-    return np.argsort(-scores)[:k]
-
-
 def match_batch(matcher, store, specs, conf_thresh, device):
     """specs: list of (eye_a, frame_a, eye_b, frame_b). Truncates every pair
     in the batch to this batch's minimum keypoint count per side (keeping the
     highest-scored points), runs ONE LightGlue call, then maps results back
     to indices into the ORIGINAL (untruncated) per-frame keypoint arrays --
     callers never see batch-local indices. Returns a list of (idx (N,2)
-    int64, scores (N,) float32), aligned with `specs`."""
+    int64, scores (N,) float32), aligned with `specs`.
+
+    Assembly is entirely on-GPU: each frame's features already live on the
+    device (FeatureStore), and its descending-score order is precomputed, so
+    per side this is just an index_select of the top-M rows and a torch.stack
+    -- no host->device upload, no np.stack, no fp32 descriptor upcast (see
+    FeatureStore's docstring for why that whole path was the stage-2
+    bottleneck). Only the two small result tensors come back to the host."""
     counts_a = [store.count(ea, fa) for ea, fa, _, _ in specs]
     counts_b = [store.count(eb, fb) for _, _, eb, fb in specs]
     M, N = min(counts_a), min(counts_b)
 
     kp0, sc0, de0, orders_a = [], [], [], []
     kp1, sc1, de1, orders_b = [], [], [], []
-    for ea, fa, eb, fb in specs:
-        kpa, sca, dea = store.get(ea, fa)
-        kpb, scb, deb = store.get(eb, fb)
-        oa, ob = top_k_order(sca, M), top_k_order(scb, N)
-        kp0.append(kpa[oa]); sc0.append(sca[oa]); de0.append(dea[oa]); orders_a.append(oa)
-        kp1.append(kpb[ob]); sc1.append(scb[ob]); de1.append(deb[ob]); orders_b.append(ob)
 
-    t = lambda arr: torch.from_numpy(np.stack(arr)).to(device)
-    feats0 = {"keypoints": t(kp0), "keypoint_scores": t(sc0), "descriptors": t(de0)}
-    feats1 = {"keypoints": t(kp1), "keypoint_scores": t(sc1), "descriptors": t(de1)}
+    def take(eye, frame, k):
+        """Top-k rows of a frame's features by score, on-GPU. Returns
+        (kp k,2 / sc k, / de k,D) gathered plus the order tensor mapping
+        batch-local row -> original keypoint index."""
+        kp_g, sc_g, de_g, order_g = store.get_gpu(eye, frame)
+        sel = order_g[:k]  # order_g is the FULL descending argsort; top-k is its prefix
+        return kp_g[sel], sc_g[sel], de_g[sel], sel
+
+    for ea, fa, eb, fb in specs:
+        kpa, sca, dea, oa = take(ea, fa, M)
+        kpb, scb, deb, ob = take(eb, fb, N)
+        kp0.append(kpa); sc0.append(sca); de0.append(dea); orders_a.append(oa)
+        kp1.append(kpb); sc1.append(scb); de1.append(deb); orders_b.append(ob)
+
+    feats0 = {"keypoints": torch.stack(kp0), "keypoint_scores": torch.stack(sc0),
+              "descriptors": torch.stack(de0)}
+    feats1 = {"keypoints": torch.stack(kp1), "keypoint_scores": torch.stack(sc1),
+              "descriptors": torch.stack(de1)}
     with torch.no_grad():
         out = matcher({"image0": feats0, "image1": feats1})
+
+    # out["matches"]/["scores"] are RAGGED (a length-B list of (N_i,2) / (N_i,)
+    # tensors -- variable match count per pair), so this stays per-row (it's
+    # only ~1% of stage-2 wall). The order tensors are pulled back to the host
+    # once per side per row; remap batch-local match indices through them to
+    # get indices into each frame's ORIGINAL keypoint array.
+    orders_a_h = [o.cpu().numpy() for o in orders_a]
+    orders_b_h = [o.cpu().numpy() for o in orders_b]
 
     results = []
     for row in range(len(specs)):
@@ -335,7 +442,7 @@ def match_batch(matcher, store, specs, conf_thresh, device):
         if idx.shape[0] == 0:
             results.append((np.zeros((0, 2), dtype=np.int64), np.zeros((0,), dtype=np.float32)))
             continue
-        oa, ob = orders_a[row], orders_b[row]
+        oa, ob = orders_a_h[row], orders_b_h[row]
         idx_orig = np.stack([oa[idx[:, 0]], ob[idx[:, 1]]], axis=1)
         results.append((idx_orig, scores))
     return results
@@ -357,7 +464,7 @@ def write_reject_too_few(eye_a, i, eye_b, j, pair_type, gap, idx, out_f):
         "idx_a": [], "idx_b": [],
         "rejected_idx_a": idx[:, 0].tolist(), "rejected_idx_b": idx[:, 1].tolist(),
     }
-    out_f.write(json.dumps(rec) + "\n")
+    out_f.write(rec)
 
 
 def _unproject_pairs(store, pairs, cams, device):
@@ -368,8 +475,8 @@ def _unproject_pairs(store, pairs, cams, device):
     buf_pts = {"left": [], "right": []}
     buf_meta = {"left": [], "right": []}  # (pair_idx, side, n) in append order
     for pair_idx, (ea, i, eb, j, pair_type, gap, idx, scores) in enumerate(pairs):
-        kpa, _, _ = store.get(ea, i)
-        kpb, _, _ = store.get(eb, j)
+        kpa = store.get_kp(ea, i)  # host-side pixel coords for the geometric gate
+        kpb = store.get_kp(eb, j)
         pts_a, pts_b = kpa[idx[:, 0]], kpb[idx[:, 1]]
         buf_pts[ea].append(pts_a); buf_meta[ea].append((pair_idx, "a", pts_a.shape[0]))
         buf_pts[eb].append(pts_b); buf_meta[eb].append((pair_idx, "b", pts_b.shape[0]))
@@ -410,7 +517,7 @@ def gate_stereo_chunk(store, eligible_stereo, cams, args, out_f):
             "idx_a": idx[inlier, 0].tolist(), "idx_b": idx[inlier, 1].tolist(),
             "rejected_idx_a": idx[~inlier, 0].tolist(), "rejected_idx_b": idx[~inlier, 1].tolist(),
         }
-        out_f.write(json.dumps(rec) + "\n")
+        out_f.write(rec)
 
 
 def collect_temporal_pairs(store, eligible_temporal, cams, args, accum):
@@ -514,7 +621,7 @@ def gate_temporal_all(accum, theta_tol_ours, args, out_f):
                 "rejected_idx_a": idx[~full_inlier, 0].tolist(),
                 "rejected_idx_b": idx[~full_inlier, 1].tolist(),
             }
-            out_f.write(json.dumps(rec) + "\n")
+            out_f.write(rec)
             n_written += 1
         print(f"  temporal RANSAC batch {bi // B + 1}/{n_full_batches} done "
               f"({n_written}/{len(accum)} pairs written)", flush=True)
@@ -585,14 +692,14 @@ def main():
 
     n_pairs = 0
     temporal_accum = []  # (eye_a, i, eye_b, j, gap, idx, pts_a2d, pts_b2d) -- WHOLE VIDEO
-    with open(out_path, "w") as out_f:
+    with AsyncJsonlWriter(out_path) as out_f:
         for chunk_start in range(0, n_frames, args.chunk_frames):
             chunk_end = min(chunk_start + args.chunk_frames, n_frames)
             specs = chunk_pair_specs(chunk_start, chunk_end, n_frames, gaps)
 
             # Bulk-prefetch every frame this chunk's specs can touch BEFORE
-            # the per-pair store.get() calls in match_batch -- temporal pairs
-            # look up to max(gaps) frames past chunk_end, so the prefetch
+            # the per-pair store.get_gpu() calls in match_batch -- temporal
+            # pairs look up to max(gaps) frames past chunk_end, so the prefetch
             # window extends that far too. See prefetch_range's docstring for
             # why this matters (a LOT, for a full-video run).
             prefetch_end = min(chunk_end + max(gaps), n_frames)
