@@ -49,7 +49,10 @@ _REJECT = {"n": 0}   # count of hands rejected for implausible triangulation
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("video", help="8-bit stereo video (left|right side-by-side)")
+    p.add_argument("left", help="left-eye video (torchcodec decodes the 10-bit "
+                                "per-eye files fine, ~51fps -- no side-by-side "
+                                "8-bit transcode needed)")
+    p.add_argument("right", help="right-eye video")
     p.add_argument("--out", required=True)
     p.add_argument("--calib-dir", default="../../long-test1")
     p.add_argument("--left-serial", default="046060323008")
@@ -213,22 +216,25 @@ def main():
     pipe, dev, dtype = W.build_pipeline(args.fp32)
     calib = load_calib(args.calib_dir, args.left_serial, args.right_serial, dev)
 
+    # Two per-eye files: decode each on-GPU, slice nothing. torchcodec decodes
+    # the 10-bit HEVC per-eye files at ~51fps (fine for a one-shot run) and
+    # skips the side-by-side 8-bit transcode + its disk cost entirely.
     from torchcodec.decoders import VideoDecoder
-    dec = VideoDecoder(args.video, device="cuda")
-    total = dec.metadata.num_frames
-    half = dec.metadata.width // 2
+    dec_l = VideoDecoder(args.left, device="cuda")
+    dec_r = VideoDecoder(args.right, device="cuda")
+    total = min(dec_l.metadata.num_frames, dec_r.metadata.num_frames)
     n_frames = total if args.max_frames is None else min(total, args.max_frames)
     writer = open(os.path.join(args.out, "hands.jsonl"), "w")
-    print(f"{args.video}: {dec.metadata.width}x{dec.metadata.height}, "
+    print(f"{args.left} + {args.right}: "
+          f"{dec_l.metadata.width}x{dec_l.metadata.height} per eye, "
           f"processing {n_frames} (chunk={args.chunk}, vit_batch={args.vit_batch})")
 
     t0 = time.time()
     done = 0
     for cs in range(0, n_frames, args.chunk):
         idxs = list(range(cs, min(cs + args.chunk, n_frames)))
-        batch = dec.get_frames_in_range(start=idxs[0], stop=idxs[-1] + 1).data
-        fl = batch[:, :, :, :half].contiguous()
-        fr = batch[:, :, :, half:].contiguous()
+        fl = dec_l.get_frames_in_range(start=idxs[0], stop=idxs[-1] + 1).data
+        fr = dec_r.get_frames_in_range(start=idxs[0], stop=idxs[-1] + 1).data
         run_chunk(pipe, dtype, calib, fl, fr, idxs, args.conf, args.vit_batch,
                   args.out_size, writer)
         done += len(idxs)
