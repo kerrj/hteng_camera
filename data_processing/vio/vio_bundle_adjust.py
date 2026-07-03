@@ -15,11 +15,13 @@ IMU/gravity priors alone don't fix scale/position). Rotation stays a free
 SE3Var refined jointly with imu_rotation_cost, unlike GLOMAP's own
 two-phase (fixed-rotation) pipeline.
 
-Outlier handling: after the first solve, observations whose angular
-residual (ray vs point direction) exceeds --filter-max-angle-deg are
-dropped, landmarks left with <2 observations are removed, and the problem
-is re-solved warm-started from the first solution (--filter-rounds times).
-Per-landmark median residuals are saved for the visualizer to threshold on.
+Outlier handling: a single robust (--robust-loss, default Cauchy) positioning
+loss down-weights geometric outliers continuously during the solve, via
+jaxls's recommended IRLS reweighting (residual * sqrt of a stop_gradient'd
+weight). This replaces the old hard filter-and-resolve rounds -- there is now
+one solve over all observations, no problem rebuild/recompile per round.
+Per-landmark median residuals are still saved for the visualizer to threshold
+on.
 
 Optional --translation-smoothness-weight adds a 2nd-derivative (constant-
 velocity) prior over consecutive pose triples' camera position, to damp
@@ -64,8 +66,24 @@ def parse_args():
                     help="cap the number of (left-eye) frames included")
     p.add_argument("--profile-compile", action="store_true",
                     help="time JIT compile vs. cached per-iteration solve separately")
-    p.add_argument("--huber-delta", type=float, default=0.1,
-                    help="Huber delta on the positioning residual (unitless, [0,1]-scale)")
+    p.add_argument("--robust-loss", choices=("huber", "cauchy", "geman_mcclure"),
+                    default="cauchy",
+                    help="M-estimator on the positioning residual: escalating "
+                         "outlier suppression huber < cauchy < geman_mcclure. "
+                         "cauchy's heavier 1/r^2 tail replaces the old hard "
+                         "filter-and-resolve rounds (now removed)")
+    p.add_argument("--robust-scale", "--huber-delta", dest="robust_scale",
+                    type=float, default=0.05,
+                    help="scale constant of the robust loss (weight=0.5 at "
+                         "residual=this). On the GLOMAP bounded-residual scale "
+                         "(residual is ~[0,1] sin-theta, inliers ~0.02-0.05 = "
+                         "1-3deg), NOT pixels or unit-variance -- so it is much "
+                         "smaller than the guide's c=2.385 default; ~0.05 (~3deg) "
+                         "sits at the inlier/outlier knee")
+    p.add_argument("--anchor-weight", type=float, default=1000.0,
+                    help="weight of the quadratic gauge-fix prior pinning pose 0 "
+                         "to identity (replaces a hard equality constraint, so the "
+                         "solve skips jaxls's Augmented Lagrangian outer loop)")
     p.add_argument("--imu-rot-weight", type=float, default=100.0,
                     help="weight on the IMU relative-rotation residual")
     p.add_argument("--gravity-weight", type=float, default=1.0,
@@ -77,21 +95,16 @@ def parse_args():
                          "damps position zigzag/cusps; 0 disables. Widens the "
                          "pose-pose coupling from immediate-neighbor to "
                          "skip-one, so watch --profile-compile if raising this")
-    p.add_argument("--pose-init-noise", type=float, default=0.3,
-                    help="std (m) of random translation init per pose; rotation "
-                         "starts at identity, refined by the IMU factor")
+    p.add_argument("--pose-init-noise", type=float, default=1.0,
+                    help="std (m) of random translation init per pose (a random "
+                         "position prior, NOT a smooth/linear guess -- see init "
+                         "code); rotation is warm-started from the integrated IMU "
+                         "relative-rotation chain, not identity")
     p.add_argument("--landmark-init-noise", type=float, default=1.0,
                     help="std (m) of random landmark init, centered at --init-depth")
     p.add_argument("--init-depth", type=float, default=1.0,
                     help="landmark init ball center depth (m)")
     p.add_argument("--pose-init-seed", type=int, default=0)
-    p.add_argument("--filter-rounds", type=int, default=1,
-                    help="after the initial solve, drop outlier observations and "
-                         "re-solve (warm-started) this many times; 0 disables")
-    p.add_argument("--filter-max-angle-deg", type=float, default=5.0,
-                    help="observations whose angular residual (observed ray vs "
-                         "point direction) exceeds this are dropped between rounds; "
-                         "landmarks left with <2 observations are removed")
     p.add_argument("--max-iterations", type=int, default=100)
     p.add_argument("--linear-solver", choices=("conjugate_gradient", "dense_cholesky", "cholmod"),
                     default="conjugate_gradient",
@@ -166,11 +179,22 @@ class ScaleVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.zeros(())):
 
 
 @jaxls.Cost.factory
-def positioning_cost(vals, pose_var, point_var, scale_var, ray_cam, rel_wxyz_xyz, huber_delta):
+def positioning_cost(vals, pose_var, point_var, scale_var, ray_cam, rel_wxyz_xyz,
+                     robust_scale, robust_kind):
     """GLOMAP-style positioning residual. T_wc = T_rel @ T_wl: proper SE3
     kinematic chain to the observing camera's world pose (T_rel = identity
     for left eye, the calibrated stereo transform for right eye) -- NOT a
-    position offset, so the stereo baseline translation is never dropped."""
+    position offset, so the stereo baseline translation is never dropped.
+
+    Robust reweighting uses jaxls's recommended IRLS pattern (residual scaled
+    by sqrt of a stop_gradient'd weight -- no explicit outer loop). robust_kind
+    selects the M-estimator, escalating outlier suppression: 0=Huber (mild,
+    ~1/r tail), 1=Cauchy (heavier, ~1/r^2 tail), 2=Geman-McClure (redescending,
+    ~1/r^4). A heavy loss lets the solve down-weight geometric outliers
+    continuously instead of leaning on hard filter-and-resolve rounds. NOTE:
+    robust_scale is on the GLOMAP bounded-residual scale (residual is ~[0,1]
+    sin-theta at the optimal d_ik), NOT pixels -- so it needs its own tuning,
+    not a pixel-space or unit-variance default."""
     T_wl = vals[pose_var]
     T_rel = jaxlie.SE3(rel_wxyz_xyz)
     T_wc = T_rel @ T_wl
@@ -182,7 +206,11 @@ def positioning_cost(vals, pose_var, point_var, scale_var, ray_cam, rel_wxyz_xyz
     d_ik = jnp.exp(vals[scale_var])
     residual = ray_world - d_ik * (point_world - cam_pos_world)
     abs_r = jnp.linalg.norm(residual) + 1e-9
-    weight = jax.lax.stop_gradient(jnp.where(abs_r > huber_delta, huber_delta / abs_r, 1.0))
+    x2 = (abs_r / robust_scale) ** 2
+    w_huber = jnp.where(abs_r > robust_scale, robust_scale / abs_r, 1.0)
+    w_cauchy = 1.0 / (1.0 + x2)
+    w_gm = 1.0 / (1.0 + x2) ** 2
+    weight = jax.lax.stop_gradient(jnp.stack([w_huber, w_cauchy, w_gm])[robust_kind])
     return residual * jnp.sqrt(weight)
 
 
@@ -201,8 +229,13 @@ def imu_rotation_cost(vals, pose_i, pose_j, delta_R_wxyz, weight):
 
 @jaxls.Cost.factory
 def gravity_cost(vals, pose_var, world_gravity_dir, measured_down_cam, weight):
-    """Anchors roll/pitch (not yaw) against the anchor frame's measured
-    gravity direction, weighted by --gravity-weight * per-frame confidence."""
+    """Absolute roll/pitch prior (not yaw): the world is gravity-aligned with
+    world +z UP, so gravity/down is world -z (world_gravity_dir = [0,0,-1]).
+    Every frame's rotation should map that world-down onto its own IMU-measured
+    down. Applies to ALL frames incl. frame 0 -- world orientation is defined by
+    gravity, not by pinning cam0 to identity. Yaw about gravity is unconstrained
+    here (a global yaw rotation leaves this residual unchanged). Weighted by
+    --gravity-weight * per-frame confidence."""
     R_wl = vals[pose_var].rotation()
     down_pred_cam = R_wl @ world_gravity_dir
     return (down_pred_cam - measured_down_cam) * weight
@@ -221,11 +254,18 @@ def translation_smoothness_cost(vals, pose_a, pose_b, pose_c, weight):
     return accel * weight
 
 
-@jaxls.Cost.factory(kind="constraint_eq_zero")
-def anchor_cost(vals, pose_var, target_wxyz_xyz):
-    """Hard equality constraint gauge-fixing one pose."""
-    target = jaxlie.SE3(target_wxyz_xyz)
-    return (vals[pose_var].inverse() @ target).log()
+@jaxls.Cost.factory
+def anchor_cost(vals, pose_var, weight):
+    """Translation-only gauge fix: pin camera 0 to the world origin (its SE3
+    translation is zero, hence its centre -R^T t is too). Rotation is left
+    FREE -- world orientation is fixed by the gravity prior (world +z = up,
+    gravity along -z), except global yaw about gravity, which is an intentional
+    remaining gauge freedom (no absolute yaw sensor; the solve keeps whatever
+    the init picked). This pins only 3 DOF, vs a full SE3 pin that would also
+    force cam0 to identity rotation. A high-weight quadratic prior, NOT a hard
+    equality constraint, so the solve stays out of jaxls's Augmented Lagrangian
+    path."""
+    return vals[pose_var].translation() * weight
 
 
 def main():
@@ -324,16 +364,51 @@ def main():
     rel_wxyz_xyz = np.where(
         obs_is_right[:, None], rel_wxyz_xyz_right[None, :], rel_wxyz_xyz_left[None, :])
 
-    # Pose init: identity rotation, random translation (frame 0 excluded,
-    # gauge-fixed below). jaxlie SE3 tangent is (x,y,z,omega...) -- filling
-    # only [:3] gives pure translation.
+    # Pose init: ROTATIONS warm-started by integrating the IMU relative-rotation
+    # chain from a gravity-aligned cam-0 seed (see below), instead of starting
+    # every pose at identity and making the stiff imu_rotation_cost drag it into
+    # place over many iterations. This is the IMU analog of GLOMAP's rotation-
+    # averaging warm start (there: MST-propagate relative rotations; here:
+    # propagate the measured inter-frame gyro rotations we already have).
+    # TRANSLATIONS stay random -- a random position prior conditions the GLOMAP
+    # positioning cost better than a wrong smooth/linear guess would.
+    #
+    # SE3Var is WORLD->CAMERA, so imu_rotation_cost's delta = R_a @ R_b^-1 for a
+    # consecutive edge a->b (b == a+1), giving R_b = delta^-1 @ R_a. Build a
+    # per-pose "delta from previous" quat (identity where a consecutive valid IMU
+    # edge is missing -- e.g. across a dropped-timestamp frame, so the chain just
+    # holds the last rotation), then left-fold it in one O(n) lax.scan.
+    delta_prev = np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (n_frames, 1))
+    consec = (new_edge_b == new_edge_a + 1) & rel_valid_orig
+    delta_prev[new_edge_b[consec]] = new_rel_quat[consec]
+
+    def _chain_step(R_prev_wxyz, delta_wxyz):
+        R_k = jaxlie.SO3(delta_wxyz).inverse() @ jaxlie.SO3(R_prev_wxyz)
+        return R_k.wxyz, R_k.wxyz
+
+    # Seed cam-0's rotation so world-down (-z) maps to its measured down
+    # (shortest-arc; yaw about gravity left at 0 -- it's a free gauge), so the
+    # gravity-aligned chain starts consistent with the gravity prior. cam-0 is
+    # therefore generally NOT identity rotation. Half-arc quat from a=[0,0,-1]
+    # to b=g0 is [1 + a.b, a x b] normalized (falls back to 180deg if antipar.).
+    g0 = np.asarray(gravity_cam[0], dtype=np.float64)
+    g0 = g0 / (np.linalg.norm(g0) + 1e-12)
+    a_down = np.array([0.0, 0.0, -1.0])
+    q0 = np.array([1.0 + a_down @ g0, *np.cross(a_down, g0)])
+    if np.linalg.norm(q0) < 1e-6:  # g0 ~ +z (antiparallel to world-down)
+        q0 = np.array([0.0, 1.0, 0.0, 0.0])
+    r0_wxyz = jnp.asarray(q0 / np.linalg.norm(q0), dtype=jnp.float32)
+    _, rot_rest = jax.lax.scan(
+        _chain_step, r0_wxyz, jnp.asarray(delta_prev[1:], dtype=jnp.float32))
+    rot_init_wxyz = jnp.concatenate([r0_wxyz[None, :], rot_rest], axis=0)
+
     key = jax.random.PRNGKey(args.pose_init_seed)
     key, sub = jax.random.split(key)
-    tangent = jnp.zeros((n_frames, 6))
     trans_noise = jax.random.normal(sub, (n_frames, 3)) * args.pose_init_noise
-    tangent = tangent.at[:, :3].set(trans_noise)
-    tangent = tangent.at[0].set(0.0)
-    pose_init = jax.vmap(lambda t: jaxlie.SE3.exp(t))(tangent)
+    trans_noise = trans_noise.at[0].set(0.0)  # anchor: cam0 centre at world origin
+    pose_init = jax.vmap(
+        lambda q, t: jaxlie.SE3.from_rotation_and_translation(jaxlie.SO3(q), t)
+    )(rot_init_wxyz, trans_noise)
 
     # Landmark init: random ball around (0, 0, --init-depth).
     key, sub = jax.random.split(key)
@@ -342,25 +417,29 @@ def main():
 
     keep_edge = rel_valid_orig
     print(f"{int(keep_edge.sum())} IMU relative-rotation edges")
-    world_gravity_dir = jnp.asarray(gravity_cam[0])[None, :]
+    # World is gravity-aligned, +z UP -> gravity/down is world -z. Every frame's
+    # gravity_cost pulls its rotation to map this onto its measured down.
+    world_gravity_dir = jnp.array([[0.0, 0.0, -1.0]], dtype=jnp.float32)
     per_frame_weight = args.gravity_weight * gravity_weight
 
     camera_vars = jaxls.SE3Var(id=jnp.arange(n_frames))
     point_vars = Point3Var(id=jnp.arange(n_points))
+    robust_kind = {"huber": 0, "cauchy": 1, "geman_mcclure": 2}[args.robust_loss]
 
-    def solve_round(obs_mask, pose_init, point_init, scale_init):
-        """Build the problem on the observation subset and solve. scale_init
-        is (n_obs_kept,) matching obs_mask's surviving rows in order."""
-        n_kept = int(obs_mask.sum())
-        scale_vars = ScaleVar(id=jnp.arange(n_kept))
+    def solve_round(pose_init, point_init, scale_init):
+        """Build the full problem (all observations) and solve. The robust
+        positioning loss handles geometric outliers in-solve, so there is no
+        filter-and-resolve loop -- a single solve on every observation."""
+        scale_vars = ScaleVar(id=jnp.arange(n_obs))
         costs = [
             positioning_cost(
-                jaxls.SE3Var(id=jnp.asarray(pose_ids[obs_mask])),
-                Point3Var(id=jnp.asarray(point_ids[obs_mask])),
-                ScaleVar(id=jnp.arange(n_kept)),
-                jnp.asarray(ray_cam[obs_mask]),
-                jnp.asarray(rel_wxyz_xyz[obs_mask]),
-                args.huber_delta,
+                jaxls.SE3Var(id=jnp.asarray(pose_ids)),
+                Point3Var(id=jnp.asarray(point_ids)),
+                ScaleVar(id=jnp.arange(n_obs)),
+                jnp.asarray(ray_cam),
+                jnp.asarray(rel_wxyz_xyz),
+                jnp.asarray(args.robust_scale),
+                robust_kind,
             ),
         ]
         if keep_edge.sum() > 0:
@@ -368,7 +447,7 @@ def main():
                 jaxls.SE3Var(id=jnp.asarray(new_edge_a[keep_edge])),
                 jaxls.SE3Var(id=jnp.asarray(new_edge_b[keep_edge])),
                 jnp.asarray(new_rel_quat[keep_edge]),
-                args.imu_rot_weight,
+                jnp.asarray(args.imu_rot_weight),
             ))
         costs.append(gravity_cost(
             jaxls.SE3Var(id=jnp.arange(n_frames)),
@@ -378,14 +457,14 @@ def main():
         ))
         costs.append(anchor_cost(
             jaxls.SE3Var(id=jnp.array([0])),
-            jnp.asarray(jaxlie.SE3.identity().wxyz_xyz)[None, :],
+            jnp.asarray(args.anchor_weight),
         ))
         if args.translation_smoothness_weight > 0 and n_frames >= 3:
             costs.append(translation_smoothness_cost(
                 jaxls.SE3Var(id=jnp.arange(n_frames - 2)),
                 jaxls.SE3Var(id=jnp.arange(1, n_frames - 1)),
                 jaxls.SE3Var(id=jnp.arange(2, n_frames)),
-                args.translation_smoothness_weight,
+                jnp.asarray(args.translation_smoothness_weight),
             ))
 
         initial_vals = jaxls.VarValues.make([
@@ -461,52 +540,24 @@ def main():
         cos = np.einsum("ni,ni->n", dir_cam, ray_cam[m])
         return np.degrees(np.arccos(np.clip(cos, -1, 1))), p_cam[:, 2]
 
-    obs_mask = np.ones(n_obs, dtype=bool)
     scale_init = jnp.zeros(n_obs)
-    solution, cost_history = solve_round(obs_mask, pose_init, point_init, scale_init)
+    solution, cost_history = solve_round(pose_init, point_init, scale_init)
 
-    for rnd in range(args.filter_rounds):
-        ang, depth = angular_residuals(solution, obs_mask)
-        bad = (ang > args.filter_max_angle_deg) | (depth <= 0)
-        # drop bad observations; then drop landmarks left with <2 obs
-        # (all their remaining observations go too)
-        kept_rows = np.where(obs_mask)[0][~bad]
-        new_mask = np.zeros(n_obs, dtype=bool)
-        new_mask[kept_rows] = True
-        counts = np.bincount(point_ids[new_mask], minlength=n_points)
-        starved = counts < 2
-        new_mask &= ~starved[point_ids]
-        n_dropped_obs = int(obs_mask.sum() - new_mask.sum())
-        n_dropped_pts = int((starved & (np.bincount(point_ids[obs_mask], minlength=n_points) >= 2)).sum())
-        print(f"[filter round {rnd + 1}] dropping {int(bad.sum())} outlier obs "
-              f"(>{args.filter_max_angle_deg} deg or behind camera), "
-              f"{n_dropped_pts} starved landmarks, {n_dropped_obs} obs total")
-        if n_dropped_obs == 0:
-            print("nothing to filter, stopping early")
-            break
-        # warm start everything from the previous solution
-        poses_prev = solution[jaxls.SE3Var]
-        points_prev = solution[Point3Var]
-        scales_prev_full = np.full(n_obs, 0.0)
-        scales_prev_full[obs_mask] = np.asarray(solution[ScaleVar])
-        obs_mask = new_mask
-        solution, cost_history = solve_round(
-            obs_mask, poses_prev, points_prev, jnp.asarray(scales_prev_full[obs_mask]))
-
-    # landmarks that survived filtering (>=1 obs in the final mask)
-    final_counts = np.bincount(point_ids[obs_mask], minlength=n_points)
-    point_alive = final_counts >= 2
-    ang, _ = angular_residuals(solution, obs_mask)
+    # Per-landmark median angular residual for the visualizer to threshold on
+    # (the robust loss already down-weighted outliers in-solve; nothing is
+    # dropped here). point_alive flags landmarks with >=2 observations.
+    ang, _ = angular_residuals(solution)
+    point_alive = np.bincount(point_ids, minlength=n_points) >= 2
     point_med_ang = np.full(n_points, np.nan)
-    order = np.argsort(point_ids[obs_mask], kind="stable")
-    ids_sorted = point_ids[obs_mask][order]
+    order = np.argsort(point_ids, kind="stable")
+    ids_sorted = point_ids[order]
     ang_sorted = ang[order]
     bounds = np.searchsorted(ids_sorted, np.arange(n_points + 1))
     for k in range(n_points):
         if bounds[k + 1] > bounds[k]:
             point_med_ang[k] = np.median(ang_sorted[bounds[k]:bounds[k + 1]])
-    print(f"{int(point_alive.sum())}/{n_points} landmarks survive filtering; "
-          f"surviving median angular residual "
+    print(f"{int(point_alive.sum())}/{n_points} landmarks alive (>=2 obs); "
+          f"median angular residual "
           f"{np.nanmedian(point_med_ang[point_alive]):.3f} deg")
 
     loss_plot_path = args.loss_plot
