@@ -184,6 +184,12 @@ undistorted pinhole crops toward each hand.
 
 - Keep all scripts/files for this pipeline under `data_processing/hands/`.
 - Record any new package added to `eyeball211` in `README.md` + here.
+- **Output location:** `wilor_hands_pinhole.py` and `stereo_optimize.py` default
+  their outputs into `<recording>/derived/` (`hands.jsonl`,
+  `hands3d_<hand>.jsonl`), reading `--calib-dir` as the recording dir — same
+  `derived/` convention as `../vio/` (replaced the old
+  `data_processing/hands/out/...` tree 2026-07-03). Pass `--out`/`--jsonl` to
+  override. Raw inputs (`left.mp4`, `calib_*.json`) stay in the recording root.
 
 ### Stereo MANO optimization (step 2) — status + key findings (2026-06-25)
 

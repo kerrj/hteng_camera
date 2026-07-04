@@ -90,10 +90,10 @@ def parse_args():
     p.add_argument("recording")
     p.add_argument("--matches", default=None, nargs="+",
                     help="one or more match files, concatenated (default: "
-                         "<recording>/matches.jsonl). Add loop_matches.jsonl as a "
-                         "2nd file for loop closure")
-    p.add_argument("--features", default=None, help="default: <recording>/features.h5")
-    p.add_argument("--out", default=None, help="default: <recording>/tracks.jsonl")
+                         "<recording>/derived/matches.jsonl). Add loop_matches.jsonl "
+                         "as a 2nd file for loop closure")
+    p.add_argument("--features", default=None, help="default: <recording>/derived/features.h5")
+    p.add_argument("--out", default=None, help="default: <recording>/derived/tracks.jsonl")
     p.add_argument("--min-observations", type=int, default=3)
     p.add_argument("--min-frames", type=int, default=15,
                     help="drop tracks seen in fewer than this many DISTINCT frames "
@@ -195,9 +195,10 @@ def edge_priority(rec):
 
 def main():
     args = parse_args()
-    matches_paths = args.matches or [os.path.join(args.recording, "matches.jsonl")]
-    features_path = args.features or os.path.join(args.recording, "features.h5")
-    out_path = args.out or os.path.join(args.recording, "tracks.jsonl")
+    matches_paths = args.matches or [os.path.join(args.recording, "derived", "matches.jsonl")]
+    features_path = args.features or os.path.join(args.recording, "derived", "features.h5")
+    out_path = args.out or os.path.join(args.recording, "derived", "tracks.jsonl")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     recs = []
     for mp in matches_paths:

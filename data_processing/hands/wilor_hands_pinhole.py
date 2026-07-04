@@ -53,7 +53,8 @@ def parse_args():
                                 "per-eye files fine, ~51fps -- no side-by-side "
                                 "8-bit transcode needed)")
     p.add_argument("right", help="right-eye video")
-    p.add_argument("--out", required=True)
+    p.add_argument("--out", default=None,
+                   help="output dir for hands.jsonl (default: <calib-dir>/derived)")
     p.add_argument("--calib-dir", default="../../long-test1")
     p.add_argument("--left-serial", default="046060323008")
     p.add_argument("--right-serial", default="046060323001")
@@ -212,6 +213,8 @@ def run_chunk(pipe, dtype, calib, frames_l_u8, frames_r_u8, frame_idxs,
 
 def main():
     args = parse_args()
+    if args.out is None:
+        args.out = os.path.join(args.calib_dir, "derived")
     os.makedirs(args.out, exist_ok=True)
     pipe, dev, dtype = W.build_pipeline(args.fp32)
     calib = load_calib(args.calib_dir, args.left_serial, args.right_serial, dev)

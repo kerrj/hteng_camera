@@ -28,11 +28,13 @@ Results are converted from the per-frame left-virtual frame back to the common
 LEFT-FISHEYE (optical-axis) frame before saving (joints_3d_cam, trans, depth_m,
 global_orient_R), so they're comparable across frames.
 
-Run:  python stereo_optimize.py --jsonl out/pinhole_stereo/hands.jsonl \
-          --mano /tmp/mano_jax.npz --out out/pinhole_stereo/hands3d.jsonl
+Run:  python stereo_optimize.py --calib-dir ../../long-test2 --hand right
+      (reads <calib-dir>/derived/hands.jsonl, writes
+       <calib-dir>/derived/hands3d_<hand>.jsonl; override with --jsonl/--out)
 """
 import argparse
 import json
+import os
 
 import jax
 import jax.numpy as jnp
@@ -399,9 +401,11 @@ def build_data(jsonl, calib_dir, left_serial, right_serial, hand,
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--jsonl", required=True)
+    ap.add_argument("--jsonl", default=None,
+                    help="pinhole hands.jsonl (default: <calib-dir>/derived/hands.jsonl)")
     ap.add_argument("--mano", default="/tmp/mano_jax.npz")
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", default=None,
+                    help="output (default: <calib-dir>/derived/hands3d_<hand>.jsonl)")
     ap.add_argument("--calib-dir", default="../../long-test1")
     ap.add_argument("--left-serial", default="046060323008")
     ap.add_argument("--right-serial", default="046060323001")
@@ -455,6 +459,12 @@ def main():
                          "conjugate_gradient (default; fastest here once singular "
                          "frames are rejected) | dense_cholesky | cholmod")
     args = ap.parse_args()
+    derived = os.path.join(args.calib_dir, "derived")
+    if args.jsonl is None:
+        args.jsonl = os.path.join(derived, "hands.jsonl")
+    if args.out is None:
+        args.out = os.path.join(derived, f"hands3d_{args.hand}.jsonl")
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     M = MJ.load_mano(args.mano)
     data, t_init, frames, Rvl_arr, want_right = build_data(

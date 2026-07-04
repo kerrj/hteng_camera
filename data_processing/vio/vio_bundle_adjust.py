@@ -51,10 +51,10 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("recording")
-    p.add_argument("--tracks", default=None, help="default: <recording>/tracks.jsonl")
+    p.add_argument("--tracks", default=None, help="default: <recording>/derived/tracks.jsonl")
     p.add_argument("--imu-relative", default=None,
-                    help="default: <recording>/imu_relative.npz")
-    p.add_argument("--out", default=None, help="default: <recording>/trajectory.npz")
+                    help="default: <recording>/derived/imu_relative.npz")
+    p.add_argument("--out", default=None, help="default: <recording>/derived/trajectory.npz")
     p.add_argument("--n-frames", type=int, default=None,
                     help="cap the number of (left-eye) frames included")
     p.add_argument("--profile-compile", action="store_true",
@@ -236,9 +236,10 @@ def translation_smoothness_cost(vals, pose_a, pose_b, pose_c, weight):
 
 def main():
     args = parse_args()
-    tracks_path = args.tracks or os.path.join(args.recording, "tracks.jsonl")
-    imu_path = args.imu_relative or os.path.join(args.recording, "imu_relative.npz")
-    out_path = args.out or os.path.join(args.recording, "trajectory.npz")
+    tracks_path = args.tracks or os.path.join(args.recording, "derived", "tracks.jsonl")
+    imu_path = args.imu_relative or os.path.join(args.recording, "derived", "imu_relative.npz")
+    out_path = args.out or os.path.join(args.recording, "derived", "trajectory.npz")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     imu = np.load(imu_path)
     frame_idx = imu["frame_idx"]
@@ -286,7 +287,7 @@ def main():
     print(f"{n_frames} pose frames (idx {frame_idx[0]}..{max_frame})")
 
     import h5py
-    features_path = os.path.join(args.recording, "features.h5")
+    features_path = os.path.join(args.recording, "derived", "features.h5")
     with h5py.File(features_path, "r") as f:
         ls_serial = f.attrs["left_serial"]
         rs_serial = f.attrs["right_serial"]
@@ -565,7 +566,7 @@ def main():
           f"median angular residual "
           f"{np.nanmedian(point_med_ang[point_alive]):.3f} deg")
 
-    loss_plot_path = args.loss_plot or os.path.join(args.recording, "loss_curve.png")
+    loss_plot_path = args.loss_plot or os.path.join(args.recording, "derived", "loss_curve.png")
     if loss_plot_path:
         import matplotlib
         matplotlib.use("Agg")

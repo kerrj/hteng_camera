@@ -158,8 +158,8 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("recording", help="recording dir with calib_*.json/stereo_*.json")
-    p.add_argument("--features", default=None, help="default: <recording>/features.h5")
-    p.add_argument("--out", default=None, help="default: <recording>/matches.jsonl")
+    p.add_argument("--features", default=None, help="default: <recording>/derived/features.h5")
+    p.add_argument("--out", default=None, help="default: <recording>/derived/matches.jsonl")
     p.add_argument("--max-frames", type=int, default=None)
     p.add_argument("--match-conf-thresh", type=float, default=0.2)
     p.add_argument("--min-raw-matches", type=int, default=10,
@@ -644,8 +644,9 @@ def chunk_pair_specs(chunk_start, chunk_end, n_frames, gaps):
 
 def main():
     args = parse_args()
-    features_path = args.features or os.path.join(args.recording, "features.h5")
-    out_path = args.out or os.path.join(args.recording, "matches.jsonl")
+    features_path = args.features or os.path.join(args.recording, "derived", "features.h5")
+    out_path = args.out or os.path.join(args.recording, "derived", "matches.jsonl")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     gaps = build_temporal_gaps(args.dense_max, args.mid_max, args.mid_stride,
                                 args.far_max, args.far_stride,
                                 args.longest_max, args.longest_stride)

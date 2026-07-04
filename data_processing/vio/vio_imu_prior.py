@@ -50,7 +50,7 @@ def parse_args():
     p.add_argument("--sync-log", default=None, help="default: <recording>/sync_log.csv")
     p.add_argument("--recording-json", default=None,
                     help="default: <recording>/recording.json")
-    p.add_argument("--out", default=None, help="default: <recording>/imu_relative.npz")
+    p.add_argument("--out", default=None, help="default: <recording>/derived/imu_relative.npz")
     p.add_argument("--gravity-half-window-ms", type=float, default=50.0,
                     help="accel samples within +-this many ms of a frame's timestamp "
                          "are averaged to estimate that frame's gravity direction")
@@ -175,7 +175,8 @@ def main():
     imu_log_path = args.imu_log or os.path.join(args.recording, "imu_log.csv")
     sync_log_path = args.sync_log or os.path.join(args.recording, "sync_log.csv")
     rec_json_path = args.recording_json or os.path.join(args.recording, "recording.json")
-    out_path = args.out or os.path.join(args.recording, "imu_relative.npz")
+    out_path = args.out or os.path.join(args.recording, "derived", "imu_relative.npz")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     rec = json.load(open(rec_json_path))
     if not rec.get("imu", {}).get("enabled"):

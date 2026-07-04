@@ -18,6 +18,14 @@ hand_cam(t)`.
 pipelines import it — everything else is domain-specific and lives in the
 subfolder it belongs to.
 
+`visualize_data.py` is the shared viser viewer: VIO camera trajectory +
+landmark point cloud (from `vio/vio_bundle_adjust.py`'s `trajectory.npz`),
+optionally composed with hand meshes FK'd from `hands/stereo_optimize.py`'s
+stereo3d jsonl output (`hand_world(t) = T_cam_world(t) @ hand_cam(t)`, same
+composition rule as above) via `--hands-left`/`--hands-right`. Hands are
+skipped automatically if those args aren't passed. Lives at this top level
+(not under `vio/`) since it now spans both pipelines.
+
 ## Data: `long-test1/`
 
 Stereo fisheye recording, at the repo root (`~/hteng_camera/long-test1/` on

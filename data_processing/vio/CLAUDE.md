@@ -108,10 +108,13 @@ See `../CLAUDE.md` for the shared recording/calibration description.
 ## Pipeline stages
 
 Mirrors the hand pipeline's `hands.jsonl → hands3d.jsonl` staged-script style
-— each stage independently re-runnable/cacheable, under
-`data_processing/vio/out/<recording_name>/` (mirrors `../hands/out/...`'s
-actual convention, NOT the `data_processing/out/vio/...` this doc originally
-sketched before any code existed).
+— each stage independently re-runnable/cacheable. **All products default into
+`<recording>/derived/`** (next to the raw `left.mp4`/`imu_log.csv`/`calib_*.json`
+inputs, which stay in the recording root) so there's no separate output-tree
+bookkeeping — just point every stage at the recording dir and omit `--out`.
+Each stage's `--out`/`--features`/`--tracks`/… still override individually.
+(Older runs used `data_processing/vio/out/<recording_name>/`; the `derived/`
+default replaced it 2026-07-03 — the hand pipeline uses the same convention.)
 
 | Stage | Script | Input | Output | Notes |
 |---|---|---|---|---|
@@ -167,20 +170,19 @@ made the ghost-cluster loop-closure workaround largely unnecessary.
 
 Visualizers: `vio_visualize_features.py`, `vio_visualize_matches.py`,
 `vio_visualize_tracks.py` (same pattern as the hand pipeline's render
-scripts — see below for tracks specifically), plus two viser-based ones for
-stages 4/5: `vio_visualize_imu_prior.py` (gravity arrow + naive cumulative-
-rotation triad + synced video thumbnail — a fixed-camera acceptance check
-since there's no pose chain at that stage yet) and
-`vio_visualize_trajectory.py` (optimized camera trajectory as left/right
-stereo frustums, colored by eye, + landmark point cloud colored by each
-landmark's ACTUAL sampled video pixel — much more informative than a
-synthetic depth colormap for spotting real-vs-degenerate reconstructions).
-Since the stage-5 world is now gravity-aligned (+z up), viser's up-direction
-is just `+z` — no measured-gravity tilt (that was for the OLD anchor-frame
-world). Has an "outlier heatmap" checkbox: recolors the cloud green→red by
-each landmark's reconstructed Cauchy down-weight (from the saved
-`point_med_ang`), for eyeballing how aggressively the robust loss is filtering
-— on testimu it's barely filtering (median weight 0.994, 0.3% below 0.75).
+scripts — see below for tracks specifically), plus `vio_visualize_imu_prior.py`
+(gravity arrow + naive cumulative-rotation triad + synced video thumbnail — a
+fixed-camera acceptance check since there's no pose chain at that stage yet).
+Stage 5's trajectory+point-cloud viewer moved up to
+`data_processing/visualize_data.py` (generic across pipelines — see
+`../CLAUDE.md`): optimized camera trajectory as left/right stereo frustums,
+colored by eye, + landmark point cloud colored by each landmark's ACTUAL
+sampled video pixel — much more informative than a synthetic depth colormap
+for spotting real-vs-degenerate reconstructions. Since the stage-5 world is
+gravity-aligned (+z up), viser's up-direction is just `+z` — no measured-
+gravity tilt (that was for the OLD anchor-frame world). Video thumbnail
+decodes via torchcodec for fast scrubbing. Static trail frustums are drawn
+thin so the bright current-frame frustums pop.
 
 Tracks (stage 3's viz) are rendered as colored "comet" dots (golden-ratio
 hue spacing per track) with fading trajectory tails — `--tracks-per-frame 0`

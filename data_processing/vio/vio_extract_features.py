@@ -41,7 +41,7 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("recording", help="recording dir with left.mp4/right.mp4/recording.json")
-    p.add_argument("--out", default=None, help="output .h5 (default: <recording>/features.h5)")
+    p.add_argument("--out", default=None, help="output .h5 (default: <recording>/derived/features.h5)")
     p.add_argument("--left-serial", default=None, help="default: read from recording.json")
     p.add_argument("--right-serial", default=None)
     p.add_argument("--fov-deg", type=float, default=150.0,
@@ -248,7 +248,8 @@ def main():
     extractor = SuperPoint(max_num_keypoints=args.max_keypoints,
                            detection_threshold=args.detection_threshold).eval().to(device)
 
-    out_path = args.out or os.path.join(args.recording, "features.h5")
+    out_path = args.out or os.path.join(args.recording, "derived", "features.h5")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with h5py.File(out_path, "w") as f:
         f.attrs["format"] = FORMAT_TAG
         f.attrs["fov_deg"] = args.fov_deg
