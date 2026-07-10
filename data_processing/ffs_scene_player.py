@@ -26,22 +26,15 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import fisheye_pinhole as FP
-import hand_mesh as HM
-
-# MANO 21-joint skeleton (matches render_hands_video._BONES)
-_BONES = np.array([(0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
-                   (0, 9), (9, 10), (10, 11), (11, 12), (0, 13), (13, 14), (14, 15),
-                   (15, 16), (0, 17), (17, 18), (18, 19), (19, 20)])
 
 
-def load_hands(path):
-    """frame -> (21,3) joints (left-fisheye frame), or {} if no file."""
-    d = {}
-    if path and os.path.exists(path):
-        for line in open(path):
-            r = json.loads(line)
-            d[r["frame"]] = np.asarray(r["joints_3d_cam"], np.float32)
-    return d
+def load_hand_mesh(path):
+    """Precomputed MANO meshes (precompute_hand_meshes.py): -> ({frame: (778,3)}, faces)."""
+    if not path or not os.path.exists(path):
+        return {}, None
+    d = np.load(path)
+    verts, frames, faces = d["verts"], d["frames"], d["faces"]
+    return {int(f): verts[i] for i, f in enumerate(frames)}, faces
 
 
 class Scene:
@@ -110,19 +103,20 @@ def main():
     ap.add_argument("--out-dir", default="data_processing/out/video")
     ap.add_argument("--port", type=int, default=8092)
     ap.add_argument("--point-size", type=float, default=0.006)
-    ap.add_argument("--max-points", type=int, default=700_000)
-    # *_fisheye.jsonl: joints rotated from the legacy virtual-crop frame into the
-    # left-fisheye frame (fix_hands_frame.py). The raw hands3d_full_*.jsonl are in
-    # the wrong frame and project to the image centre — do not use them directly.
-    ap.add_argument("--hands-left", default="data_processing/out/hands3d_full_left_fisheye.jsonl")
-    ap.add_argument("--hands-right", default="data_processing/out/hands3d_full_right_fisheye.jsonl")
+    ap.add_argument("--max-points", type=int, default=400_000)
+    # Precomputed MANO hand meshes in the left-fisheye frame (778 verts/frame),
+    # from precompute_hand_meshes.py (jkerr's viz_*.jsonl + full-mesh MANO forward).
+    ap.add_argument("--hand-mesh-left", default="data_processing/out/hand_mesh_left.npz")
+    ap.add_argument("--hand-mesh-right", default="data_processing/out/hand_mesh_right.npz")
     ap.add_argument("--selftest", type=int, nargs="*", default=None)
     args = ap.parse_args()
 
     sc = Scene(args.out_dir)
-    hands_L, hands_R = load_hands(args.hands_left), load_hands(args.hands_right)
+    hands_L, facesL = load_hand_mesh(args.hand_mesh_left)
+    hands_R, facesR = load_hand_mesh(args.hand_mesh_right)
+    FACES = facesL if facesL is not None else facesR
     print(f"scene: {sc.total} frames  range-map {sc.Hf}x{sc.Wf}  {len(sc.stacks)} stacks  "
-          f"hands L/R {len(hands_L)}/{len(hands_R)} frames")
+          f"hand-mesh L/R {len(hands_L)}/{len(hands_R)} frames")
 
     if args.selftest is not None:
         for f in (args.selftest or [0]):
@@ -135,10 +129,12 @@ def main():
                 print(f"  frame {f}: empty (not written yet?)")
         return
 
+    import threading
     import viser
     server = viser.ViserServer(port=args.port)
     server.scene.set_up_direction("-y")
     server.scene.add_frame("/left_cam", axes_length=0.15, axes_radius=0.005)
+
     g_frame = server.gui.add_slider("frame", 0, sc.total - 1, 1, 0)
     g_play = server.gui.add_checkbox("play", False)
     g_fps = server.gui.add_slider("fps", 1, 30, 1, 10)
@@ -147,37 +143,49 @@ def main():
     g_hands = server.gui.add_checkbox("show hands", True)
     g_op = server.gui.add_slider("hand opacity", 0.1, 1.0, 0.05, 0.55)
 
-    def draw_hand(name, J, color):
-        if J is None or len(J) == 0:                          # hide when absent
-            server.scene.add_mesh_simple(name, np.zeros((3, 3), np.float32),
-                                         np.array([[0, 1, 2]], np.int32), visible=False)
-            return
-        V, F = HM.hand_mesh(J)
-        server.scene.add_mesh_simple(name, V, F, color=color, opacity=g_op.value,
-                                     side="double", flat_shading=False, cast_shadow=False)
+    # PERSISTENT scene handles, created ONCE and updated IN PLACE each frame
+    # (after jkerr's viz_hands.py). Re-adding rebuilds + re-uploads the whole
+    # object every frame — a ~700k-point cloud re-upload floods the browser and
+    # crashes the tab (plus leaks handler threads). Meshes carry the real FACES
+    # at creation; only .vertices/.visible/.opacity change.
+    pc_h = server.scene.add_point_cloud(
+        "/scene", np.zeros((1, 3), np.float32), np.zeros((1, 3), np.uint8),
+        point_size=args.point_size, point_shape="rounded")
+    tracks = {"left": (hands_L, (40, 220, 40)), "right": (hands_R, (250, 140, 20))}
+    mesh_h = {name: server.scene.add_mesh_simple(
+                  f"/hand_{name}", np.zeros((778, 3), np.float32), FACES, color=color,
+                  opacity=0.55, side="double", flat_shading=False,
+                  cast_shadow=False, visible=False)
+              for name, (_, color) in tracks.items()}
 
-    def show(f):
-        f = int(f)
-        p, c = sc.reconstruct(f, g_mr.value, args.max_points)
-        server.scene.add_point_cloud("/scene", points=p, colors=c,
-                                     point_size=g_ps.value, point_shape="rounded")
-        draw_hand("/hands/left", hands_L.get(f) if g_hands.value else None, (40, 220, 40))
-        draw_hand("/hands/right", hands_R.get(f) if g_hands.value else None, (250, 140, 20))
+    # the play loop and the scrub/slider callbacks fire on different threads;
+    # serialize the whole render so two updates can't interleave on the shared
+    # handles or the (thread-unsafe) cv2 decoder inside reconstruct().
+    _lock = threading.Lock()
 
-    # ALL decoding happens in this thread only: cv2.VideoCapture is not
-    # thread-safe (concurrent reads abort libavcodec). GUI callbacks run on
-    # viser's websocket threads, so they must NOT decode — they only mutate
-    # widget state, and this loop re-renders whenever anything changes.
-    show(0)
-    last = (0, g_ps.value, g_mr.value, g_hands.value, g_op.value)
+    def update(_=None):
+        with _lock:
+            fr = int(g_frame.value)
+            p, c = sc.reconstruct(fr, g_mr.value, args.max_points)
+            pc_h.points, pc_h.colors, pc_h.point_size = p, c, g_ps.value
+            for name, (track, _color) in tracks.items():
+                V = track.get(fr)
+                if V is None or not g_hands.value:
+                    mesh_h[name].visible = False
+                else:
+                    mesh_h[name].vertices = V.astype(np.float32)
+                    mesh_h[name].opacity = g_op.value
+                    mesh_h[name].visible = True
+
+    for g in (g_frame, g_ps, g_mr, g_hands, g_op):
+        g.on_update(update)
+    update()
+
     print(f"viser player on :{args.port} — ssh -L {args.port}:localhost:{args.port} sphynx")
     while True:
         if g_play.value:
-            g_frame.value = (int(g_frame.value) + 1) % sc.total
-        key = (int(g_frame.value), g_ps.value, g_mr.value, g_hands.value, g_op.value)
-        if key != last:
-            show(key[0])
-            last = key
+            nxt = int(g_frame.value) + 1
+            g_frame.value = 0 if nxt >= sc.total else nxt   # fires update via on_update
         time.sleep(1.0 / g_fps.value)
 
 
