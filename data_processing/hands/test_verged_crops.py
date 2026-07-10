@@ -11,14 +11,17 @@ import cv2
 import numpy as np
 import torch
 
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import fisheye_pinhole as FP
 from wilor_hands_pinhole import load_calib
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--video", default="../long-test1/left_stereo_8bit.mp4")
-    ap.add_argument("--calib-dir", default="../long-test1")
+    ap.add_argument("--video", default="../../long-test1/left_stereo_8bit.mp4")
+    ap.add_argument("--calib-dir", default="../../long-test1")
     ap.add_argument("--jsonl", default="out/pinhole_verged_test/hands.jsonl")
     ap.add_argument("--out", default="out/verged_check.png")
     ap.add_argument("--n", type=int, default=8, help="number of hand crops to show")

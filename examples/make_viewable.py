@@ -8,9 +8,9 @@ record.py writes one of two masters, tagged in the stream's transfer VUI:
                 It is a normal SDR video that already looks correct; it just
                 isn't maximally compatible (10-bit, full range). So "making it
                 viewable" is a pure *format* transcode: 10-bit -> 8-bit, full
-                -> limited range, HEVC -> H.264. No tone curve, no colour
-                scaling — the gamma is left exactly as recorded. ffmpeg does the
-                whole thing; there is no per-frame Python.
+                -> limited range, re-encoded as 8-bit HEVC (hvc1). No tone curve,
+                no colour scaling — the gamma is left exactly as recorded.
+                ffmpeg does the whole thing; there is no per-frame Python.
 
   linear master (record.py --transfer linear) — scene-linear 10-bit HEVC. It
                 looks dark in normal players because nothing tone-maps it, so
@@ -23,10 +23,10 @@ The input's ``color_trc`` tag selects the path automatically (override with
 ``--mode``).
 
 Pipelines:
-    bt709:  HEVC 10-bit full-range --ffmpeg--> H.264 8-bit limited-range (bt709)
+    bt709:  HEVC 10-bit full-range --ffmpeg--> HEVC 8-bit limited-range (bt709)
     linear: HEVC 10-bit linear --decode--> rgb48le
             --convert.tonemap_linear(curve,param)--> 8-bit RGB
-            --encode--> H.264 8-bit (bt709)
+            --encode--> HEVC 8-bit (bt709)
 
 The output path defaults to the input with an ``_8bit`` suffix
 (``master.mp4`` -> ``master_8bit.mp4``); override it with ``-o``.
@@ -53,14 +53,26 @@ import numpy as np
 
 from hteng_camera import convert
 
+def _video_enc(crf: int) -> list[str]:
+    """Return ffmpeg HEVC encoder + quality flags. VideoToolbox on macOS, x265 elsewhere.
 
-def _h264_enc(crf: int) -> list[str]:
-    """Return ffmpeg H.264 encoder + quality flags. VideoToolbox on macOS, x264 elsewhere."""
+    HEVC (vs H.264) lets us encode the full-resolution side-by-side stereo frame
+    — h264_videotoolbox caps each axis at 4096, which the hstacked pair exceeds;
+    HEVC's limit is 8192. The hvc1 tag makes the .mp4 play in QuickTime/Apple.
+
+    hevc_videotoolbox drops transfer/primaries from the bitstream VUI (it only
+    writes them when the *input* already carried them), so a raw-frame encode
+    ends up tagged 'unknown'. We always output bt709, so stamp it back into the
+    VUI with the hevc_metadata bitstream filter (1 == bt709 for all three).
+    """
+    bsf = ["-bsf:v", "hevc_metadata=transfer_characteristics=1:"
+           "colour_primaries=1:matrix_coefficients=1"]
     if platform.system() == "Darwin":
-        # q:v scale is inverted (1=best, 100=worst); map crf roughly: q ≈ crf * 1.5
-        q = max(1, min(100, int(crf * 1.5)))
-        return ["-c:v", "h264_videotoolbox", "-q:v", str(q)]
-    return ["-c:v", "libx264", "-crf", str(crf)]
+        # VideoToolbox -q:v is 1..100, higher = better (the OPPOSITE of x26x crf,
+        # where 0=lossless..51=worst). Map crf onto it; crf 18 -> ~q 65.
+        q = max(1, min(100, round((1 - crf / 51) * 100)))
+        return ["-c:v", "hevc_videotoolbox", "-q:v", str(q), "-tag:v", "hvc1", *bsf]
+    return ["-c:v", "libx265", "-crf", str(crf), "-tag:v", "hvc1", *bsf]
 
 
 def _probe(path: str, entries: str) -> str:
@@ -101,7 +113,7 @@ def _probe_transfer(path: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _transcode_bt709(inp: str, out: str, crf: int) -> int:
-    """Transcode an already-gamma-encoded master to a compatible 8-bit H.264.
+    """Transcode an already-gamma-encoded master to a compatible 8-bit HEVC.
 
     The master is BT.709 gamma, 10-bit, full range. Players want 8-bit and
     (conventionally) limited range, so the only conversions are bit depth and
@@ -113,7 +125,7 @@ def _transcode_bt709(inp: str, out: str, crf: int) -> int:
         "ffmpeg", "-y", "-v", "error", "-i", inp,
         # Bit depth happens via -pix_fmt; this only remaps full->limited levels.
         "-vf", "scale=in_range=full:out_range=tv",
-        *_h264_enc(crf), "-pix_fmt", "yuv420p",
+        *_video_enc(crf), "-pix_fmt", "yuv420p",
         "-colorspace", "bt709", "-color_primaries", "bt709",
         "-color_trc", "bt709", "-color_range", "tv",
         "-movflags", "+faststart", out,
@@ -122,13 +134,13 @@ def _transcode_bt709(inp: str, out: str, crf: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Path 2: linear master -> tone-mapped 8-bit H.264 (bakes in a display curve)
+# Path 2: linear master -> tone-mapped 8-bit HEVC (bakes in a display curve)
 # ---------------------------------------------------------------------------
 
 def _tonemap_linear_master(inp: str, out: str, w: int, h: int, fps: str,
                            crf: int, curve: str, param: float, ev: float,
                            black: float, white: float) -> int:
-    """Decode a linear master, bake a tone curve per frame, re-encode to H.264."""
+    """Decode a linear master, bake a tone curve per frame, re-encode to HEVC."""
     frame_bytes = w * h * 3 * 2          # rgb48le: 3 ch * uint16
 
     # Decoder: linear master -> raw 16-bit linear RGB on stdout. We do NOT let
@@ -140,13 +152,13 @@ def _tonemap_linear_master(inp: str, out: str, w: int, h: int, fps: str,
         stdout=subprocess.PIPE,
     )
 
-    # Encoder: tone-mapped 8-bit RGB -> H.264, tagged bt709 (a normal display
+    # Encoder: tone-mapped 8-bit RGB -> HEVC, tagged bt709 (a normal display
     # video). +faststart for progressive playback.
     enc = subprocess.Popen(
         ["ffmpeg", "-y", "-v", "error",
          "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", fps,
          "-i", "pipe:0",
-         *_h264_enc(crf), "-pix_fmt", "yuv420p",
+         *_video_enc(crf), "-pix_fmt", "yuv420p",
          "-colorspace", "bt709", "-color_primaries", "bt709",
          "-color_trc", "bt709", "-color_range", "tv",
          "-movflags", "+faststart", out],
@@ -250,7 +262,12 @@ def _transcode_stereo(inp_l: str, inp_r: str, out: str,
                       w_r: int, h_r: int,
                       crf: int, curve: str, param: float,
                       ev: float, black: float, white: float) -> int:
-    """Decode both videos to rgb24 frame streams, hstack per-frame, encode."""
+    """Decode both videos to rgb24 frame streams, hstack per-frame, encode.
+
+    The full-resolution hstacked frame (e.g. 4896 wide for two 2448-px eyes) is
+    encoded as HEVC, which has no trouble with the width — h264_videotoolbox
+    would refuse anything over 4096 px.
+    """
     # Both sides must have the same height; width can differ (hstack handles it).
     if h_l != h_r:
         sys.exit(f"[error] stereo videos have different heights ({h_l} vs {h_r}); "
@@ -268,7 +285,7 @@ def _transcode_stereo(inp_l: str, inp_r: str, out: str,
         ["ffmpeg", "-y", "-v", "error",
          "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w_out}x{h_out}",
          "-r", fps_l, "-i", "pipe:0",
-         *_h264_enc(crf), "-pix_fmt", "yuv420p",
+         *_video_enc(crf), "-pix_fmt", "yuv420p",
          "-colorspace", "bt709", "-color_primaries", "bt709",
          "-color_trc", "bt709", "-color_range", "tv",
          "-movflags", "+faststart", out],
@@ -318,7 +335,7 @@ def main() -> None:
         ),
     )
     ap.add_argument("--crf", type=int, default=18,
-                    help="H.264 quality (lower=better; 18 visually lossless)")
+                    help="HEVC quality (lower=better; 18 visually lossless)")
     # Tone-map (linear-master) options — ignored by the transcode path.
     ap.add_argument("--curve", choices=["gamma", "log", "reinhard"],
                     default="log", help="[tonemap] Tone curve (matches the GUI)")

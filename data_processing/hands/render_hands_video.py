@@ -10,7 +10,7 @@ that matches the jsonl.
 Example:
     python render_hands_video.py \
         --jsonl data_processing/out/stereo/left/hands.jsonl \
-        --video long-test1/left_stereo_8bit.mp4 --eye left \
+        --video ../../long-test1/left_stereo_8bit.mp4 --eye left \
         --out data_processing/out/stereo/left_overlay.mp4 --downscale 2
 """
 import argparse

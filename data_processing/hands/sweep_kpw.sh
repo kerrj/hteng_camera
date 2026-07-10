@@ -4,7 +4,7 @@
 set -e
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate eyeball211
-cd ~/hteng_camera/data_processing
+cd ~/hteng_camera/data_processing/hands
 
 JSONL=out/pinhole_stereo/hands.jsonl
 COMMON="--jsonl $JSONL --mano /tmp/mano_jax.npz --hand right --w-temporal 0 --frame-max 900 --iters 40"

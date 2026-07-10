@@ -8,11 +8,11 @@ refinement mode is planned (see README).
 Examples
 --------
     # smoke test: a few frames, with annotated jpgs
-    python wilor_hands.py long-test1/left.mp4 --out out/left \
+    python wilor_hands.py ../../long-test1/left.mp4 --out out/left \
         --frames 1500,3000,5000 --viz
 
     # full run, every 3rd frame, json only
-    python wilor_hands.py long-test1/left.mp4 --out out/left --stride 3
+    python wilor_hands.py ../../long-test1/left.mp4 --out out/left --stride 3
 
 Output
 ------

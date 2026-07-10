@@ -12,11 +12,15 @@ surface without importing jax at runtime. One npz per hand:
 """
 import argparse
 import json
+import os
+import sys
 
 import numpy as np
 import jax.numpy as jnp
 import jaxlie
 
+# mano_jax lives in data_processing/hands/ after the origin/main reorg
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "hands"))
 import mano_jax as MJ
 
 

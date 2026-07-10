@@ -5,7 +5,7 @@
 # stock requirement pins don't apply. We install --no-deps and add only what's
 # actually missing, to avoid disturbing the env's torch/numpy.
 #
-# Run on chungus:  bash data_processing/install_wilor.sh
+# Run on chungus:  bash data_processing/hands/install_wilor.sh
 set -euo pipefail
 
 source ~/miniconda3/etc/profile.d/conda.sh

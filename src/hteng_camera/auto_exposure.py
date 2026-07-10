@@ -2,7 +2,7 @@
 
 Why software AE instead of the SDK's ``CameraSetAeState``: the SDK's AE varies
 *exposure time* freely, which balloons the sensor's frame interval in dim scenes
-— fine for a still preview, fatal for ``record_stereo`` where a stable, matched
+— fine for a still preview, fatal for ``record_ego`` where a stable, matched
 frame interval is what keeps the timestamp-paired stereo sync tight. This
 controller keeps exposure pinned short and bounded and reaches the brightness
 target *gain-first*, so the frame rate stays put.

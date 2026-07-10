@@ -34,6 +34,7 @@ from .enums import (
     FRAME_SPEED_HIGH, FRAME_SPEED_LOW, FRAME_SPEED_NORMAL, FRAME_SPEED_SUPER,
     GET_NEWEST, GET_NEXT, GET_OLDEST,
 )
+from .imu import ImuSample, YbImu
 
 __version__ = "0.1.0"
 
@@ -43,4 +44,5 @@ __all__ = [
     "CameraCalibration", "Intrinsics", "ColorCalibration", "StereoCalibration",
     "FRAME_SPEED_LOW", "FRAME_SPEED_NORMAL", "FRAME_SPEED_HIGH", "FRAME_SPEED_SUPER",
     "GET_OLDEST", "GET_NEWEST", "GET_NEXT",
+    "YbImu", "ImuSample",
 ]

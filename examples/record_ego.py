@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Record a synchronized HTENG stereo pair to two frame-matched 10-bit HEVC MP4s.
+Record a synchronized stereo + IMU egomotion capture: two frame-matched
+10-bit HEVC MP4s plus (optionally) a raw IMU log, all sharing one clock.
 
-This is the two-camera sibling of ``record.py``. The per-frame pixel path
-(unpack -> demosaic -> BT.709/linear transfer -> rgb48le -> ffmpeg) is identical;
-see ``record.py`` for the full rationale on encoders, transfer functions, and
-colour metadata. The only new thing here is *synchronization*.
+This is the two-camera sibling of ``record.py``, extended with an optional
+IMU stream for feeding a downstream VIO/SLAM pipeline. The per-frame pixel
+path (unpack -> demosaic -> BT.709/linear transfer -> rgb48le -> ffmpeg) is
+identical to ``record.py``; see that file for the full rationale on encoders,
+transfer functions, and colour metadata. The two new things here are
+*camera synchronization* and *IMU capture* (see the two sections below).
 
 Frame matching (timestamp-paired, left = master)
 -------------------------------------------------
@@ -13,29 +16,75 @@ Both cameras free-run at max USB throughput, and we call ``reset_timestamp()``
 on the pair back-to-back at startup so their hardware frame timestamps share a
 common time base (to within the gap between the two calls, ~50-200 µs).
 
-The LEFT camera is the master clock: it streams into a single-slot mailbox
-(newest frame wins, carrying its timestamp). The RIGHT camera streams into a
-small ring buffer of its most recent frames (also timestamped).
+The LEFT camera is the master clock: it streams into a small bounded queue
+(every frame, carrying its timestamp). The RIGHT camera streams into a small
+ring buffer of its most recent frames (also timestamped).
 
-A single encode loop ticks at the 1/fps deadline. On each tick it takes the
-freshest LEFT frame as the reference, then picks the RIGHT frame from the ring
-whose timestamp is *closest* to the left frame's — the best temporal match
-available, rather than just "the newest right frame". Because the reference left
-frame is already a few ms behind the tick instant, the ring holds right frames
-both before and after it, so the nearest-neighbour search genuinely brackets the
-left timestamp (no explicit lag needed). The measured skew (t_right - t_left)
-for every emitted frame is logged to sync_log.csv.
+EVENT-DRIVEN, NOT WALL-CLOCK PACED. The encode loop emits one output pair for
+each LEFT frame the sensor delivers — it does NOT tick on a 1/fps deadline.
+Sampling a free-running sensor on an independent wall clock is a resampler: the
+sensor runs at its own rate (~40 Hz here) and a 30 Hz tick keeps 3 of every 4
+frames, giving a 1,1,2-spaced "3-then-break" cadence (25% of slots dropped; see
+git history for the diagnosis). Driving off frame arrival instead makes the
+output spacing BE the sensor's spacing — uniform by construction — while true
+per-frame timestamps still go to sync_log.csv for the solve. --fps, if set,
+decimates by an INTEGER sensor-frame stride (still uniform); the default keeps
+every frame.
 
-Both files are fed one frame per tick, so frame N of left and frame N of right
-are the same tick — the MP4s stay identical in length and aligned by frame
-index. A tick only writes once both cameras have produced a frame (so the
-streams start together); if the master underruns, the last pair is duplicated
-rather than desyncing.
+For each master frame, the RIGHT frame is picked from the ring by *closest*
+timestamp — the best temporal match, not just "the newest right frame". Because
+the master reference lags real time by the queue/encode latency, the ring
+brackets it on both sides, so nearest-neighbour genuinely straddles the left
+timestamp (no explicit lag needed). The skew (t_right - t_left) for every
+emitted frame is logged to sync_log.csv.
+
+Both files are fed one frame per emitted pair, so frame N of left and frame N of
+right are the same instant — the MP4s stay identical in length and aligned by
+frame index. A pair is written only once both cameras have produced a frame (so
+the streams start together). If encoding can't keep the sensor's pace the queue
+fills and the SDK drops frames at the source — surfacing as a larger real-
+timestamp gap in sync_log (which the solve already handles via per-frame dt),
+never as a silent systematic decimation.
 
 This nearest-timestamp pairing (vs. plain newest-newest) removes the fixed phase
 offset between two free-running sensors, the slow drift between their unlocked
 clocks, and one-off USB jitter — bounding skew to ~half a camera frame interval.
 For true simultaneous exposure, wire a hardware trigger.
+
+IMU synchronization (optional, --imu-port)
+-------------------------------------------
+The IMU (hteng_camera.imu.YbImu) has no hardware timestamp counter of its
+own, so it cannot share the cameras' frame-timestamp reset the way the two
+cameras share it with each other. Instead, every host-side clock reading in
+this script — the camera-reset anchor and every IMU sample — uses
+``time.perf_counter()``, and the two camera clocks are related to that same
+perf_counter timeline through one recorded offset:
+
+  cam_reset_perf_counter_us = perf_counter() reading taken at the same instant
+  cam_left.reset_timestamp() / cam_right.reset_timestamp() are called.
+
+``sync_log.csv``'s ``t_left_us``/``t_right_us`` are left untouched — they
+keep meaning exactly what they mean without an IMU (camera-firmware counter
+time, relative to the reset instant). ``imu_log.csv``'s ``host_time_us`` is
+the *absolute* perf_counter reading for each sample (no relative-zero
+subtraction). To align a camera frame with the IMU stream, add the recorded
+offset to the frame's timestamp:
+
+  t_frame_perfcounter_us = cam_reset_perf_counter_us + t_left_us  # or t_right_us
+
+then compare directly against imu_log.csv's host_time_us column. This keeps
+each CSV's semantics independent and makes the conversion explicit and
+recomputable rather than baked into one side.
+
+Accuracy: the cam_reset_perf_counter_us read lags the actual
+CameraRstTimeStamp() calls by call/return overhead (tens of µs, similar order
+to the ~50-200 µs left/right reset gap above). Separately — and NOT
+corrected for — there is an inherent few-ms of serial/USB transmission
+latency between an IMU sample's true physical sampling instant and the host
+receiving and timestamping it; the wire protocol gives no way to recover the
+true sensor-side sample instant. This is a soft-sync approximation, not a
+hardware-timestamped guarantee. IMU report rate is capped at 100 Hz — this is
+a verified FIRMWARE ceiling for this board, not just a library-side clamp.
 
 Output
 ------
@@ -45,7 +94,12 @@ Everything lands in one folder (the positional argument):
       left.mp4                       left camera, frame-matched to right.mp4
       right.mp4                      right camera
       sync_log.csv                   per-frame t_left/t_right/skew (µs)
-      recording.json                 manifest: fps, exposure, per-camera ROI
+      imu_log.csv                    raw accel/gyro/mag samples (only if --imu-port given)
+      markers.csv                    demo segment boundaries from the viser GUI
+                                     (unless --no-viser); same perf_counter clock
+                                     as imu_log.csv
+      recording.json                 manifest: fps, exposure, per-camera ROI,
+                                     IMU config + clock-alignment offset
                                      (with the intrinsics offset note)
       calib_<serial_left>.json       copy of each camera's calibration (if found)
       calib_<serial_right>.json
@@ -56,10 +110,11 @@ The calibration files are copied verbatim from the calibration search path
 
 Usage
 -----
-  python record_stereo.py take01/                     # first two cameras found
-  python record_stereo.py --left 046060323003 --right 046060323006 take01/
-  python record_stereo.py --duration 10 --fps 60 --exposure-ms 12 fast/
-  python record_stereo.py --encoder x265 --transfer linear master/
+  python record_ego.py take01/                     # first two cameras found
+  python record_ego.py --left 046060323003 --right 046060323006 take01/
+  python record_ego.py --duration 10 --fps 60 --exposure-ms 12 fast/
+  python record_ego.py --encoder x265 --transfer linear master/
+  python record_ego.py --imu-port /dev/cu.usbserial-1440 take01/     # + raw IMU log
 """
 
 import argparse
@@ -68,6 +123,7 @@ import csv
 import json
 import os
 import platform
+import queue
 import shutil
 import signal
 import subprocess
@@ -81,6 +137,7 @@ from typing import Optional
 import numpy as np
 
 from hteng_camera import HTCamera, AutoExposure, calibration, convert, enums, list_cameras
+from hteng_camera.imu import ImuSample, YbImu
 
 
 # ---------------------------------------------------------------------------
@@ -106,12 +163,12 @@ def _elapsed_str(seconds: float) -> str:
 
 def _start_announcer(stop: threading.Event, interval: float = 30.0) -> None:
     """Daemon thread that speaks the elapsed time every ``interval`` seconds."""
-    t0 = time.monotonic()
+    t0 = time.perf_counter()
 
     def loop():
         next_tick = t0 + interval
-        while not stop.wait(timeout=max(0.0, next_tick - time.monotonic())):
-            elapsed = time.monotonic() - t0
+        while not stop.wait(timeout=max(0.0, next_tick - time.perf_counter())):
+            elapsed = time.perf_counter() - t0
             _speak(_elapsed_str(elapsed))
             next_tick += interval
 
@@ -246,25 +303,38 @@ def _ffmpeg_cmd(encoder: str, w: int, h: int, fps: int, quality: int,
 # Producers: master mailbox (left) + timestamped ring buffer (right)
 # ---------------------------------------------------------------------------
 
-class _Mailbox:
-    """Single-slot latest-frame handoff for the MASTER (left) camera.
+class _MasterQueue:
+    """Bounded FIFO of ``(timestamp_us, bayer)`` for the MASTER (left) camera.
 
-    Holds the newest ``(timestamp_us, bayer)`` only — the encoder always wants
-    the freshest reference frame, and at ~10 MB per plane, depth is real memory.
+    A FIFO, not a latest-wins mailbox: the encoder emits one output pair per
+    master frame, so EVERY frame must reach it in order — dropping to "newest
+    only" is exactly the wall-clock resampling this design removes. Depth is a
+    few frames of slack for encode-time jitter; at ~10 MB/plane it stays small.
+
+    When the encoder can't keep the sensor's pace the queue fills and ``put``
+    drops the newest frame (rather than blocking the SDK grab thread, which
+    would wedge the camera). A drop is a genuine skipped capture — it shows up
+    as a larger real-timestamp gap in sync_log, which the solve handles, and is
+    counted so the run can report it.
     """
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._item: Optional[tuple[int, np.ndarray]] = None
+    def __init__(self, depth: int) -> None:
+        self._q: "queue.Queue[tuple[int, np.ndarray]]" = queue.Queue(maxsize=depth)
+        self.dropped = 0
 
     def put(self, ts: int, frame: np.ndarray) -> None:
-        with self._lock:
-            self._item = (ts, frame)
+        try:
+            self._q.put_nowait((ts, frame))
+        except queue.Full:
+            self.dropped += 1
 
-    def take(self) -> Optional[tuple[int, np.ndarray]]:
-        with self._lock:
-            item, self._item = self._item, None
-            return item
+    def take(self, timeout: float) -> Optional[tuple[int, np.ndarray]]:
+        """Next frame in arrival order, or None if none arrives within
+        ``timeout`` s (so the encode loop can re-check ``stop``)."""
+        try:
+            return self._q.get(timeout=timeout)
+        except queue.Empty:
+            return None
 
 
 class _Ring:
@@ -291,8 +361,243 @@ class _Ring:
             return min(self._buf, key=lambda it: abs(it[0] - ts))
 
 
-def _capture_master(cam: HTCamera, box: _Mailbox, stop: threading.Event) -> None:
-    """Grab left (master) Bayer planes, keeping only the newest in the mailbox."""
+# ---------------------------------------------------------------------------
+# IMU raw-sample CSV writer (see "IMU synchronization" in the module
+# docstring for how host_time_us here relates to sync_log.csv's timestamps)
+# ---------------------------------------------------------------------------
+
+class _ImuCsvWriter:
+    """Thread-safe per-sample CSV writer, invoked directly from YbImu's own
+    receive thread via its ``on_raw_sample`` callback.
+
+    A lock-guarded direct write (no separate queue/writer thread) is enough
+    here: the IMU is hardware-capped at 100 Hz, and a CSV append at that rate
+    is trivially fast compared to disk I/O bandwidth. If this were ever
+    logging something much higher-rate, a bounded queue drained by a
+    dedicated writer thread would be worth it to keep a slow disk from ever
+    backing up the IMU's receive thread — not needed at this rate.
+    """
+
+    _COLUMNS = [
+        "sample", "host_time_us",
+        "ax_g", "ay_g", "az_g",
+        "gx_rad_s", "gy_rad_s", "gz_rad_s",
+        "mx_ut", "my_ut", "mz_ut",
+    ]
+
+    def __init__(self, path: Path) -> None:
+        self._lock = threading.Lock()
+        self._file = open(path, "w", newline="")
+        self._writer = csv.writer(self._file)
+        self._writer.writerow(self._COLUMNS)
+        self._count = 0
+
+    def on_sample(self, sample: ImuSample) -> None:
+        """Callback for ``YbImu.start(on_raw_sample=...)``. Writes
+        ``host_time_us`` as an ABSOLUTE ``perf_counter()`` microsecond
+        reading (no relative-zero subtraction) — see the module docstring's
+        "IMU synchronization" section for how this lines up with
+        ``sync_log.csv``'s camera timestamps via the recorded
+        ``cam_reset_perf_counter_us`` offset."""
+        with self._lock:
+            self._writer.writerow([
+                self._count, int(sample.host_time_s * 1e6),
+                sample.ax, sample.ay, sample.az,
+                sample.gx, sample.gy, sample.gz,
+                sample.mx, sample.my, sample.mz,
+            ])
+            self._count += 1
+
+    def close(self) -> None:
+        with self._lock:
+            self._file.close()
+
+
+# ---------------------------------------------------------------------------
+# Segment markers (viser phone GUI) — coarse hands-free "demo live / idle"
+# boundaries stamped onto the SAME perf_counter clock as the IMU and the
+# camera-reset anchor, so a marker aligns to both streams the same way an IMU
+# sample does (see the "IMU synchronization" section of the module docstring).
+# ---------------------------------------------------------------------------
+
+class _MarkerCsvWriter:
+    """Thread-safe CSV of segment boundaries, written straight from viser's GUI
+    callback threads. Markers are human-paced (a tap every few seconds at most),
+    so a lock-guarded direct write is plenty — same reasoning as _ImuCsvWriter.
+
+    ``host_time_us`` is an ABSOLUTE ``perf_counter()`` microsecond reading, the
+    identical clock imu_log.csv uses, so a marker lines up against IMU samples
+    directly and against camera frames via ``cam_reset_perf_counter_us +
+    t_left_us`` (see the module docstring). ``live`` is the recording-boundary
+    state IN EFFECT AFTER this marker (1 inside a demo, 0 idle) — a plain
+    ``mark`` carries the current state unchanged, so the column alone segments
+    the timeline without pairing start/stop rows.
+    """
+
+    _COLUMNS = ["marker", "host_time_us", "label", "live"]
+
+    def __init__(self, path: Path) -> None:
+        self._lock = threading.Lock()
+        self._file = open(path, "w", newline="")
+        self._writer = csv.writer(self._file)
+        self._writer.writerow(self._COLUMNS)
+        self._count = 0
+
+    def write(self, label: str, live: bool) -> int:
+        """Append one marker at the current perf_counter instant. Returns the
+        marker index. Flushed immediately so a mid-run crash keeps every mark."""
+        with self._lock:
+            idx = self._count
+            self._writer.writerow(
+                [idx, int(time.perf_counter() * 1e6), label, int(live)])
+            self._file.flush()
+            self._count += 1
+            return idx
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return self._count
+
+    def close(self) -> None:
+        with self._lock:
+            self._file.close()
+
+
+class _MarkerPanel:
+    """A viser GUI, served on the LAN, for marking coarse demo segments from a
+    phone while the laptop is closed and headless.
+
+    The whole browser window is a solid colour that reflects the segment state:
+    GREEN inside a marked-live demo, RED when idle. This is deliberate — there
+    is no camera preview to show (ffmpeg owns the streams), and a full-window
+    colour is legible at arm's length with hands full, which a small button
+    label is not. Every tap also fires a ``say`` confirmation.
+
+    "Live" here is a LABEL on the timeline, not a capture gate: the cameras and
+    IMU record continuously the whole time. Start/Stop only write demo_start /
+    demo_stop markers (and flip the colour); nothing about the encode path
+    changes. Precise per-episode boundaries are a separate, later concern.
+
+    Optional and self-contained: if viser isn't installed, :func:`build`
+    returns None and the recording proceeds without it — an add-on GUI must
+    never break a capture, same policy as the IMU.
+    """
+
+    # Tiny solid-colour planes; viser scales the background to fill the window.
+    _GREEN = np.full((8, 8, 3), (16, 150, 64), dtype=np.uint8)
+    _RED = np.full((8, 8, 3), (170, 32, 32), dtype=np.uint8)
+
+    def __init__(self, server, writer: "_MarkerCsvWriter") -> None:
+        self._server = server
+        self._writer = writer
+        self.share_url: Optional[str] = None   # set by build() once the share URL resolves
+        self._lock = threading.Lock()
+        self._live = False
+        self._t0 = time.perf_counter()      # for the elapsed-time readout
+
+        with server.gui.add_folder("Recording segment"):
+            self._state_text = server.gui.add_text(
+                "State", initial_value="IDLE", disabled=True)
+            self._start_btn = server.gui.add_button(
+                "Start demo", icon=viser.Icon.PLAYER_RECORD, color="green")
+            self._stop_btn = server.gui.add_button(
+                "Stop demo", icon=viser.Icon.PLAYER_STOP, color="red",
+                disabled=True)
+            self._mark_btn = server.gui.add_button(
+                "Mark point", icon=viser.Icon.FLAG,
+                hint="Drop a one-off marker without changing the live/idle state.")
+            self._info_text = server.gui.add_text(
+                "Markers", initial_value="0 written", disabled=True)
+
+        self._start_btn.on_click(lambda _e: self._set_live(True))
+        self._stop_btn.on_click(lambda _e: self._set_live(False))
+        self._mark_btn.on_click(lambda _e: self._mark())
+        self._refresh()
+
+    @classmethod
+    def build(cls, writer: "_MarkerCsvWriter", host: str, port: int,
+              share: bool = True):
+        """Construct the viser server + panel, or return None if viser is
+        missing / the server can't bind. Never raises into the caller.
+
+        Always requests a public tunnel URL from viser's external share
+        server so a phone off the laptop's network can reach the GUI. It
+        blocks a few seconds on first connect and depends on that third-party
+        server; a failure degrades to the LAN URL only."""
+        try:
+            import viser  # noqa: F401  (module-level name used by the class)
+            globals().setdefault("viser", viser)
+        except ImportError:
+            print("[warn] viser not installed — no marker GUI. "
+                  "Install with `pip install viser` (or pass --no-viser).")
+            return None
+        try:
+            server = viser.ViserServer(host=host, port=port, verbose=False)
+        except Exception as e:
+            print(f"[warn] could not start viser server on {host}:{port}: {e}. "
+                  "Recording without the marker GUI.")
+            return None
+        panel = cls(server, writer)
+        if share:
+            try:
+                print("[info] marker GUI: requesting public share URL "
+                      "(may take a few seconds)…")
+                url = server.request_share_url(verbose=False)
+                panel.share_url = url or None
+                if not url:
+                    print("[warn] marker GUI: share URL request failed — "
+                          "LAN URL only.")
+            except Exception as e:
+                print(f"[warn] marker GUI: share URL request errored ({e}) — "
+                      "LAN URL only.")
+        return panel
+
+    def _set_live(self, live: bool) -> None:
+        """Start/Stop handler: flip state, stamp a boundary marker, reflect it."""
+        with self._lock:
+            if live == self._live:
+                return                       # ignore a double-tap of the same side
+            self._live = live
+        label = "demo_start" if live else "demo_stop"
+        self._writer.write(label, live)
+        _speak("demo started" if live else "demo stopped")
+        self._refresh()
+
+    def _mark(self) -> None:
+        """One-off marker; carries the current live state unchanged."""
+        with self._lock:
+            live = self._live
+        self._writer.write("mark", live)
+        _speak("marked")
+        self._refresh()
+
+    def _refresh(self) -> None:
+        """Push state to the buttons, the text fields, and the window colour."""
+        with self._lock:
+            live = self._live
+        self._server.scene.set_background_image(
+            self._GREEN if live else self._RED, format="jpeg")
+        self._state_text.value = "● LIVE" if live else "IDLE"
+        self._start_btn.disabled = live
+        self._stop_btn.disabled = not live
+        self._info_text.value = f"{self._writer.count} written"
+
+    def close(self) -> None:
+        """Stop the server. If a demo was left open, close the segment cleanly
+        so the log never ends mid-demo."""
+        with self._lock:
+            dangling = self._live
+        if dangling:
+            self._writer.write("demo_stop", False)
+        try:
+            self._server.stop()
+        except Exception:
+            pass
+
+
+def _capture_master(cam: HTCamera, box: _MasterQueue, stop: threading.Event) -> None:
+    """Grab left (master) Bayer planes and enqueue every one in arrival order."""
     while not stop.is_set():
         bayer, info = cam.grab_bayer12()
         if bayer is None:
@@ -310,8 +615,29 @@ def _capture_slave(cam: HTCamera, ring: _Ring, stop: threading.Event) -> None:
         ring.put(info["time"], bayer)
 
 
+def _measure_native_hz(cam: HTCamera, n: int = 30) -> Optional[float]:
+    """Grab ``n`` frames back-to-back and return the sensor's delivered rate in
+    Hz from the median inter-frame gap of their hardware timestamps, or None if
+    too few frames arrive. Used to turn --fps into an integer decimation stride
+    over the true (free-running) rate rather than resampling on a wall clock.
+    Measured on ``info["time"]`` (camera-firmware µs), the same clock sync_log
+    logs, so the stride matches what the encode loop actually sees."""
+    ts = []
+    for _ in range(n + 1):
+        bayer, info = cam.grab_bayer12(timeout_ms=2000)
+        if bayer is not None:
+            ts.append(info["time"])
+    if len(ts) < 3:
+        return None
+    gaps = np.diff(np.asarray(ts, dtype=np.float64))       # µs
+    gaps = gaps[gaps > 0]
+    if len(gaps) == 0:
+        return None
+    return 1e6 / float(np.median(gaps))
+
+
 # ---------------------------------------------------------------------------
-# Consumer: fixed-rate encoder loop, left as master, right matched by timestamp
+# Consumer: event-driven encoder loop, left as master, right matched by timestamp
 # ---------------------------------------------------------------------------
 
 def _encode(bayer: np.ndarray, cv_code: int, transfer: str, wb) -> np.ndarray:
@@ -328,96 +654,90 @@ def _encode_loop_stereo(
     left: dict,
     right: dict,
     stop: threading.Event,
-    fps: int,
+    stride: int,
     transfer: str,
     sync_csv: Path,
     ae: Optional[dict] = None,
 ) -> None:
-    """At each 1/fps deadline, encode the freshest LEFT frame and the RIGHT frame
-    whose timestamp is nearest to it, writing one frame to each ffmpeg pipe.
+    """Emit one encoded pair per (stride-th) LEFT frame the sensor delivers,
+    each matched to the RIGHT frame whose timestamp is nearest it. Event-driven
+    — there is NO wall-clock deadline (see the module docstring's "EVENT-DRIVEN"
+    note for why: pacing a free-running sensor on an independent clock resamples
+    it into a non-uniform 1,1,2 cadence).
 
     ``left``/``right`` are per-camera dicts with keys ``proc``, ``cv_code``,
-    ``wb``; ``left`` also has ``box`` (a :class:`_Mailbox`) and ``right`` has
+    ``wb``; ``left`` also has ``box`` (a :class:`_MasterQueue`) and ``right`` has
     ``ring`` (a :class:`_Ring`).
 
     Frame matching
     ~~~~~~~~~~~~~~
-    The left camera is the master clock. Each tick takes the newest left frame as
-    the reference and selects the right frame from the ring with the closest
-    timestamp — the best temporal pair available. Both pipes get exactly one
-    frame per tick, so the files stay equal-length and index-aligned. A tick
-    writes nothing until both a left reference and a right match exist (streams
-    start together); if the master underruns, the previous encoded pair is
-    rewritten rather than desyncing. The per-frame skew (t_right - t_left) is
-    written to ``sync_csv``.
+    The left camera is the master. Each master frame is pulled in arrival order;
+    the right frame is the ring entry with the closest timestamp — the best
+    temporal pair available. Both pipes get exactly one frame per emitted pair,
+    so the files stay equal-length and index-aligned. Nothing is emitted until a
+    right match exists (streams start together). Per-frame skew (t_right -
+    t_left) goes to ``sync_csv``; every logged row is a real capture (fresh=1).
 
-    The timing model (monotonic deadline advanced one interval per tick,
-    coarse-sleep + 1 ms spin) is exactly record.py's.
+    Decimation
+    ~~~~~~~~~~
+    ``stride`` keeps every stride-th master frame (1 = keep all). Because the
+    master stream is uniform, every stride-th frame of it is also uniform — this
+    is honest integer decimation, not the resampling the old deadline loop did.
+    ``stride`` is derived in ``main()`` from the measured native rate and --fps.
 
     Auto-exposure
     ~~~~~~~~~~~~~
     If ``ae`` is given (``{"ctrl": AutoExposure, "cams": [left_cam, right_cam],
-    "exp": ms, "gain": x}``), each *fresh* left reference frame is metered and the
-    SAME exposure/gain is applied to BOTH cameras via :meth:`AutoExposure.apply`.
+    "exp": ms, "gain": x}``), each emitted left frame is metered and the SAME
+    exposure/gain applied to BOTH cameras via :meth:`AutoExposure.apply`.
     Metering the master and copying to the slave keeps the pair photometrically
     matched (essential for stereo), and the anti-flicker exposure makes that match
     hold even though the two sensors free-run out of phase — a flicker-free
     exposure integrates whole 120 Hz cycles, so both collect equal light
     regardless of phase. We meter the raw Bayer plane (cheap, pre-demosaic).
     """
-    interval = 1.0 / fps
-    deadline = time.monotonic() + interval
-    last_pair: Optional[tuple[np.ndarray, np.ndarray]] = None
-    frame_idx = 0
+    frame_idx = 0        # emitted pairs (== output frame count)
+    master_seen = 0      # master frames pulled since streaming began (for stride)
 
     with open(sync_csv, "w", newline="") as f:
         log = csv.writer(f)
         log.writerow(["frame", "t_left_us", "t_right_us", "skew_us", "fresh"])
 
         while not stop.is_set():
-            now = time.monotonic()
-            remaining = deadline - now
+            ref = left["box"].take(timeout=0.5)
+            if ref is None:
+                continue                         # no frame yet; re-check stop
+            t_left, bayer_left = ref
 
-            if remaining > 0.001:
-                time.sleep(remaining - 0.001)
+            match = right["ring"].nearest(t_left)
+            if match is None:
+                continue                         # right not warmed up; pre-roll
+            t_right, bayer_right = match
+
+            # Integer decimation on the uniform master stream. master_seen only
+            # advances once the right side is live, so warmup frames don't shift
+            # the stride phase.
+            keep = (master_seen % stride == 0)
+            master_seen += 1
+            if not keep:
                 continue
 
-            # Snap forward if we fell more than one frame behind (e.g. GIL pause).
-            if remaining < -interval:
-                deadline = now + interval
-            else:
-                deadline += interval
-
-            ref = left["box"].take()
-            if ref is not None:
-                t_left, bayer_left = ref
-                match = right["ring"].nearest(t_left)
-                if match is None:
-                    continue                     # right not warmed up yet
-                t_right, bayer_right = match
-
-                # Software AE: meter the master's raw Bayer, apply the same
-                # exposure/gain to both cameras (flash-free, anti-flicker on).
-                if ae is not None:
-                    ctrl = ae["ctrl"]
-                    new_exp, new_gain, _ = ctrl.update(
-                        bayer_left, ae["exp"], ae["gain"])
-                    try:
-                        ae["exp"], ae["gain"] = ctrl.apply(
-                            ae["cams"], new_exp, new_gain, ae["exp"], ae["gain"])
-                    except Exception:
-                        pass                     # a wedged control write must not
+            # Software AE: meter the master's raw Bayer, apply the same
+            # exposure/gain to both cameras (flash-free, anti-flicker on).
+            if ae is not None:
+                ctrl = ae["ctrl"]
+                new_exp, new_gain, _ = ctrl.update(
+                    bayer_left, ae["exp"], ae["gain"])
+                try:
+                    ae["exp"], ae["gain"] = ctrl.apply(
+                        ae["cams"], new_exp, new_gain, ae["exp"], ae["gain"])
+                except Exception:
+                    pass                         # a wedged control write must not
                                                  # stall the encode/sync loop
 
-                out_left = _encode(bayer_left, left["cv_code"], transfer, left["wb"])
-                out_right = _encode(bayer_right, right["cv_code"], transfer, right["wb"])
-                last_pair = (out_left, out_right)
-                log.writerow([frame_idx, t_left, t_right, t_right - t_left, 1])
-            elif last_pair is not None:
-                out_left, out_right = last_pair  # master underrun → duplicate pair
-                log.writerow([frame_idx, "", "", "", 0])
-            else:
-                continue                         # nothing to write yet
+            out_left = _encode(bayer_left, left["cv_code"], transfer, left["wb"])
+            out_right = _encode(bayer_right, right["cv_code"], transfer, right["wb"])
+            log.writerow([frame_idx, t_left, t_right, t_right - t_left, 1])
 
             try:
                 left["proc"].stdin.write(out_left.view(np.uint8))
@@ -522,7 +842,8 @@ def _side_meta(cam: HTCamera, serial: str, full_wh: tuple[int, int],
     }
 
 
-def _write_manifest(out_dir: Path, args, encoder: str, left: dict, right: dict) -> None:
+def _write_manifest(out_dir: Path, args, encoder: str, left: dict, right: dict,
+                     imu_info: dict, rate_info: dict) -> None:
     """Write recording.json describing how the videos were captured, including
     the per-camera ROI needed to adjust the copied full-frame intrinsics.
 
@@ -532,11 +853,23 @@ def _write_manifest(out_dir: Path, args, encoder: str, left: dict, right: dict) 
         cy_roi = cy_full - roi.y_offset
     and the image size becomes roi.width x roi.height. This note + the ROI are
     recorded so that step is unambiguous later.
+
+    ``imu_info`` is ``{"enabled": False}`` if no IMU was requested/succeeded,
+    or the fully-populated dict built in ``main()`` if it did — it reflects
+    ACTUAL outcome, not just whether --imu-port was passed, so a manifest
+    never claims IMU logging succeeded when it silently didn't.
     """
     manifest = {
         "format": "hteng-camera-stereo-recording/1",
         "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "fps": args.fps,
+        # Nominal container rate; the sensor free-runs and frames are decimated by
+        # an integer stride (event-driven, not wall-clock resampled). Frame TIMES
+        # are non-uniform-but-honest -- always use sync_log.csv's per-frame
+        # t_left_us/t_right_us for the solve, not this rate.
+        "fps": rate_info["effective_hz"],
+        "fps_requested": args.fps or None,
+        "sensor_native_hz": rate_info["native_hz"],
+        "decimation_stride": rate_info["stride"],
         "encoder": encoder,
         "quality": args.quality,
         "transfer": args.transfer,
@@ -560,13 +893,37 @@ def _write_manifest(out_dir: Path, args, encoder: str, left: dict, right: dict) 
             "left": "left.mp4",
             "right": "right.mp4",
             "sync_log": "sync_log.csv",
+            "imu_log": "imu_log.csv" if imu_info.get("enabled") else None,
+            "markers": "markers.csv" if not args.no_viser else None,
             "stereo_transform":
                 f"stereo_{left['serial']}_{right['serial']}.json",
         },
+        "markers": (
+            {"enabled": False}
+            if args.no_viser else {
+                "enabled": True,
+                "file": "markers.csv",
+                "gui": "viser",
+                "host": args.viser_host,
+                "port": args.viser_port,
+                "note": (
+                    "markers.csv columns: marker, host_time_us, label, live. "
+                    "host_time_us is an ABSOLUTE time.perf_counter() reading in "
+                    "microseconds -- the SAME clock as imu_log.csv, so a marker "
+                    "aligns to IMU samples directly and to a camera frame via "
+                    "cam_reset_perf_counter_us + t_left_us (see clock_alignment). "
+                    "label is demo_start / demo_stop / mark; live (0/1) is the "
+                    "segment state in effect after the row, so the column alone "
+                    "segments the timeline. Markers annotate only -- they do NOT "
+                    "gate capture; video/IMU record continuously throughout."
+                ),
+            }
+        ),
         "left": _side_meta(left["cam"], left["serial"], left["full"],
                            left["exp"], left["gain"]),
         "right": _side_meta(right["cam"], right["serial"], right["full"],
                             right["exp"], right["gain"]),
+        "imu": imu_info,
         "intrinsics_note": (
             "calib_<serial>.json intrinsics are FULL-SENSOR. For this recording's "
             "ROI, shift the principal point: cx_roi = cx_full - roi.x_offset, "
@@ -889,7 +1246,13 @@ def main() -> None:
         help="HEVC encoder. 'auto' maps by platform (Linux->nvenc, "
              "macOS->videotoolbox); or force nvenc / videotoolbox / x265.",
     )
-    ap.add_argument("--fps", type=int, default=30, help="Target output frame rate")
+    ap.add_argument(
+        "--fps", type=int, default=0,
+        help="Target output rate. The sensor free-runs at its own (fixed) rate; "
+             "this keeps the nearest INTEGER-stride fraction of frames (uniform), "
+             "never a wall-clock resample. 0 (default) keeps every frame at the "
+             "native rate. E.g. asking 30 on a ~40 Hz sensor -> stride 1 -> ~40 "
+             "fps (closest integer stride); ask 20 for a clean half.")
     ap.add_argument(
         "--duration", type=float, default=None,
         help="Recording duration in seconds (omit to record until Ctrl+C)",
@@ -976,10 +1339,11 @@ def main() -> None:
     )
     ap.add_argument(
         "--sync-buffer", type=int, default=8,
-        help="Depth of the right-camera ring buffer the master's timestamp is "
-             "paired against. More frames give the nearest-timestamp search more "
-             "to choose from but cost ~10 MB each. 8 is plenty when the sensors "
-             "run faster than --fps.",
+        help="Depth (frames) of BOTH the right-camera ring the master timestamp "
+             "is paired against AND the master FIFO of frames awaiting encode. "
+             "More gives the nearest-timestamp search more to choose from and "
+             "more encode-jitter slack before frames drop, but costs ~10 MB each. "
+             "8 is plenty at the sensor's native rate.",
     )
     ap.add_argument(
         "--no-keep-awake", action="store_true",
@@ -988,23 +1352,64 @@ def main() -> None:
              "sudo) so you can shut the laptop and let it run. Both are restored "
              "on exit. No-op off macOS.",
     )
+    ap.add_argument(
+        "--imu-port", default=None,
+        help="IMU serial port. Autodetected by default; pass this to pin "
+             "an exact port if autodetection picks the wrong device.",
+    )
+    ap.add_argument(
+        "--no-imu", action="store_true",
+        help="Disable IMU logging even if one is autodetected.",
+    )
+    ap.add_argument(
+        "--imu-rate", type=int, default=100,
+        help="IMU report rate in Hz, [10, 100]. 100 is also a hard "
+             "firmware ceiling for this board -- more has no effect.",
+    )
+    ap.add_argument(
+        "--imu-algo", type=int, choices=[6, 9], default=9,
+        help="Onboard fusion mode 6 or 9 (unused; this script only logs "
+             "raw data). Matters only because 6-axis makes the firmware "
+             "stop sampling the magnetometer -- mx/my/mz log as 0.0.",
+    )
+    ap.add_argument(
+        "--no-viser", action="store_true",
+        help="Disable the viser marker GUI. By default a small web GUI is "
+             "served so you can open it on a phone and tap Start/Stop demo to "
+             "mark coarse recording segments into markers.csv (hands-free-ish "
+             "while the lid is shut). The window fills GREEN while a demo is "
+             "marked live, RED when idle. Markers don't gate capture — the "
+             "cameras/IMU record continuously regardless.",
+    )
+    ap.add_argument(
+        "--viser-host", default="0.0.0.0",
+        help="Interface the viser GUI binds to. 0.0.0.0 (default) lets a phone "
+             "on the same network/hotspot reach it at http://<laptop-ip>:port.",
+    )
+    ap.add_argument(
+        "--viser-port", type=int, default=8080,
+        help="Port for the viser marker GUI.",
+    )
     args = ap.parse_args()
 
     if args.sync_buffer < 1:
         sys.exit("[error] --sync-buffer must be >= 1.")
     if not 0.0 < args.roi_height <= 1.0:
         sys.exit("[error] --roi-height must be in (0, 1].")
+    if not 10 <= args.imu_rate <= 100:
+        sys.exit("[error] --imu-rate must be in [10, 100] (firmware hard-caps at 100 anyway).")
 
     encoder = _resolve_encoder(args.encoder)
     _preflight_ffmpeg(encoder)
 
-    frame_interval_ms = 1000.0 / args.fps
-    if args.exposure_ms >= frame_interval_ms:
-        print(
-            f"[warn] exposure {args.exposure_ms:.1f} ms >= frame interval "
-            f"{frame_interval_ms:.1f} ms — cameras will run below {args.fps} fps "
-            "and output frames will be duplicated."
-        )
+    # Long exposure caps the sensor's native rate (it can't deliver frames faster
+    # than it integrates). The event-driven loop never duplicates — it just emits
+    # whatever the sensor delivers — so this is informational, and the actual rate
+    # is measured + reported once the cameras are open.
+    if args.fps and args.exposure_ms >= 1000.0 / args.fps:
+        print(f"[warn] exposure {args.exposure_ms:.1f} ms exceeds the "
+              f"{1000.0 / args.fps:.1f} ms interval of the requested {args.fps} "
+              "fps — the sensor will deliver below that rate.")
 
     # ── Resolve which serials are left / right ───────────────────────────────
     cams = list_cameras()
@@ -1060,6 +1465,55 @@ def main() -> None:
     awake = _KeepAwake(enabled=not args.no_keep_awake)
     awake.engage()
 
+    # ── Open + configure the IMU (optional, on by default) ───────────────────
+    # Without --no-imu, this always runs: an explicit --imu-port opens that
+    # exact port, otherwise the IMU is autodetected by probing candidate
+    # USB-serial ports with a real version-query handshake (see
+    # hteng_camera.imu.YbImu.autodetect) -- no flag needed if one is plugged
+    # in. Either way, any failure here is a warning, not fatal -- the stereo
+    # recording must not break because of optional add-on hardware.
+    # Calibration is deliberately NOT done here -- it's a one-time-per-mount
+    # (accel/gyro) or environment-dependent (magnetometer) step, not
+    # something to run on every recording; do it separately before capturing.
+    imu: Optional[YbImu] = None
+    imu_csv: Optional[_ImuCsvWriter] = None
+    imu_version: Optional[str] = None
+    if not args.no_imu:
+        try:
+            if args.imu_port:
+                imu = YbImu(args.imu_port)
+                # YbImu.start() must run before ANY set_*/get_version call --
+                # see YbImu's docstring: sending a command first can silently
+                # wedge the serial link (found by direct hardware testing
+                # while building this integration).
+                imu.start()
+            else:
+                print("[info] IMU: autodetecting (pass --imu-port to pin an "
+                      "exact port, --no-imu to disable)...")
+                imu = YbImu.autodetect()
+                if imu is None:
+                    print("[info] IMU: none detected -- recording without IMU logging.")
+            if imu is not None:
+                imu_csv = _ImuCsvWriter(out_dir / "imu_log.csv")
+                imu.on_raw_sample = imu_csv.on_sample
+                imu.set_report_rate(args.imu_rate)
+                imu.set_algo_type(args.imu_algo)
+                imu_version = imu.get_version()
+                print(f"[info] IMU: streaming from {imu.port} at {args.imu_rate} Hz, "
+                      f"algo={args.imu_algo}, firmware {imu_version or 'unknown'}.")
+        except Exception as e:
+            print(f"[warn] IMU setup failed: {e}. Continuing WITHOUT IMU logging.")
+            if imu_csv is not None:
+                imu_csv.close()
+            if imu is not None:
+                try:
+                    imu.close()
+                except Exception:
+                    pass
+            imu = None
+            imu_csv = None
+            imu_version = None
+
     # ── Open + configure both cameras ────────────────────────────────────────
     print(f"[info] Opening cameras  left={serial_left}  right={serial_right} …")
     cam_left = cam_right = None
@@ -1080,9 +1534,26 @@ def main() -> None:
                     pass
         raise
 
+    # Measure the sensor's true delivered rate (before the reset, so these warmup
+    # grabs don't consume post-reset timestamps). --fps then decimates by an
+    # INTEGER stride over this rate instead of resampling on a wall clock, which
+    # is what produced the non-uniform 1,1,2 frame cadence (see module docstring).
+    native_hz = _measure_native_hz(cam_left) or float(args.fps or 30)
+    if args.fps and args.fps > 0:
+        stride = max(1, int(round(native_hz / args.fps)))
+    else:
+        stride = 1                               # keep every frame (native rate)
+    effective_hz = native_hz / stride
+    print(f"[info] sensor native ~{native_hz:.2f} Hz; stride {stride} "
+          f"-> output ~{effective_hz:.2f} fps"
+          + (f" (asked {args.fps})" if args.fps else " (all frames)"))
+
     # Shared hardware time base for the pair (soft sync; see module docstring).
     cam_left.reset_timestamp()
     cam_right.reset_timestamp()
+    # Anchor for relating the IMU's absolute perf_counter timestamps to the
+    # cameras' reset-relative ones -- see "IMU synchronization" above.
+    cam_reset_perf_counter_us = int(time.perf_counter() * 1e6)
 
     # Encoder dims come from the real frame each camera delivered during open
     # (no extra grab to time out on).
@@ -1094,7 +1565,7 @@ def main() -> None:
     wb_left = None if (args.transfer == "linear" or args.no_wb) else cam_left.wb_gains
     wb_right = None if (args.transfer == "linear" or args.no_wb) else cam_right.wb_gains
     print(
-        f"[info] {dims['left'][1]}x{dims['left'][0]} @ {args.fps} fps, "
+        f"[info] {dims['left'][1]}x{dims['left'][0]} @ ~{effective_hz:.2f} fps, "
         f"encoder {encoder} ({_ENCODERS[encoder]['codec']}), quality {args.quality}, "
         f"transfer {args.transfer}"
     )
@@ -1134,12 +1605,48 @@ def main() -> None:
 
     # ── Copy calibration JSONs + write the recording manifest ────────────────
     _copy_calibration(out_dir, serial_left, serial_right)
+    if imu is not None:
+        imu_info = {
+            "enabled": True,
+            "port": imu.port,
+            "report_rate_hz": args.imu_rate,
+            "report_rate_hz_effective": 100,
+            "algo_type": args.imu_algo,
+            "firmware_version": imu_version,
+            "cam_reset_perf_counter_us": cam_reset_perf_counter_us,
+            "clock_alignment": (
+                "imu_log.csv's host_time_us is an ABSOLUTE time.perf_counter() "
+                "reading in microseconds (no relative-zero subtraction). To "
+                "align a frame from sync_log.csv, compute "
+                "cam_reset_perf_counter_us + t_left_us (or t_right_us) and "
+                "compare directly against host_time_us. Accuracy: tens to "
+                "hundreds of microseconds from the reset_timestamp()/"
+                "perf_counter() call gap, plus an UNCORRECTED few-ms of "
+                "serial/USB transmission latency per IMU sample -- a "
+                "soft-sync approximation, not a hardware-timestamped "
+                "guarantee."
+            ),
+            "logged_fields": (
+                "Raw accelerometer (g), gyroscope (rad/s), magnetometer (uT) "
+                "per sample -- NOT the onboard fused quaternion/Euler angles. "
+                "algo_type above affects more than the (unlogged) onboard "
+                "fusion output: in 6-axis mode the firmware stops sampling "
+                "the magnetometer, so mx_ut/my_ut/mz_ut in imu_log.csv are a "
+                "constant 0.0 regardless of motion. Raw accel/gyro are "
+                "unaffected by algo_type either way."
+            ),
+        }
+    else:
+        imu_info = {"enabled": False}
     _write_manifest(
         out_dir, args, encoder,
         {"cam": cam_left, "serial": serial_left, "full": full_left,
          "exp": exp_left, "gain": gain_left},
         {"cam": cam_right, "serial": serial_right, "full": full_right,
          "exp": exp_right, "gain": gain_right},
+        imu_info,
+        {"native_hz": round(native_hz, 3), "stride": stride,
+         "effective_hz": round(effective_hz, 3)},
     )
 
     # ── Start one ffmpeg per camera ──────────────────────────────────────────
@@ -1147,14 +1654,19 @@ def main() -> None:
     for out_path, (tag, cam) in zip((out_left, out_right),
                                     (("left", cam_left), ("right", cam_right))):
         h, w = dims[tag]
-        cmd = _ffmpeg_cmd(encoder, w, h, args.fps, args.quality, out_path, args.transfer)
+        # Container playback rate = the true emitted rate (native/stride), not the
+        # requested --fps, so real-time playback matches wall-clock duration. The
+        # solve uses per-frame sync_log timestamps regardless; this only sets the
+        # nominal timebase stamped in the MP4.
+        cmd = _ffmpeg_cmd(encoder, w, h, max(1, round(effective_hz)),
+                          args.quality, out_path, args.transfer)
         # bufsize=0: each frame is one big write; buffering just memcpys ~30 MB.
         procs.append(subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0))
     proc_left, proc_right = procs
 
-    # ── Producers (left mailbox / right ring) + one shared encode thread ─────
+    # ── Producers (left FIFO / right ring) + one shared encode thread ────────
     stop = threading.Event()
-    box_left = _Mailbox()
+    box_left = _MasterQueue(args.sync_buffer)
     ring_right = _Ring(args.sync_buffer)
 
     left = {"proc": proc_left,  "box": box_left,
@@ -1171,7 +1683,7 @@ def main() -> None:
     ]
     enc_thread = threading.Thread(
         target=_encode_loop_stereo,
-        args=(left, right, stop, args.fps, args.transfer, sync_csv, ae),
+        args=(left, right, stop, stride, args.transfer, sync_csv, ae),
         name="hteng-encode",
     )
     for t in cap_threads:
@@ -1179,6 +1691,28 @@ def main() -> None:
     enc_thread.start()
     _speak("recording")
     _start_announcer(stop)
+
+    # ── Marker GUI (viser, optional) ──────────────────────────────────────────
+    # A phone-friendly web GUI for stamping coarse "demo live / idle" segment
+    # boundaries into markers.csv on the shared perf_counter clock. Started here,
+    # after capture is up, so the GUI only ever appears once frames are flowing.
+    # Fully optional and non-fatal (same policy as the IMU): if viser is missing
+    # or the port is taken, we warn and record without it.
+    marker_csv: Optional[_MarkerCsvWriter] = None
+    marker_panel: Optional[_MarkerPanel] = None
+    if not args.no_viser:
+        marker_csv = _MarkerCsvWriter(out_dir / "markers.csv")
+        marker_panel = _MarkerPanel.build(
+            marker_csv, args.viser_host, args.viser_port, share=True)
+        if marker_panel is None:
+            marker_csv.close()               # GUI failed to start — no writer needed
+            marker_csv = None
+        else:
+            print(f"[info] marker GUI on http://{args.viser_host}:{args.viser_port} "
+                  "(open it on your phone; tap Start/Stop demo — GREEN=live, RED=idle).")
+            if marker_panel.share_url:
+                print(f"[info] marker GUI share URL: {marker_panel.share_url} "
+                      "(works off the laptop's network).")
 
     # ── Wait for duration / Ctrl+C ───────────────────────────────────────────
     # Handle SIGINT ourselves so Ctrl+C tears down in the SAME order as the
@@ -1204,14 +1738,14 @@ def main() -> None:
     stopped_intentionally = False
     try:
         print("[info] Recording… press Ctrl+C to stop.")
-        t_end = None if args.duration is None else time.monotonic() + args.duration
+        t_end = None if args.duration is None else time.perf_counter() + args.duration
         while enc_thread.is_alive():
             if interrupted.is_set():
                 stopped_intentionally = True
                 print()                                # newline after ^C
                 _speak("stopped")
                 break
-            if t_end is not None and time.monotonic() >= t_end:
+            if t_end is not None and time.perf_counter() >= t_end:
                 stopped_intentionally = True
                 _speak("done")
                 break
@@ -1238,8 +1772,16 @@ def main() -> None:
             print("[warn] ffmpeg didn't exit in time — killing it.")
             proc.kill()
             rets.append(proc.wait())
+    if marker_panel is not None:
+        marker_panel.close()            # closes any open segment, stops the server
+    if marker_csv is not None:
+        marker_csv.close()
     cam_left.close()
     cam_right.close()
+    if imu is not None:
+        imu.close()                     # stop the receive thread before closing the sink
+    if imu_csv is not None:
+        imu_csv.close()
     awake.release()                     # restore sleep settings; stop caffeinate
 
     # ffmpeg exits 255 / -SIGINT on a graceful SIGINT — expected, file is complete.
@@ -1250,7 +1792,14 @@ def main() -> None:
         print(f"[info] Saved → {out_left}")
         print(f"[info] Saved → {out_right}")
         print(f"[info] Sync log → {sync_csv}")
+        if imu_info.get("enabled"):
+            print(f"[info] IMU log → {out_dir / 'imu_log.csv'}")
         _report_sync(sync_csv)
+        if box_left.dropped:
+            print(f"[warn] dropped {box_left.dropped} master frames at the encoder "
+                  "(couldn't keep the sensor's pace) — they show as larger dt gaps "
+                  "in sync_log, not silent decimation. Lower --fps / resolution or "
+                  "raise --sync-buffer if this is high.")
         _speak("saved")
     else:
         print(f"[warn] ffmpeg exited with codes {rets} — output may be incomplete.")
