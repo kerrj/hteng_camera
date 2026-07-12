@@ -89,29 +89,35 @@ def worker(args):
     model = M.load_ffs(args.weights, dev, valid_iters=args.iters)
     fx, H, dirs, Rv_ls, Rv_rs = build_geom(b_hat, Rs, args.tile_w, args.hfov, args.vfov, dev)
 
+    to_t = lambda b: torch.tensor(cv2.cvtColor(b, cv2.COLOR_BGR2RGB),
+                                  device=dev, dtype=torch.float32).permute(2, 0, 1)
     cap = cv2.VideoCapture(args.video)
-    fish_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) // 2
+    cap_r = cv2.VideoCapture(args.video_right) if args.video_right else None
+    # --video-right => separate per-eye files (long-test2 convention); else the
+    # single --video is a side-by-side stereo frame (long-test1's 8-bit file).
+    fish_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) // (1 if cap_r else 2)
     fish_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     Wf, Hf = int(fish_w * args.scale), int(fish_h * args.scale)
     cap.set(cv2.CAP_PROP_POS_FRAMES, args.start)
+    if cap_r:
+        cap_r.set(cv2.CAP_PROP_POS_FRAMES, args.start)
 
     n = args.end - args.start
     out = f"{args.out_dir}/range_{args.start}_{args.end}.npy"
     stack = np.lib.format.open_memmap(out, mode="w+", dtype=np.float16, shape=(n, Hf, Wf))
 
-    def split(fr):
-        half = fr.shape[1] // 2
-        to_t = lambda b: torch.tensor(cv2.cvtColor(b, cv2.COLOR_BGR2RGB),
-                                      device=dev, dtype=torch.float32).permute(2, 0, 1)
-        return to_t(fr[:, :half]), to_t(fr[:, half:])
-
     t0 = time.time()
     for i in range(n):
         ok, fr = cap.read()
-        if not ok:
+        okr, frr = cap_r.read() if cap_r else (True, None)
+        if not ok or not okr:
             print(f"[gpu slice {args.start}-{args.end}] short read at {args.start+i}", flush=True)
             break
-        fL, fR = split(fr)
+        if cap_r:
+            fL, fR = to_t(fr), to_t(frr)
+        else:
+            half = fr.shape[1] // 2
+            fL, fR = to_t(fr[:, :half]), to_t(fr[:, half:])
         tl = [M.render_tile(fL, Rv, dirs, Kl, Dl, args.tile_w, H) for Rv in Rv_ls]
         tr = [M.render_tile(fR, Rv, dirs, Kr, Dr, args.tile_w, H) for Rv in Rv_rs]
         disps = ffs_batch(model, tl, tr, dev).reshape(len(tl), H, args.tile_w)
@@ -123,6 +129,8 @@ def worker(args):
             print(f"[{args.start}-{args.end}] {i+1}/{n}  {fps:.1f} fps", flush=True)
     stack.flush()
     cap.release()
+    if cap_r:
+        cap_r.release()
     print(f"[{args.start}-{args.end}] DONE {n} frames in {(time.time()-t0)/60:.1f} min -> {out}", flush=True)
 
 
@@ -133,7 +141,9 @@ def launcher(args):
     slices = list(zip(bounds[:-1], bounds[1:]))
     # shared meta for reconstruction
     with open(f"{args.out_dir}/meta.json", "w") as f:
-        json.dump({"video": os.path.abspath(args.video), "calib_dir": os.path.abspath(args.calib_dir),
+        json.dump({"video": os.path.abspath(args.video),
+                   "video_right": os.path.abspath(args.video_right) if args.video_right else None,
+                   "calib_dir": os.path.abspath(args.calib_dir),
                    "left_serial": args.left_serial, "right_serial": args.right_serial,
                    "scale": args.scale, "tile_w": args.tile_w, "hfov": args.hfov,
                    "vfov": args.vfov, "pitches": PITCHES, "iters": args.iters,
@@ -152,6 +162,8 @@ def launcher(args):
                "--hfov", str(args.hfov), "--vfov", str(args.vfov),
                "--scale", str(args.scale), "--iters", str(args.iters),
                "--min-disp", str(args.min_disp), "--max-depth", str(args.max_depth)]
+        if args.video_right:
+            cmd += ["--video-right", args.video_right]
         print(f"launch gpu {gid}: frames {s}-{e}", flush=True)
         procs.append(subprocess.Popen(cmd, env=env))
     rc = [p.wait() for p in procs]
@@ -165,6 +177,9 @@ def main():
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--end", type=int, default=7006)
     ap.add_argument("--video", default="long-test1/left_stereo_8bit.mp4")
+    ap.add_argument("--video-right", default=None,
+                    help="separate right-eye mp4 (per-eye recordings like long-test2); "
+                         "if omitted, --video is treated as a side-by-side stereo frame")
     ap.add_argument("--calib-dir", default="long-test1")
     ap.add_argument("--left-serial", default="046060323008")
     ap.add_argument("--right-serial", default="046060323001")

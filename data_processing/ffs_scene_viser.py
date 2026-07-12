@@ -21,6 +21,9 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--point-size", type=float, default=0.004)
     ap.add_argument("--max-points", type=int, default=2_000_000)
+    ap.add_argument("--up", default="-y",
+                    help="scene up dir: -y for left-cam clouds, +z for the VIO world frame")
+    ap.add_argument("--share", action="store_true", help="request a public viser share URL")
     args = ap.parse_args()
 
     pc = o3d.io.read_point_cloud(args.ply)
@@ -33,7 +36,9 @@ def main():
     print(f"{len(P):,} pts  range p50={np.median(rng):.2f}m max={rng.max():.2f}m")
 
     server = viser.ViserServer(port=args.port)
-    server.scene.set_up_direction("-y")                 # world +y is down
+    if args.share:
+        print(f"SHARE URL: {server.request_share_url()}", flush=True)
+    server.scene.set_up_direction(args.up)
     server.scene.add_frame("/left_cam", axes_length=0.15, axes_radius=0.005)
 
     ps = server.gui.add_slider("point size", 0.001, 0.02, 0.001, args.point_size)

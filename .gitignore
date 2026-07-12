@@ -24,3 +24,8 @@ data_processing/out/
 
 # Fast-FoundationStereo model weights (~900 MB, fetched via install script)
 data_processing/weights/
+
+# Raw stereo recordings (large: videos + derived/ pipeline outputs) — copied in,
+# regenerable, not tracked.
+/long-test1/
+/long-test2/

@@ -222,7 +222,10 @@ def main():
     # records (pair_type="temporal", true gap) straight into loop_matches.jsonl.
     accum = []
     MP.collect_temporal_pairs(store, eligible, cams, args, accum)
-    with open(out_path, "w") as out_f:
+    # gate_temporal_all writes record DICTS -> use the same async JSONL writer as
+    # vio_match_pairs (a plain file's .write() rejects dicts). jkerr updated the
+    # matcher's writer but not this caller.
+    with MP.AsyncJsonlWriter(out_path) as out_f:
         MP.gate_temporal_all(accum, theta_tol, args, out_f)
     print(f"wrote {out_path}")
 

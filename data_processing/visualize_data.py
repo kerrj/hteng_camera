@@ -151,6 +151,11 @@ def main():
                           "current-frame frustums pop")
     ap.add_argument("--current-line-width", type=float, default=3.0)
     ap.add_argument("--port", type=int, default=8081)
+    ap.add_argument("--share", action="store_true",
+                     help="request a public viser share-tunnel URL (no SSH forward needed)")
+    ap.add_argument("--trail-stride", type=int, default=50,
+                     help="draw a trail frustum every Nth frame (the full path is a "
+                          "polyline); avoids 2*n_frames frustum objects choking the browser")
     args = ap.parse_args()
 
     derived = os.path.join(args.recording, "derived")
@@ -281,6 +286,9 @@ def main():
         print(f"hands: {', '.join(hand_tracks)} (FK'd into world via left-cam pose)")
 
     server = viser.ViserServer(port=args.port)
+    if args.share:
+        share_url = server.request_share_url()
+        print(f"SHARE URL: {share_url}", flush=True)
     server.scene.world_axes.visible = False
     server.scene.set_up_direction("+z")  # stage-5 world is gravity-aligned
 
@@ -288,17 +296,18 @@ def main():
         "/landmarks", points=points[keep_points], colors=point_colors[keep_points],
         point_size=args.point_size, point_shape="circle")
 
-    # All frustums thin/faint for the trajectory shape; one bright thick pair
-    # for the current frame (updated below).
-    for i in range(n_frames):
+    # Full trajectory as ONE polyline through the left-cam centers — NOT a
+    # frustum per frame (2*n_frames frustum objects tanks the browser at
+    # multi-minute scale; jkerr's original was sized for ~900 frames). Sparse
+    # trail frustums (every --trail-stride) give orientation cues along the path.
+    seg = np.stack([cam_pos_world[:-1], cam_pos_world[1:]], axis=1)   # (n-1,2,3)
+    server.scene.add_line_segments("/trail/path", seg.astype(np.float32),
+                                   colors=(150, 100, 30), line_width=1.5)
+    for i in range(0, n_frames, max(1, args.trail_stride)):
         server.scene.add_camera_frustum(
-            f"/trail/cam_l_{i}", fov=1.4, aspect=1.2, scale=args.frustum_scale * 0.6,
+            f"/trail/cam_l_{i}", fov=1.4, aspect=1.2, scale=args.frustum_scale * 0.5,
             line_width=args.trail_line_width,
             color=(0.6, 0.4, 0.1), wxyz=cam_quat_world[i], position=cam_pos_world[i])
-        server.scene.add_camera_frustum(
-            f"/trail/cam_r_{i}", fov=1.4, aspect=1.2, scale=args.frustum_scale * 0.6,
-            line_width=args.trail_line_width,
-            color=(0.1, 0.4, 0.5), wxyz=cam_quat_world_r[i], position=cam_pos_world_r[i])
     current_frustum_l = server.scene.add_camera_frustum(
         "/current_left", fov=1.4, aspect=1.2, scale=args.frustum_scale,
         line_width=args.current_line_width,
