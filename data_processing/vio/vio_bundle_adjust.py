@@ -87,6 +87,13 @@ def parse_args():
     p.add_argument("--init-depth", type=float, default=1.0,
                     help="landmark init ball center depth (m)")
     p.add_argument("--pose-init-seed", type=int, default=0)
+    p.add_argument("--init-trajectory", default=None,
+                    help="trajectory npz (frame_idx, pose_wxyz_xyz) to take "
+                         "stage-1 frozen rotations + camera-center inits from, "
+                         "instead of the IMU gyro chain + random centers. Used "
+                         "by vio_windowed_ba.py's global refine: the stitched "
+                         "windowed solution is a near-correct init everywhere, "
+                         "where the raw gyro chain drifts over minutes.")
     p.add_argument("--max-iterations", type=int, default=15,
                     help="iteration cap for stage 1 (frozen-rotation positioning)")
     p.add_argument("--refine-iterations", type=int, default=3,
@@ -371,6 +378,23 @@ def main():
     key, sub = jax.random.split(key)
     point_init = jax.random.normal(sub, (n_points, 3)) * args.landmark_init_noise
     point_init = point_init.at[:, 2].add(args.init_depth)
+
+    if args.init_trajectory:
+        init = np.load(args.init_trajectory)
+        init_fi = init["frame_idx"]
+        pos = np.searchsorted(init_fi, frame_idx)
+        if pos.max() >= len(init_fi) or not np.array_equal(init_fi[pos], frame_idx):
+            raise ValueError(f"--init-trajectory {args.init_trajectory} does not "
+                             f"cover the solve's frames "
+                             f"({frame_idx[0]}..{frame_idx[-1]})")
+        init_poses = np.asarray(init["pose_wxyz_xyz"])[pos]
+        rot_init_wxyz = jnp.asarray(init_poses[:, :4], dtype=jnp.float32)
+        R_init = np.asarray(jax.vmap(lambda q: jaxlie.SO3(q).as_matrix())(
+            jnp.asarray(init_poses[:, :4])))
+        center_init = jnp.asarray(
+            -np.einsum("nji,nj->ni", R_init, init_poses[:, 4:]), dtype=jnp.float32)
+        print(f"stage-1 rotations + centers initialized from "
+              f"{args.init_trajectory} ({len(frame_idx)} frames)")
 
     keep_edge = rel_valid_orig
     print(f"{int(keep_edge.sum())} IMU relative-rotation edges")
