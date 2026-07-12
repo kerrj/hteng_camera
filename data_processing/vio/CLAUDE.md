@@ -242,3 +242,45 @@ trajectory); stage 1 needs ~15 iters to converge.
 Prior open items to re-check against the new solver (were measured on the OLD
 one): negative-depth landmarks, per-iteration cost growth over a long run.
 Track-quality-weighted costs still flagged as worth trying.
+
+## Windowed BA for long recordings (2026-07-12, branch depth_understanding)
+
+**CRITICAL ENV GOTCHA:** stage 5 (and everything jaxls) must run in a CURRENT
+jax/jaxls env. On smahapatra's setup that is conda env **`vio`** (jax 0.10.2,
+py3.13, torch 2.12.1+cu130 — cloned from jkerr's `jaxgpu`). The `eyeball` env
+(jax 0.6.2 + older jaxls) SILENTLY under-solves: its LM trust-region rejects
+nearly every step after ~iter 3 (`accepted=False` even when cost would drop
+3x), and the damage grows with problem size — testimu full solve 9.79° there
+vs **0.325°** in `vio` (byte-matches jkerr's reference). The long-test2
+"8-9° plateau" measured 2026-07-10 was largely THIS, not gyro drift.
+
+**Memory ceiling:** at long-test2 scale (11k frames, 16.35M obs) stage 1 fits
+(~34 GB) but stage 2 needs ~60 GB > A6000's 48 GB → RESOURCE_EXHAUSTED. Full-
+length single solves are not viable at this scale; use the windowed stage.
+
+**Stage 5w — `vio_windowed_ba.py`** (design doc:
+`docs/superpowers/specs/2026-07-12-windowed-ba-design.md`): solves overlapping
+~30 s windows in parallel across GPUs (`--gpus`; each window's gyro chain
+re-seeds gravity-aligned at its own first frame), aligns consecutive windows
+with a closed-form 4-DOF stitch (`vio_stitch.py`: both gauges gravity-aligned
++ metric → yaw+translation only; circular-mean yaw votes + center-mean t),
+blends overlaps (center lerp + quat nlerp), then re-runs the full solve from
+the stitched init via `vio_bundle_adjust.py --init-trajectory` (new flag,
+along with `--start-frame`). `--ba-python` selects the BA interpreter (point
+it at the `vio` env). `--no-refine` stops after stitching. Per-window
+residuals flagged >1°; per-seam yaw-vote-spread + center-rms printed.
+
+For the refine at scales where stage 2 OOMs, subsample tracks to a ~6M-obs
+budget with per-frame coverage (keep top-500 longest as loop/global glue +
+random-sample the rest; long-test2: 26.8k tracks, every frame >=107 obs).
+
+**Results (long-test2, 11042 frames):** 17/17 windows converged 0.12–0.58°;
+seams 0.005–0.77° yaw-vote spread; two-stage refine on the 6M subsample
+(+ loop closure) → **0.328° median angular residual** full-length (vs 8-9°
+before). Refine moved cameras median 95 cm vs stitched — real warp removal
+(side-view: 4 m of vertical smear → flat 2.5 m-tall level slab). Ablation:
+stage-1-only refine at full 16.35M obs → 0.339° but keeps the stitched
+rotations' per-window tilts. testimu end-to-end: windows 0.353/0.342°, seam
+spread 0.062° + 0.58 cm rms, final 0.325° = reference to 0.12 cm median.
+Windowed solves also parallelize: 17 windows on 6 GPUs ≈ 30 min wall vs 2.5 h+
+for the (OOM-doomed) monolithic attempt.

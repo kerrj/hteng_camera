@@ -159,3 +159,12 @@ a blurry frame. THEN phase 2 (temporal) / phase 3 (mono fill).
 - NEXT: run `vio/` to get `T_cam_world(t)`, then fuse per-frame scene depth +
   hands into ONE world cloud (`hand_world(t) = T_cam_world(t) @ hand_cam(t)`).
   Newer recording `long-test2/` has a full `derived/` pipeline already.
+- 2026-07-12: long-test2 full-length VIO SOLVED via **windowed BA**
+  (`vio/vio_windowed_ba.py` — see `vio/CLAUDE.md`'s "Windowed BA" section):
+  0.328° median residual over all 11042 frames (was 8-9°, which turned out to
+  be mostly a broken-env artifact — jaxls solves MUST use the `vio` conda env,
+  NOT `eyeball`; full-length monolithic solves also OOM at this scale, so the
+  windowed stage is required either way). Dense fusion
+  (`ffs_fuse_world.py --trajectory long-test2/derived/trajectory.npz`) now
+  yields a flat, level multi-room world cloud (13.7M pts cleaned;
+  `out/lt2_world_refined.ply`, compare png `out/lt2_world_compare.png`).
