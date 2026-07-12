@@ -57,6 +57,10 @@ def parse_args():
     p.add_argument("--out", default=None, help="default: <recording>/derived/trajectory.npz")
     p.add_argument("--n-frames", type=int, default=None,
                     help="cap the number of (left-eye) frames included")
+    p.add_argument("--start-frame", type=int, default=None,
+                    help="first video frame of the solve window; with --n-frames "
+                         "this solves frames [start, start+n] (windowed BA); "
+                         "default: the recording's first frame")
     p.add_argument("--profile-compile", action="store_true",
                     help="time JIT compile vs. cached per-iteration solve separately")
     p.add_argument("--robust-loss", choices=("huber", "cauchy", "geman_mcclure"),
@@ -115,16 +119,17 @@ def load_stereo(recording_dir, ls, rs):
     return np.array(st["R"], np.float64), np.array(st["t"], np.float64).reshape(3)
 
 
-def load_tracks(tracks_path, max_frame):
+def load_tracks(tracks_path, min_frame, max_frame):
     """Returns list of tracks; each track is a list of (eye, frame, px (2,))
-    observations, restricted to frame <= max_frame."""
+    observations, restricted to min_frame <= frame <= max_frame (either bound
+    None = unbounded)."""
     tracks = []
     with open(tracks_path) as f:
         for line in f:
             r = json.loads(line)
-            obs = r["observations"]
-            if max_frame is not None:
-                obs = [o for o in obs if o["frame"] <= max_frame]
+            obs = [o for o in r["observations"]
+                   if (min_frame is None or o["frame"] >= min_frame)
+                   and (max_frame is None or o["frame"] <= max_frame)]
             if len(obs) < 2:
                 continue
             tracks.append([(o["eye"], o["frame"], np.array(o["px"], dtype=np.float64))
@@ -249,15 +254,20 @@ def main():
     gravity_cam = imu["gravity_cam"]
     gravity_weight = imu["gravity_weight"]
 
-    if args.n_frames is not None:
-        keep = frame_idx <= (frame_idx[0] + args.n_frames)
-        frame_idx = frame_idx[keep]
-        frame_valid = frame_valid[keep]
-        n = len(frame_idx)
-        rel_quat = rel_quat[:n - 1]
-        rel_valid = rel_valid[:n - 1]
-        gravity_cam = gravity_cam[:n]
-        gravity_weight = gravity_weight[:n]
+    if args.n_frames is not None or args.start_frame is not None:
+        lo = args.start_frame if args.start_frame is not None else int(frame_idx[0])
+        hi = lo + args.n_frames if args.n_frames is not None else int(frame_idx[-1])
+        keep = (frame_idx >= lo) & (frame_idx <= hi)
+        a = int(np.argmax(keep))
+        b = a + int(keep.sum())
+        assert keep.any() and keep[a:b].all(), \
+            f"frame window [{lo},{hi}] empty or non-contiguous in frame_idx"
+        frame_idx = frame_idx[a:b]
+        frame_valid = frame_valid[a:b]
+        rel_quat = rel_quat[a:b - 1]
+        rel_valid = rel_valid[a:b - 1]
+        gravity_cam = gravity_cam[a:b]
+        gravity_weight = gravity_weight[a:b]
 
     # Drop invalid-timestamp frames entirely (they have no IMU tie to neighbors).
     n_dropped = int((~frame_valid).sum())
@@ -299,7 +309,7 @@ def main():
     rel_wxyz_xyz_right = np.asarray(jaxlie.SE3.from_rotation_and_translation(
         jaxlie.SO3.from_matrix(R_st), t_st).wxyz_xyz)
 
-    tracks = load_tracks(tracks_path, max_frame)
+    tracks = load_tracks(tracks_path, int(frame_idx[0]), max_frame)
     print(f"{len(tracks)} tracks (>=2 obs) within the frame range")
 
     pose_ids, point_ids, obs_px, obs_is_right = [], [], [], []
