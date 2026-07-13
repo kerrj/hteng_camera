@@ -42,23 +42,30 @@ import jaxls
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from vio_bundle_adjust import (Point3Var, CamCenterVar, ScaleVar,
+from vio_bundle_adjust import (Point3Var, CamCenterVar,
                                load_intrinsics, load_stereo,
                                load_tracks, unproject_all)
 
 
-def _win_residual(vals, center, point_var, scale_var, pose_quat, ray, rel, w,
+def _win_residual(vals, center, point_var, pose_quat, ray, rel, w,
                   robust_scale):
-    """GLOMAP positioning residual, frozen rotations, per-obs weight (0 = pad
-    row). MODULE-LEVEL on purpose: jaxls hashes the residual fn by identity in
-    the jit cache key, so a per-window closure would force a retrace per window."""
+    """Positioning residual with the per-observation scale ANALYTICALLY
+    eliminated: for fixed X, c the optimal GLOMAP d* = <ray, X-c>/|X-c|^2, and
+    substituting it leaves the component of the ray PERPENDICULAR to (X-c) --
+    a pure angular (sin-theta) error. Same optimum as the ScaleVar form, but
+    the solver never sees the 50k+ per-obs scale variables that dominated the
+    window solve (and forced Schur, whose static elimination plan blocked
+    vmapping across windows). Frozen rotations; per-obs weight w=0 pads.
+    MODULE-LEVEL on purpose: jaxls hashes the residual fn by identity in the
+    jit cache key, so a per-window closure would retrace per window."""
     T_rel = jaxlie.SE3(rel)
     R_wl = jaxlie.SO3(pose_quat)
     R_wc = T_rel.rotation() @ R_wl
     cam_pos = vals[center] - (R_wc.inverse() @ T_rel.translation())
     ray_w = R_wc.inverse() @ ray
-    d = jnp.exp(vals[scale_var])
-    r = ray_w - d * (vals[point_var] - cam_pos)
+    v = vals[point_var] - cam_pos
+    v_dir = v / (jnp.linalg.norm(v) + 1e-9)
+    r = ray_w - jnp.dot(ray_w, v_dir) * v_dir   # perpendicular component
     abs_r = jnp.linalg.norm(r) + 1e-9
     wr = jax.lax.stop_gradient(1.0 / (1.0 + (abs_r / robust_scale) ** 2))
     return r * (w * jnp.sqrt(wr))
@@ -250,12 +257,10 @@ def main():
     def make_problem(wi):
         centers = CamCenterVar(id=jnp.arange(W))
         points = Point3Var(id=jnp.arange(n_pts_pad))
-        scales = ScaleVar(id=jnp.arange(n_obs_pad))
         cost = jaxls.Cost(
             _win_residual,
             (CamCenterVar(id=jnp.asarray(P_pose[wi])),
              Point3Var(id=jnp.asarray(P_point[wi])),
-             ScaleVar(id=jnp.arange(n_obs_pad)),
              jnp.asarray(quat_per_obs[wi]),
              jnp.asarray(P_ray[wi]),
              jnp.asarray(P_rel[wi]),
@@ -263,14 +268,13 @@ def main():
              jnp.asarray(args.robust_scale, dtype=jnp.float32)),
         )
         problem = jaxls.LeastSquaresProblem(
-            [cost], [centers, points, scales]).analyze(schur_elimination="off")
+            [cost], [centers, points]).analyze(schur_elimination="off")
         key = jax.random.PRNGKey(wi)
         k1, k2 = jax.random.split(key)
         vals0 = jaxls.VarValues.make([
             centers.with_value(jax.random.normal(k1, (W, 3)) * 0.1),
             points.with_value(jax.random.normal(k2, (n_pts_pad, 3)) * 0.5
                               + jnp.array([0, 0, 1.0])),
-            scales.with_value(jnp.zeros(n_obs_pad)),
         ])
         return problem, vals0
 
