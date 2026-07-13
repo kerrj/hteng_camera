@@ -43,8 +43,25 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from vio_bundle_adjust import (Point3Var, CamCenterVar, ScaleVar,
-                               positioning_cost, load_intrinsics, load_stereo,
+                               load_intrinsics, load_stereo,
                                load_tracks, unproject_all)
+
+
+def _win_residual(vals, center, point_var, scale_var, pose_quat, ray, rel, w,
+                  robust_scale):
+    """GLOMAP positioning residual, frozen rotations, per-obs weight (0 = pad
+    row). MODULE-LEVEL on purpose: jaxls hashes the residual fn by identity in
+    the jit cache key, so a per-window closure would force a retrace per window."""
+    T_rel = jaxlie.SE3(rel)
+    R_wl = jaxlie.SO3(pose_quat)
+    R_wc = T_rel.rotation() @ R_wl
+    cam_pos = vals[center] - (R_wc.inverse() @ T_rel.translation())
+    ray_w = R_wc.inverse() @ ray
+    d = jnp.exp(vals[scale_var])
+    r = ray_w - d * (vals[point_var] - cam_pos)
+    abs_r = jnp.linalg.norm(r) + 1e-9
+    wr = jax.lax.stop_gradient(1.0 / (1.0 + (abs_r / robust_scale) ** 2))
+    return r * (w * jnp.sqrt(wr))
 
 
 def parse_args():
@@ -107,6 +124,24 @@ def main():
 
     frame_to_pose = {int(f): i for i, f in enumerate(frame_idx)}
     max_frame = int(frame_idx[-1])
+
+    # ONE global IMU rotation chain, gravity-aligned at frame 0 (same recipe as
+    # vio_bundle_adjust). Windows slice it: gyro drift over any 3s window is
+    # negligible, and this avoids re-seeding each window from its own gravity
+    # estimate (noisy during fast motion -> was causing 10-15 deg window errors).
+    g0 = gravity_cam[0] / (np.linalg.norm(gravity_cam[0]) + 1e-12)
+    a_down = np.array([0.0, 0.0, -1.0])
+    q0 = np.array([1.0 + a_down @ g0, *np.cross(a_down, g0)])
+    if np.linalg.norm(q0) < 1e-6:
+        q0 = np.array([0.0, 1.0, 0.0, 0.0])
+    q0 = q0 / np.linalg.norm(q0)
+    def _chain_step(R_prev_wxyz, delta_wxyz):
+        R_k = jaxlie.SO3(delta_wxyz).inverse() @ jaxlie.SO3(R_prev_wxyz)
+        return R_k.wxyz, R_k.wxyz
+    q0_j = jnp.asarray(q0, dtype=jnp.float32)
+    _, rot_rest = jax.lax.scan(
+        _chain_step, q0_j, jnp.asarray(delta_prev[1:], dtype=jnp.float32))
+    rot_chain = np.asarray(jnp.concatenate([q0_j[None], rot_rest], axis=0))
 
     import h5py
     with h5py.File(os.path.join(rec, "derived", "features.h5"), "r") as f:
@@ -192,77 +227,68 @@ def main():
         if m < n_obs_pad:  # pad by repeating row 0 with weight 0
             P_pose[wi, m:] = P_pose[wi, 0]; P_point[wi, m:] = P_point[wi, 0]
             P_ray[wi, m:] = P_ray[wi, 0]; P_rel[wi, m:] = P_rel[wi, 0]
-        # IMU rotation chain seeded gravity-aligned at the window start.
-        g0 = gravity_cam[s] / (np.linalg.norm(gravity_cam[s]) + 1e-12)
-        a = np.array([0.0, 0, -1])
-        q0 = np.array([1.0 + a @ g0, *np.cross(a, g0)])
-        if np.linalg.norm(q0) < 1e-6:
-            q0 = np.array([0.0, 1, 0, 0])
-        q = q0 / np.linalg.norm(q0)
-        R_init[wi, 0] = q
-        Rk = jaxlie.SO3(jnp.asarray(q))
-        for j in range(1, W):
-            Rk = jaxlie.SO3(jnp.asarray(delta_prev[s + j])).inverse() @ Rk
-            R_init[wi, j] = np.asarray(Rk.wxyz)
+        # Rotations: slice of ONE global IMU chain (built below) -- per-window
+        # gravity re-seeding was noisy during fast motion (low gravity
+        # confidence) and produced 10-15 deg window rotation errors.
+        R_init[wi] = rot_chain[s:s + W]
 
-    # --- per-window solve, vmapped-free but jit-cached (same shapes) ---------
-    @jaxls.Cost.factory
-    def win_positioning_cost(vals, center, point_var, scale_var, pose_quat,
-                             ray, rel, w, robust_scale):
-        T_rel = jaxlie.SE3(rel)
-        R_wl = jaxlie.SO3(pose_quat)
-        R_wc = T_rel.rotation() @ R_wl
-        cam_pos = vals[center] - (R_wc.inverse() @ T_rel.translation())
-        ray_w = R_wc.inverse() @ ray
-        d = jnp.exp(vals[scale_var])
-        r = ray_w - d * (vals[point_var] - cam_pos)
-        abs_r = jnp.linalg.norm(r) + 1e-9
-        wr = jax.lax.stop_gradient(1.0 / (1.0 + (abs_r / robust_scale) ** 2))
-        return r * (w * jnp.sqrt(wr))
-
-    # ALL windows in ONE block-diagonal problem: window wi's variables live at
-    # id offsets wi*W / wi*n_pts_pad / wi*n_obs_pad. Windows share no variables
-    # (block-diagonal), so this is exactly N independent solves -- but with ONE
-    # analyze, ONE compile, and the GPU working on all windows concurrently.
+    # --- vmapped solve over all windows ---------------------------------------
+    # Every window is padded to the same (W, n_pts_pad, n_obs_pad) shape, the
+    # residual fn is MODULE-LEVEL (stable function identity -> stable jit key;
+    # a @Cost.factory closure here would retrace per window), and analyze runs
+    # with schur_elimination="off" so the id arrays are TRACED leaves (Schur's
+    # elimination plan is static and would bake per-window connectivity into
+    # the jit key). All N per-window problems then share one treedef: stack
+    # their leaves and vmap a single compiled solve across the window axis.
     t0 = time.time()
-    off_pose = (np.arange(N)[:, None] * W + P_pose).reshape(-1)
-    off_point = (np.arange(N)[:, None] * n_pts_pad + P_point).reshape(-1)
-    off_scale = np.arange(N * n_obs_pad)
-    quat_flat = np.take_along_axis(R_init, P_pose[..., None], axis=1).reshape(-1, 4)
+    quat_per_obs = np.take_along_axis(R_init, P_pose[..., None], axis=1)  # (N,obs,4)
 
-    centers = CamCenterVar(id=jnp.arange(N * W))
-    points = Point3Var(id=jnp.arange(N * n_pts_pad))
-    scales = ScaleVar(id=jnp.arange(N * n_obs_pad))
-    costs = [win_positioning_cost(
-        CamCenterVar(id=jnp.asarray(off_pose)),
-        Point3Var(id=jnp.asarray(off_point)),
-        ScaleVar(id=jnp.asarray(off_scale)),
-        jnp.asarray(quat_flat),
-        jnp.asarray(P_ray.reshape(-1, 3)),
-        jnp.asarray(P_rel.reshape(-1, 7)),
-        jnp.asarray(P_w.reshape(-1)),
-        jnp.asarray(args.robust_scale),
-    )]
-    key = jax.random.PRNGKey(0)
-    k1, k2 = jax.random.split(key)
-    vals0 = jaxls.VarValues.make([
-        centers.with_value(jax.random.normal(k1, (N * W, 3)) * 0.1),
-        points.with_value(jax.random.normal(k2, (N * n_pts_pad, 3)) * 0.5
-                          + jnp.array([0, 0, 1.0])),
-        scales.with_value(jnp.zeros(N * n_obs_pad)),
-    ])
-    problem = jaxls.LeastSquaresProblem(costs, [centers, points, scales]).analyze()
-    print(f"[timing] analyze (once, all windows): {time.time() - t0:.2f}s")
+    def make_problem(wi):
+        centers = CamCenterVar(id=jnp.arange(W))
+        points = Point3Var(id=jnp.arange(n_pts_pad))
+        scales = ScaleVar(id=jnp.arange(n_obs_pad))
+        cost = jaxls.Cost(
+            _win_residual,
+            (CamCenterVar(id=jnp.asarray(P_pose[wi])),
+             Point3Var(id=jnp.asarray(P_point[wi])),
+             ScaleVar(id=jnp.arange(n_obs_pad)),
+             jnp.asarray(quat_per_obs[wi]),
+             jnp.asarray(P_ray[wi]),
+             jnp.asarray(P_rel[wi]),
+             jnp.asarray(P_w[wi]),
+             jnp.asarray(args.robust_scale, dtype=jnp.float32)),
+        )
+        problem = jaxls.LeastSquaresProblem(
+            [cost], [centers, points, scales]).analyze(schur_elimination="off")
+        key = jax.random.PRNGKey(wi)
+        k1, k2 = jax.random.split(key)
+        vals0 = jaxls.VarValues.make([
+            centers.with_value(jax.random.normal(k1, (W, 3)) * 0.1),
+            points.with_value(jax.random.normal(k2, (n_pts_pad, 3)) * 0.5
+                              + jnp.array([0, 0, 1.0])),
+            scales.with_value(jnp.zeros(n_obs_pad)),
+        ])
+        return problem, vals0
+
+    pairs = [make_problem(wi) for wi in range(N)]
+    stacked_prob = jax.tree.map(lambda *xs: jnp.stack(xs), *[p for p, _ in pairs])
+    stacked_vals = jax.tree.map(lambda *xs: jnp.stack(xs), *[v for _, v in pairs])
+    print(f"[timing] build+analyze {N} windows: {time.time() - t0:.2f}s")
+
+    def _solve_one(prob, v0):
+        sol = prob.solve(
+            v0, linear_solver="conjugate_gradient",
+            trust_region=jaxls.TrustRegionConfig(),
+            termination=jaxls.TerminationConfig(
+                max_iterations=args.iters, early_termination=False),
+            verbose=False)
+        return sol[CamCenterVar], sol[Point3Var]
+
     t0 = time.time()
-    sol = problem.solve(
-        vals0, linear_solver="conjugate_gradient",
-        trust_region=jaxls.TrustRegionConfig(),
-        termination=jaxls.TerminationConfig(
-            max_iterations=args.iters, early_termination=False),
-        verbose=False)
-    c_all = np.asarray(sol[CamCenterVar]).reshape(N, W, 3)
-    p_all = np.asarray(sol[Point3Var]).reshape(N, n_pts_pad, 3)
-    print(f"[timing] solve (once, all {N} windows): {time.time() - t0:.2f}s")
+    c_all, p_all = jax.vmap(_solve_one)(stacked_prob, stacked_vals)
+    c_all = np.asarray(jax.block_until_ready(c_all))
+    p_all = np.asarray(p_all)
+    print(f"[timing] vmapped solve, all {N} windows: {time.time() - t0:.2f}s")
 
     # --- stitch ---------------------------------------------------------------
     centers_glob = np.zeros((n_frames, 3))
