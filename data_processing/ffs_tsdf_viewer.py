@@ -37,6 +37,9 @@ def main():
     ap.add_argument("--dynamic-max-points", type=int, default=25_000,
                     help="per-frame cap (random subsample) -- keeps the "
                          "websocket stream viable at playback rates")
+    ap.add_argument("--mesh", default=None,
+                    help="mesh ply override (e.g. a decimated _tsdf_view.ply "
+                         "for big segments); default <prefix>_tsdf_mesh.ply")
     args = ap.parse_args()
 
     seg = json.load(open(f"{args.prefix}_segment.json"))
@@ -44,7 +47,7 @@ def main():
     if args.fps is None:
         args.fps = seg.get("fps", 30.0)
 
-    mesh = o3d.io.read_triangle_mesh(f"{args.prefix}_tsdf_mesh.ply")
+    mesh = o3d.io.read_triangle_mesh(args.mesh or f"{args.prefix}_tsdf_mesh.ply")
     tm = trimesh.Trimesh(np.asarray(mesh.vertices), np.asarray(mesh.triangles),
                          vertex_colors=(np.asarray(mesh.vertex_colors) * 255).astype(np.uint8),
                          process=False)
