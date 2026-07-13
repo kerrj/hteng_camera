@@ -27,7 +27,9 @@ def main():
     ap.add_argument("--trajectory", default="long-test2/derived/trajectory.npz")
     ap.add_argument("--port", type=int, default=8091)
     ap.add_argument("--share", action="store_true")
-    ap.add_argument("--fps", type=float, default=30.0)
+    ap.add_argument("--fps", type=float, default=None,
+                    help="playback rate; default: the recording fps from the "
+                         "segment json (falls back to 30)")
     ap.add_argument("--dynamic", default=None,
                     help="<prefix>_dynamic.npz from ffs_dynamic_residual.py: "
                          "per-frame residual points played over the static mesh")
@@ -39,6 +41,8 @@ def main():
 
     seg = json.load(open(f"{args.prefix}_segment.json"))
     s0, e0 = seg["start"], seg["end"]
+    if args.fps is None:
+        args.fps = seg.get("fps", 30.0)
 
     mesh = o3d.io.read_triangle_mesh(f"{args.prefix}_tsdf_mesh.ply")
     tm = trimesh.Trimesh(np.asarray(mesh.vertices), np.asarray(mesh.triangles),

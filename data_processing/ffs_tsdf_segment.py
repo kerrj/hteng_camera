@@ -141,8 +141,13 @@ def main():
     centers = -np.einsum("nji,nj->ni", Rws, poses[:, 4:])
     pose_of = {int(f): i for i, f in enumerate(frame_idx)}
 
+    # true frame rate from the video (long-test1 is 30 fps, long-test2 is 40!)
+    _c = cv2.VideoCapture(meta["video"])
+    fps = _c.get(cv2.CAP_PROP_FPS) or 30.0
+    _c.release()
+
     imu = np.load(args.imu)
-    gyro_dps = 2 * np.degrees(np.arccos(np.clip(np.abs(imu["rel_quat"][:, 0]), -1, 1))) * 30
+    gyro_dps = 2 * np.degrees(np.arccos(np.clip(np.abs(imu["rel_quat"][:, 0]), -1, 1))) * fps
     gyro_frames = imu["frame_idx"][:-1]
 
     hands = {}
@@ -160,7 +165,8 @@ def main():
         s0, e0, rep = pick_segment(centers, frame_idx, gyro_dps, gyro_frames,
                                    hand_frames, args.window_frames,
                                    args.pick_stride, args.min_hand_frac)
-    print(f"segment: frames {s0}..{e0}  (t={s0/30:.1f}s..{e0/30:.1f}s)  {rep}", flush=True)
+    print(f"segment: frames {s0}..{e0}  (t={s0/fps:.1f}s..{e0/fps:.1f}s @ {fps:g} fps)  "
+          f"{rep}", flush=True)
 
     # virtual forward pinhole
     W = args.img_w
@@ -261,7 +267,7 @@ def main():
     o3d.io.write_triangle_mesh(out, mesh)
     print(f"wrote {len(mesh.vertices):,} verts / {len(mesh.triangles):,} tris -> {out}")
     with open(f"{args.out_prefix}_segment.json", "w") as f:
-        json.dump({"start": int(s0), "end": int(e0), "report": rep,
+        json.dump({"start": int(s0), "end": int(e0), "fps": float(fps), "report": rep,
                    "used": used, "skipped_blur": skipped_blur}, f, indent=2)
 
 
