@@ -10,7 +10,6 @@ same trajectory the TSDF used -- clean scene + moving hands, one world frame.
 """
 import argparse
 import json
-import threading
 import time
 
 import numpy as np
@@ -63,7 +62,9 @@ def main():
 
     g_frame = server.gui.add_slider("frame", s0, e0 - 1, 1, s0)
     g_play = server.gui.add_checkbox("play", True)
-    lock = threading.Lock()
+    # NO shared lock: holding one across viser setters deadlocks against viser's
+    # internal update lock (ABBA). Single-writer instead: the play loop is the
+    # only caller of show() while playing; the scrub callback only acts paused.
 
     def show(vf):
         i = pose_of.get(int(vf))
@@ -81,17 +82,16 @@ def main():
             h.visible = True
 
     def on_scrub(_):
-        with lock:
+        if not g_play.value:
             show(g_frame.value)
 
     g_frame.on_update(on_scrub)
     print(f"viser on :{args.port}", flush=True)
     while True:
         if g_play.value:
-            with lock:
-                nxt = g_frame.value + 1
-                g_frame.value = s0 if nxt >= e0 else nxt
-                show(g_frame.value)
+            nxt = g_frame.value + 1
+            g_frame.value = s0 if nxt >= e0 else nxt
+            show(g_frame.value)
         time.sleep(1.0 / args.fps)
 
 
