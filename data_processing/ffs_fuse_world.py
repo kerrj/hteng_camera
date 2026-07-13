@@ -43,6 +43,10 @@ def main():
     ap.add_argument("--trajectory", required=True)
     ap.add_argument("--out", default="data_processing/out/lt2_world.ply")
     ap.add_argument("--frame-stride", type=int, default=10, help="use every Nth VIO pose")
+    ap.add_argument("--start-frame", type=int, default=None,
+                    help="first video frame to fuse (segment mode)")
+    ap.add_argument("--end-frame", type=int, default=None,
+                    help="last video frame to fuse (inclusive)")
     ap.add_argument("--max-points-per-frame", type=int, default=30_000)
     ap.add_argument("--max-range", type=float, default=6.0, help="drop points beyond this (m)")
     ap.add_argument("--voxel", type=float, default=0.01, help="final voxel downsample size (m)")
@@ -107,6 +111,10 @@ def main():
     used = 0
     for i in range(0, len(frame_idx), args.frame_stride):
         vf = int(frame_idx[i])
+        if args.start_frame is not None and vf < args.start_frame:
+            continue
+        if args.end_frame is not None and vf > args.end_frame:
+            continue
         rng = range_of(vf)
         if rng is None:
             continue
