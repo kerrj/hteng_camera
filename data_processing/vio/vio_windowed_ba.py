@@ -1,23 +1,31 @@
-"""Windowed VIO solve: independent short-window positioning solves, stitched.
+"""Windowed VIO solve: independent short-window solves, chained by refined pose.
 
 Rationale: the global stage-5 solve is superlinear in trajectory length (CG
 iteration count blows up as LM damping decays on a long, gauge-free problem --
 observed: ~50min/iter at 11k frames), but the downstream use only needs LOW
 DRIFT OVER ~10s, not global consistency. So: solve fixed-size windows (default
-3s) independently -- each is tiny, well-conditioned, and identical in shape so
-jaxls JIT-compiles ONCE -- then chain windows by SE3-aligning each onto the
-previous over their overlap (default 1s).
+3s, overlapping by 2 frames) independently -- each is tiny, well-conditioned,
+and identical in shape so jaxls JIT-compiles ONCE per stage -- then chain them.
 
-Per window it runs only the frozen-rotation positioning stage (rotations from
-the IMU relative chain, gravity-aligned at the window start; GLOMAP bounded
-positioning cost). No SE3 refine: rotations stay IMU-integrated, which the
-full-solve validation showed tracks truth to ~1 deg; gyro drift over one 3s
-window is negligible.
+Per window, both stages of the global solver (both with the analytic-scale
+positioning residual, no per-obs ScaleVars):
+  1. frozen-rotation positioning (rotations sliced from ONE global IMU chain,
+     gravity-aligned at frame 0)
+  2. short SE3 refine (default 3 iters): rotations free, tethered by the IMU
+     relative-rotation + gravity costs -- same recipe as vio_bundle_adjust
+     stage 2. The full-solve A/B showed refine roughly halves 10s drift.
+
+Stitching: consecutive windows share --overlap-frames (default 2) frames. The
+gauge transform G aligning window k+1 into the stitched world is fixed by
+requiring its REFINED pose at the first shared frame to equal the stitched
+pose there (T_wc_stitched = T_wc_win @ G). This uses the window's own refined
+relative motion -- its strongest information -- instead of the old Procrustes
+fit over a 30-frame overlap of noisy positions.
 
 Fixed problem shape = fixed (n_obs_pad, n_points_pad) per window: observations
-are subsampled/padded to the p95 window's size, extra slots get zero-weight
-dummy costs. Landmarks are per-window variables (re-triangulated each window);
-only poses are stitched.
+are subsampled/padded (--max-obs caps the dense-Jacobian memory of
+dense_cholesky; measured accuracy-neutral). Landmarks are per-window variables
+(re-triangulated each window); only poses are stitched.
 
 Output: same trajectory.npz schema as vio_bundle_adjust.py (minus per-landmark
 visualizer fields -- points are per-window and not globally consistent, so a
@@ -25,7 +33,7 @@ merged cloud is written for rough viz only).
 
 Run:
     python vio_windowed_ba.py ../../testimu --tracks ../../testimu/tracks.jsonl \
-        --out /tmp/traj_windowed.npz --window-s 3 --overlap-s 1
+        --out /tmp/traj_windowed.npz --window-s 3
 """
 import argparse
 import json
@@ -74,6 +82,41 @@ def _win_residual(vals, center, point_var, pose_quat, ray, rel, w,
     return r * (w * jnp.sqrt(wr))
 
 
+def _refine_positioning(vals, pose_var, point_var, ray, rel, w, robust_scale):
+    """SE3-refine version of _win_residual: pose is a free SE3Var instead of a
+    frozen quat + CamCenterVar. Same analytic-scale (perpendicular component)
+    residual with the d*>=0 cheirality clamp."""
+    T_wl = vals[pose_var]
+    R_wl = T_wl.rotation()
+    c_left = -(R_wl.inverse() @ T_wl.translation())
+    T_rel = jaxlie.SE3(rel)
+    R_wc = T_rel.rotation() @ R_wl
+    cam_pos = c_left - (R_wc.inverse() @ T_rel.translation())
+    ray_w = R_wc.inverse() @ ray
+    v = vals[point_var] - cam_pos
+    v_dir = v / (jnp.linalg.norm(v) + 1e-9)
+    d_star = jnp.maximum(jnp.dot(ray_w, v_dir), 0.0)
+    r = ray_w - d_star * v_dir
+    abs_r = jnp.linalg.norm(r) + 1e-9
+    wr = jax.lax.stop_gradient(1.0 / (1.0 + (abs_r / robust_scale) ** 2))
+    return r * (w * jnp.sqrt(wr))
+
+
+def _refine_imu_rot(vals, pose_i, pose_j, delta_wxyz, weight):
+    """IMU relative-rotation tether between consecutive window poses (same
+    residual as vio_bundle_adjust.imu_rotation_cost)."""
+    R_i = vals[pose_i].rotation()
+    R_j = vals[pose_j].rotation()
+    return (jaxlie.SO3(delta_wxyz).inverse() @ (R_i @ R_j.inverse())).log() * weight
+
+
+def _refine_gravity(vals, pose_var, measured_down_cam, weight):
+    """Roll/pitch prior: world is +z up; each pose should map world-down onto
+    its IMU-measured down (yaw free)."""
+    down_pred = vals[pose_var].rotation() @ jnp.array([0.0, 0.0, -1.0])
+    return (down_pred - measured_down_cam) * weight
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -84,9 +127,19 @@ def parse_args():
     p.add_argument("--out", default=None,
                     help="default: <recording>/derived/trajectory_windowed.npz")
     p.add_argument("--window-s", type=float, default=3.0)
-    p.add_argument("--overlap-s", type=float, default=1.0)
+    p.add_argument("--overlap-frames", type=int, default=2,
+                    help="frames shared between consecutive windows. The stitch "
+                         "uses the REFINED relative pose across the shared "
+                         "frame, so 2 suffices (vs 30 for the old Procrustes-"
+                         "on-centers stitch)")
     p.add_argument("--iters", type=int, default=20,
-                    help="LM iterations per window (small window converges fast)")
+                    help="LM iterations for the positioning stage per window")
+    p.add_argument("--refine-iters", type=int, default=3,
+                    help="LM iterations for the per-window SE3 refine (IMU "
+                         "rotation + gravity tethered); 0 skips refine and "
+                         "stitches on IMU-chain rotations")
+    p.add_argument("--imu-rot-weight", type=float, default=100.0)
+    p.add_argument("--gravity-weight", type=float, default=1.0)
     p.add_argument("--robust-scale", type=float, default=0.05)
     p.add_argument("--pad-quantile", type=float, default=50.0,
                     help="percentile of per-window obs counts used as the padded "
@@ -105,10 +158,6 @@ def parse_args():
                          "per-window cost is uniform (CG varied 2-90s/window on "
                          "ill-conditioned fast-motion windows) and vmap lockstep "
                          "isn't dragged down by the slowest window")
-    p.add_argument("--no-vmap", action="store_true",
-                    help="solve windows sequentially instead of vmapped -- "
-                         "prints per-window wall time (jit-cache sanity check: "
-                         "only window 1 should be slow)")
     p.add_argument("--device", default="cuda")
     return p.parse_args()
 
@@ -124,7 +173,7 @@ def main():
 
     fps = json.load(open(os.path.join(rec, "recording.json"))).get("fps", 30)
     W = max(8, int(round(args.window_s * fps)))
-    V = max(2, int(round(args.overlap_s * fps)))
+    V = max(2, args.overlap_frames)
     stride = W - V
 
     imu = np.load(imu_path)
@@ -140,6 +189,7 @@ def main():
     keep = frame_valid
     frame_idx = frame_idx_all[keep]
     gravity_cam = gravity_cam_all[keep]
+    gravity_weight_arr = imu["gravity_weight"][keep]
     n_frames = len(frame_idx)
     # delta_prev[i] rotates pose i-1 -> pose i (identity where edge invalid).
     delta_prev = np.tile(np.array([1.0, 0, 0, 0]), (n_frames, 1))
@@ -298,11 +348,9 @@ def main():
         return problem, vals0
 
     pairs = [make_problem(wi) for wi in range(N)]
-    stacked_prob = jax.tree.map(lambda *xs: jnp.stack(xs), *[p for p, _ in pairs])
-    stacked_vals = jax.tree.map(lambda *xs: jnp.stack(xs), *[v for _, v in pairs])
     print(f"[timing] build+analyze {N} windows: {time.time() - t0:.2f}s")
 
-    def _solve_one(prob, v0):
+    def _solve_positioning(prob, v0):
         sol = prob.solve(
             v0, linear_solver=args.linear_solver,
             trust_region=jaxls.TrustRegionConfig(),
@@ -311,56 +359,124 @@ def main():
             verbose=False)
         return sol[CamCenterVar], sol[Point3Var]
 
-    if args.no_vmap:
-        # Sequential per-window solves. Doubles as a jit-cache check: with a
-        # module-level residual + schur off, window 1 pays compile and every
-        # later window should be ~ms; seconds per window = something retraced.
-        cs, ps = [], []
-        for wi, (prob, v0) in enumerate(pairs):
-            t0 = time.time()
-            c, p = _solve_one(prob, v0)
-            jax.block_until_ready(c)
-            cs.append(np.asarray(c)); ps.append(np.asarray(p))
-            print(f"  window {wi + 1}/{N}: {time.time() - t0:.3f}s")
-        c_all, p_all = np.stack(cs), np.stack(ps)
-    else:
-        t0 = time.time()
-        c_all, p_all = jax.vmap(_solve_one)(stacked_prob, stacked_vals)
-        c_all = np.asarray(jax.block_until_ready(c_all))
-        p_all = np.asarray(p_all)
-        print(f"[timing] vmapped solve, all {N} windows: {time.time() - t0:.2f}s")
+    def make_refine(wi, centers_np, points_np):
+        """Per-window SE3 refine: rotations free, tethered by IMU relative
+        rotation + gravity (same recipe as vio_bundle_adjust stage 2). Same
+        module-level residuals + schur off + fixed shapes -> compile once."""
+        poses = jaxls.SE3Var(id=jnp.arange(W))
+        points = Point3Var(id=jnp.arange(n_pts_pad))
+        s = win_data[wi][0]
+        costs = [
+            jaxls.Cost(_refine_positioning,
+                       (jaxls.SE3Var(id=jnp.asarray(P_pose[wi])),
+                        Point3Var(id=jnp.asarray(P_point[wi])),
+                        jnp.asarray(P_ray[wi]),
+                        jnp.asarray(P_rel[wi]),
+                        jnp.asarray(P_w[wi]),
+                        jnp.asarray(args.robust_scale, dtype=jnp.float32))),
+            jaxls.Cost(_refine_imu_rot,
+                       (jaxls.SE3Var(id=jnp.arange(W - 1)),
+                        jaxls.SE3Var(id=jnp.arange(1, W)),
+                        jnp.asarray(delta_prev[s + 1:s + W], dtype=jnp.float32),
+                        jnp.asarray(args.imu_rot_weight, dtype=jnp.float32))),
+            jaxls.Cost(_refine_gravity,
+                       (jaxls.SE3Var(id=jnp.arange(W)),
+                        jnp.asarray(gravity_cam[s:s + W], dtype=jnp.float32),
+                        jnp.asarray(args.gravity_weight * gravity_weight_arr[s:s + W],
+                                    dtype=jnp.float32)[:, None])),
+        ]
+        problem = jaxls.LeastSquaresProblem(
+            costs, [poses, points]).analyze(schur_elimination="off")
+        pose_init = jax.vmap(
+            lambda q, c: jaxlie.SE3.from_rotation_and_translation(
+                jaxlie.SO3(q), -(jaxlie.SO3(q) @ c))
+        )(jnp.asarray(R_init[wi]), jnp.asarray(centers_np))
+        vals0 = jaxls.VarValues.make([
+            poses.with_value(pose_init),
+            points.with_value(jnp.asarray(points_np)),
+        ])
+        return problem, vals0
 
-    # --- stitch ---------------------------------------------------------------
+    def _solve_refine(prob, v0):
+        sol = prob.solve(
+            v0, linear_solver=args.linear_solver,
+            trust_region=jaxls.TrustRegionConfig(),
+            termination=jaxls.TerminationConfig(
+                max_iterations=args.refine_iters, early_termination=False),
+            verbose=False)
+        return sol[jaxls.SE3Var].wxyz_xyz, sol[Point3Var]
+
+    # Positioning then (optionally) refine, window by window. Compile is paid
+    # once per stage; later windows are cached.
+    q_all = np.zeros((N, W, 4))
+    c_all = np.zeros((N, W, 3))
+    p_all = np.zeros((N, n_pts_pad, 3))
+    for wi, (prob, v0) in enumerate(pairs):
+        t0 = time.time()
+        c, p = _solve_positioning(prob, v0)
+        jax.block_until_ready(c)
+        t_pos = time.time() - t0
+        if args.refine_iters > 0:
+            t0 = time.time()
+            rprob, rv0 = make_refine(wi, np.asarray(c), np.asarray(p))
+            pose_out, p = _solve_refine(rprob, rv0)
+            jax.block_until_ready(pose_out)
+            t_ref = time.time() - t0
+            pose_out = np.asarray(pose_out)
+            q_all[wi] = pose_out[:, :4]
+            # centers from refined SE3: c = -R^T t
+            for j in range(W):
+                Rj = np.asarray(jaxlie.SO3(jnp.asarray(pose_out[j, :4])).as_matrix())
+                c_all[wi, j] = -(Rj.T @ pose_out[j, 4:])
+        else:
+            t_ref = 0.0
+            q_all[wi] = R_init[wi]
+            c_all[wi] = np.asarray(c)
+        p_all[wi] = np.asarray(p)
+        if wi < 3 or wi % 20 == 0:
+            print(f"  window {wi + 1}/{N}: pos {t_pos:.2f}s + refine {t_ref:.2f}s")
+
+    # --- stitch via the refined relative pose at the shared frames ------------
+    # Window wi and wi+1 share V frames. Both have a (refined) pose for the
+    # first shared frame f0. Chain: find the SE3 gauge transform G mapping
+    # window wi+1's world into the stitched world so that its pose at f0
+    # equals the stitched pose at f0, then apply G to the whole window and
+    # keep its poses for all frames after f0. This uses the window's own
+    # refined relative motion (its strongest information) instead of a
+    # Procrustes fit over a long overlap.
+    def pose_mat(q, c):
+        R = np.asarray(jaxlie.SO3(jnp.asarray(q)).as_matrix())  # world->cam
+        T = np.eye(4); T[:3, :3] = R; T[:3, 3] = -(R @ c)
+        return T  # T_wc: world->cam
+
     centers_glob = np.zeros((n_frames, 3))
     R_glob = np.zeros((n_frames, 4))
     have = np.zeros(n_frames, bool)
     merged_pts = []
     for wi, (s, rows, local_pid, npts) in enumerate(win_data):
-        c_win, p_win = c_all[wi], p_all[wi]
-        q_win = R_init[wi]  # rotations frozen per window
-
         if wi == 0:
-            centers_glob[s:s + W] = c_win
-            R_glob[s:s + W] = q_win
+            centers_glob[s:s + W] = c_all[wi]
+            R_glob[s:s + W] = q_all[wi]
             have[s:s + W] = True
-        else:
-            # SE3-align this window onto the stitched trajectory over overlap.
-            ov = np.arange(s, s + W)[have[s:s + W]]
-            loc = ov - s
-            Aw, bw = _rigid(c_win[loc], centers_glob[ov])
-            c_al = c_win @ Aw.T + bw
-            # rotate window rotations: R_cam->world' = Aw @ R_cam->world
-            # stored as WORLD->CAM quats: R_wl' = R_wl @ Aw^T
-            R_align = jaxlie.SO3.from_matrix(jnp.asarray(Aw))
-            q_al = np.asarray(jax.vmap(
-                lambda q: (jaxlie.SO3(q) @ R_align.inverse()).wxyz
-            )(jnp.asarray(q_win)))
-            new = np.arange(s, s + W)[~have[s:s + W]]
-            centers_glob[new] = c_al[new - s]
-            R_glob[new] = q_al[new - s]
-            have[new] = True
-            p_win = p_win @ Aw.T + bw
-        merged_pts.append(p_win[:npts])
+            merged_pts.append(p_all[wi][:npts])
+            continue
+        # First shared frame: stitched pose T_stitched, window pose T_win.
+        f0 = s  # window start (already covered by previous window)
+        T_st = pose_mat(R_glob[f0], centers_glob[f0])
+        T_wn = pose_mat(q_all[wi][0], c_all[wi][0])
+        # Gauge: for any frame, T_wc_stitched = T_wc_win @ G  with
+        # G = T_wn^-1 @ T_st (world-side transform). Then cam centers/rots:
+        G = np.linalg.inv(T_wn) @ T_st
+        Ginv = np.linalg.inv(G)
+        new = np.arange(s, s + W)[~have[s:s + W]]
+        for f in new:
+            T = pose_mat(q_all[wi][f - s], c_all[wi][f - s]) @ G
+            Rf = T[:3, :3]
+            centers_glob[f] = -(Rf.T @ T[:3, 3])
+            R_glob[f] = np.asarray(jaxlie.SO3.from_matrix(jnp.asarray(Rf)).wxyz)
+        have[new] = True
+        # carry points into the stitched world: X' = Ginv[:3,:3] X + Ginv trans
+        merged_pts.append(p_all[wi][:npts] @ Ginv[:3, :3].T + Ginv[:3, 3])
 
     assert have.all()
     print(f"[timing] wall total {time.time() - t_wall0:.1f}s")
@@ -371,19 +487,10 @@ def main():
         lambda q, c: -(jaxlie.SO3(q) @ c)
     )(jnp.asarray(R_glob), jnp.asarray(centers_glob)))
     poses = np.concatenate([R_glob, t_out], axis=1)
-    pts = np.concatenate(merged_pts, 0) - 0  # rough merged cloud (per-window dup)
+    pts = np.concatenate(merged_pts, 0)  # rough merged cloud (per-window dup)
 
     np.savez(out_path, frame_idx=frame_idx, pose_wxyz_xyz=poses, points=pts)
     print(f"wrote {out_path}")
-
-
-def _rigid(A, B):
-    ca, cb = A.mean(0), B.mean(0)
-    H = (A - ca).T @ (B - cb)
-    U, _, Vt = np.linalg.svd(H)
-    S = np.diag([1, 1, np.sign(np.linalg.det(Vt.T @ U.T))])
-    R = Vt.T @ S @ U.T
-    return R, cb - R @ ca
 
 
 if __name__ == "__main__":
