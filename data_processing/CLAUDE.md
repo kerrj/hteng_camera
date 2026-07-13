@@ -168,3 +168,20 @@ a blurry frame. THEN phase 2 (temporal) / phase 3 (mono fill).
   (`ffs_fuse_world.py --trajectory long-test2/derived/trajectory.npz`) now
   yields a flat, level multi-room world cloud (13.7M pts cleaned;
   `out/lt2_world_refined.ply`, compare png `out/lt2_world_compare.png`).
+- 2026-07-13: **TSDF task-segment PoC** (spec
+  `docs/superpowers/specs/2026-07-13-tsdf-task-segment-design.md`) — pivot to
+  the egocentric-manipulation regime: `ffs_tsdf_segment.py` auto-picks a calm
+  hands-busy ~30 s window (long-test2 frames 90-990: phone-in-hands at desk,
+  4 cm camera extent, 1.8 deg/s gyro, hands 100% of frames), masks the MANO
+  hand silhouettes out of each range map, renders virtual forward pinhole
+  RGB-D, and integrates with Open3D ScalableTSDF (5 mm voxels, 2 m clamp) →
+  clean 173k-vert workspace mesh (laptop/keyboards/desk clearly readable, no
+  hand ghosts, no floaters) vs obvious arm-smear haze in the naive
+  accumulation of the SAME inputs (`out/lt2_seg_render_*.png`,
+  `out/lt2_seg_compare.png`). Hands baked per-frame via
+  `precompute_hand_meshes.py` straight from `hands3d_*.jsonl` (same schema) →
+  `out/lt2_hands/`; `ffs_tsdf_viewer.py` composites the animated MANO
+  surfaces over the static mesh in viser. Known gap (expected): the phone —
+  a moving, unmasked object — leaves partial ghosts; manipulated-object
+  masking is the next lever, then Tier-2 depth quality (calm-frame FFS
+  recompute at higher res / accurate checkpoint).
