@@ -81,6 +81,10 @@ def parse_args():
     p.add_argument("--pad-quantile", type=float, default=50.0,
                     help="percentile of per-window obs counts used as the padded "
                          "problem size; windows above it are subsampled")
+    p.add_argument("--no-vmap", action="store_true",
+                    help="solve windows sequentially instead of vmapped -- "
+                         "prints per-window wall time (jit-cache sanity check: "
+                         "only window 1 should be slow)")
     p.add_argument("--device", default="cuda")
     return p.parse_args()
 
@@ -284,11 +288,24 @@ def main():
             verbose=False)
         return sol[CamCenterVar], sol[Point3Var]
 
-    t0 = time.time()
-    c_all, p_all = jax.vmap(_solve_one)(stacked_prob, stacked_vals)
-    c_all = np.asarray(jax.block_until_ready(c_all))
-    p_all = np.asarray(p_all)
-    print(f"[timing] vmapped solve, all {N} windows: {time.time() - t0:.2f}s")
+    if args.no_vmap:
+        # Sequential per-window solves. Doubles as a jit-cache check: with a
+        # module-level residual + schur off, window 1 pays compile and every
+        # later window should be ~ms; seconds per window = something retraced.
+        cs, ps = [], []
+        for wi, (prob, v0) in enumerate(pairs):
+            t0 = time.time()
+            c, p = _solve_one(prob, v0)
+            jax.block_until_ready(c)
+            cs.append(np.asarray(c)); ps.append(np.asarray(p))
+            print(f"  window {wi + 1}/{N}: {time.time() - t0:.3f}s")
+        c_all, p_all = np.stack(cs), np.stack(ps)
+    else:
+        t0 = time.time()
+        c_all, p_all = jax.vmap(_solve_one)(stacked_prob, stacked_vals)
+        c_all = np.asarray(jax.block_until_ready(c_all))
+        p_all = np.asarray(p_all)
+        print(f"[timing] vmapped solve, all {N} windows: {time.time() - t0:.2f}s")
 
     # --- stitch ---------------------------------------------------------------
     centers_glob = np.zeros((n_frames, 3))
