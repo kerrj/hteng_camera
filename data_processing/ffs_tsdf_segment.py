@@ -113,6 +113,17 @@ def main():
     ap.add_argument("--mask-dilate-px", type=int, default=12)
     ap.add_argument("--frame-stride", type=int, default=1)
     ap.add_argument("--out-prefix", default="data_processing/out/lt2_seg")
+    ap.add_argument("--engine", choices=("vbg", "legacy"), default="vbg",
+                    help="vbg = t.geometry.VoxelBlockGrid (CUDA, supports "
+                         "--weight-threshold); legacy = ScalableTSDFVolume")
+    ap.add_argument("--weight-threshold", type=float, default=3.0,
+                    help="vbg only: min integration weight (~frames seen) for a "
+                         "voxel to reach the mesh -- kills 1-2-view 'lace'")
+    ap.add_argument("--mask-against", default=None,
+                    help="pass-2 rebuild: prior mesh ply; pixels whose measured "
+                         "depth disagrees (in front by >3 cm, despeckled) are "
+                         "masked out of integration IN ADDITION to MANO -- "
+                         "catches manipulated objects, blankets, unfit hands")
     args = ap.parse_args()
 
     meta = json.load(open(f"{args.range_dir}/meta.json"))
@@ -192,10 +203,30 @@ def main():
         return cv2.cvtColor(fr, cv2.COLOR_BGR2RGB) if ok else None
 
     import open3d as o3d
-    vol = o3d.pipelines.integration.ScalableTSDFVolume(
-        voxel_length=args.voxel, sdf_trunc=4 * args.voxel,
-        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8)
+    import open3d.core as o3c
+    if args.engine == "vbg":
+        dev = o3c.Device("CUDA:0") if o3c.cuda.is_available() else o3c.Device("CPU:0")
+        vbg = o3d.t.geometry.VoxelBlockGrid(
+            attr_names=("tsdf", "weight", "color"),
+            attr_dtypes=(o3c.float32, o3c.float32, o3c.float32),
+            attr_channels=((1), (1), (3)),
+            voxel_size=args.voxel, block_resolution=16, block_count=100_000,
+            device=dev)
+        K_t = o3c.Tensor([[fx, 0, cx], [0, fx, cy], [0, 0, 1]], o3c.float64)
+    else:
+        vol = o3d.pipelines.integration.ScalableTSDFVolume(
+            voxel_length=args.voxel, sdf_trunc=4 * args.voxel,
+            color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8)
     intr = o3d.camera.PinholeCameraIntrinsic(W, H, fx, fx, cx, cy)
+
+    prior = None
+    if args.mask_against:
+        from ffs_dynamic_residual import residual_mask, despeckle  # lazy: avoids cycle
+        pm = o3d.io.read_triangle_mesh(args.mask_against)
+        prior = o3d.t.geometry.RaycastingScene()
+        prior.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(pm))
+        prior_fns = (residual_mask, despeckle)
+        ray_norm = np.linalg.norm(rays, axis=-1)
 
     gyro_of = np.zeros(int(frame_idx[-1]) + 2, np.float64)
     gyro_of[np.asarray(gyro_frames, int)] = gyro_dps
@@ -222,6 +253,21 @@ def main():
             px = FP.fisheye_project(torch.tensor(np.asarray(verts, np.float32)),
                                     Kl, Dl).numpy() * scale
             rng[rasterize_hand_mask(px, Hf, Wf, args.mask_dilate_px)] = 0.0
+        # pass-2: mask disagreement vs the prior mesh (objects, blankets,
+        # unfit hands). Only the in-front clause -- the orphan clause would
+        # forbid pass 2 from ever filling pass-1 holes with real surface.
+        if prior is not None:
+            i0 = pose_of[vf]
+            R0 = Rws[i0]
+            c0 = -(R0.T @ poses[i0, 4:])
+            dirs_w = (rays.reshape(-1, 3) @ R0).astype(np.float32)
+            org = np.broadcast_to(c0.astype(np.float32), dirs_w.shape)
+            rc = prior.cast_rays(o3c.Tensor(np.concatenate(
+                [org, dirs_w], axis=1).reshape(-1, 6)))
+            t_hit = rc["t_hit"].numpy().reshape(Hf, Wf) * ray_norm
+            rmask, dspk = prior_fns
+            m2 = dspk(rmask(rng, t_hit, 0.03, 0.0), 50)  # near_orphan=0 disables
+            rng[m2] = 0.0
         m = rng > 0
         if not m.any():
             continue
@@ -247,21 +293,34 @@ def main():
             ok = (uu >= 0) & (uu < W) & (vv >= 0) & (vv < H)
             depth[vv[ok], uu[ok]] = Z[ok]                    # later = nearer wins
             color[vv[ok], uu[ok]] = C[ok]
-        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            o3d.geometry.Image(color), o3d.geometry.Image(depth),
-            depth_scale=1.0, depth_trunc=args.max_range,
-            convert_rgb_to_intensity=False)
         i = pose_of[vf]
         ext = np.eye(4)
         ext[:3, :3] = Rws[i]
         ext[:3, 3] = poses[i, 4:]                            # world->cam = o3d extrinsic
-        vol.integrate(rgbd, intr, ext)
+        if args.engine == "vbg":
+            d_t = o3d.t.geometry.Image(o3c.Tensor(depth, device=dev))
+            c_t = o3d.t.geometry.Image(o3c.Tensor(
+                (color.astype(np.float32) / 255.0), device=dev))
+            ext_t = o3c.Tensor(ext, o3c.float64)
+            blocks = vbg.compute_unique_block_coordinates(
+                d_t, K_t, ext_t, 1.0, args.max_range)
+            vbg.integrate(blocks, d_t, c_t, K_t, K_t, ext_t, 1.0, args.max_range)
+        else:
+            rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+                o3d.geometry.Image(color), o3d.geometry.Image(depth),
+                depth_scale=1.0, depth_trunc=args.max_range,
+                convert_rgb_to_intensity=False)
+            vol.integrate(rgbd, intr, ext)
         used += 1
     cap.release()
     print(f"integrated {used} frames (skipped {skipped_blur} blurred; "
           f"{missing_hand} frame-sides lacked a hand fit)", flush=True)
 
-    mesh = vol.extract_triangle_mesh()
+    if args.engine == "vbg":
+        mesh = vbg.extract_triangle_mesh(
+            weight_threshold=args.weight_threshold).to_legacy()
+    else:
+        mesh = vol.extract_triangle_mesh()
     mesh.compute_vertex_normals()
     out = f"{args.out_prefix}_tsdf_mesh.ply"
     o3d.io.write_triangle_mesh(out, mesh)
