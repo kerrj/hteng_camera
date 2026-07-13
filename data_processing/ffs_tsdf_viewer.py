@@ -28,6 +28,13 @@ def main():
     ap.add_argument("--port", type=int, default=8091)
     ap.add_argument("--share", action="store_true")
     ap.add_argument("--fps", type=float, default=30.0)
+    ap.add_argument("--dynamic", default=None,
+                    help="<prefix>_dynamic.npz from ffs_dynamic_residual.py: "
+                         "per-frame residual points played over the static mesh")
+    ap.add_argument("--dynamic-point-size", type=float, default=0.004)
+    ap.add_argument("--dynamic-max-points", type=int, default=25_000,
+                    help="per-frame cap (random subsample) -- keeps the "
+                         "websocket stream viable at playback rates")
     args = ap.parse_args()
 
     seg = json.load(open(f"{args.prefix}_segment.json"))
@@ -47,6 +54,13 @@ def main():
         d = np.load(f"{args.hands_dir}/hand_mesh_{side}.npz")
         hands[side] = (dict(zip(d["frames"].tolist(), d["verts"])), d["faces"])
 
+    dyn = None
+    if args.dynamic:
+        d = np.load(args.dynamic)
+        dyn = {"points": d["points"], "colors": d["colors"],
+               "slice_of": {int(f): (int(d["offsets"][k]), int(d["offsets"][k + 1]))
+                            for k, f in enumerate(d["frames"])}}
+
     server = viser.ViserServer(port=args.port)
     if args.share:
         print(f"SHARE URL: {server.request_share_url()}", flush=True)
@@ -60,8 +74,17 @@ def main():
             f"/hands/{side}", vertices=np.zeros((778, 3), np.float32),
             faces=faces, color=color, opacity=0.85, visible=False)
 
+    dyn_h = None
+    if dyn is not None:
+        dyn_h = server.scene.add_point_cloud(
+            "/dynamic", points=np.zeros((1, 3), np.float32),
+            colors=np.zeros((1, 3), np.uint8),
+            point_size=args.dynamic_point_size, point_shape="rounded")
+
     g_frame = server.gui.add_slider("frame", s0, e0 - 1, 1, s0)
     g_play = server.gui.add_checkbox("play", True)
+    g_mano = server.gui.add_checkbox("MANO hands", True)
+    g_dyn = server.gui.add_checkbox("residual points", dyn is not None)
     # NO shared lock: holding one across viser setters deadlocks against viser's
     # internal update lock (ABBA). Single-writer instead: the play loop is the
     # only caller of show() while playing; the scrub callback only acts paused.
@@ -75,11 +98,25 @@ def main():
         for side in ("left", "right"):
             V = hands[side][0].get(int(vf))
             h = hand_h[side]
-            if V is None:
+            if V is None or not g_mano.value:
                 h.visible = False
                 continue
             h.vertices = (np.asarray(V) @ R + c).astype(np.float32)
             h.visible = True
+        if dyn_h is not None:
+            sl = dyn["slice_of"].get(int(vf))
+            if sl is None or sl[0] == sl[1] or not g_dyn.value:
+                dyn_h.visible = False
+            else:
+                P = dyn["points"][sl[0]:sl[1]]
+                C = dyn["colors"][sl[0]:sl[1]]
+                if len(P) > args.dynamic_max_points:
+                    sel = np.random.default_rng(vf).choice(
+                        len(P), args.dynamic_max_points, replace=False)
+                    P, C = P[sel], C[sel]
+                dyn_h.points = P
+                dyn_h.colors = C
+                dyn_h.visible = True
 
     def on_scrub(_):
         if not g_play.value:
