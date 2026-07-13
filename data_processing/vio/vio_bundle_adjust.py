@@ -2,13 +2,16 @@
 relative-rotation and gravity priors.
 
 GLOMAP-style bounded positioning cost (Pan et al. 2024 / BATA) instead of
-reprojection error:
+reprojection error, with the per-observation scale analytically eliminated:
 
-    residual_ik = v_ik - d_ik * (X_k - c_i),   d_ik >= 0 (via d_ik=exp(s_ik))
+    residual_ik = v_ik - <v_ik, u_ik> u_ik,   u_ik = (X_k - c_i)/|X_k - c_i|
 
-v_ik = observed ray in world frame, X_k = landmark, c_i = camera center, d_ik
-= free per-observation scale. Squared norm = sin(theta) capped at 1, bounded
-to [0,1] (reprojection error diverges under the random init this needs).
+i.e. the component of the observed ray v_ik perpendicular to the predicted
+direction u_ik -- same optimum as GLOMAP's explicit d_ik variables
+(substitute the optimal d* = <v,X-c>/|X-c|^2), but without one extra variable
+per observation. Squared norm = sin^2(theta) capped at 1, bounded (reprojection
+error diverges under the random init this needs). Metric scale comes from the
+stereo baseline.
 
 Two-stage solve (mirrors GLOMAP: rotation averaging -> positioning with
 rotations frozen -> full BA):
@@ -158,8 +161,6 @@ class CamCenterVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.zeros(3)):
     """Stage-1 variable: left camera center in world frame (rotations frozen)."""
 
 
-class ScaleVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.zeros(())):
-    """GLOMAP's per-observation d_ik, as exp(s_ik) so d_ik>=0."""
 
 
 def _robust_weight(residual, robust_scale, robust_kind):
@@ -174,11 +175,16 @@ def _robust_weight(residual, robust_scale, robust_kind):
 
 
 @jaxls.Cost.factory
-def positioning_cost(vals, pose, center, point_var, scale_var, ray_cam,
+def positioning_cost(vals, pose, center, point_var, ray_cam,
                      rel_wxyz_xyz, robust_scale, robust_kind):
-    """GLOMAP positioning residual, shared by both stages via var-or-constant
-    factory args (a Var arg is optimized, a plain array is baked in constant;
-    the isinstance branch is resolved once at problem-construction time):
+    """Positioning residual with GLOMAP's per-observation scale ANALYTICALLY
+    eliminated: substituting the optimal d* = <ray, X-c>/|X-c|^2 leaves the
+    component of the observed ray perpendicular to the predicted direction --
+    a bounded sin-theta heading error with the same optimum, minus one
+    ScaleVar per observation (16M of them on an 11k-frame recording; they
+    dominated both compile and solve). Metric scale still comes from the
+    stereo baseline in rel_wxyz_xyz. Shared by both stages via var-or-constant
+    factory args (a Var arg is optimized, a plain array is baked in constant):
       stage 1: pose = constant IMU-chain quats, center = CamCenterVar optimized.
       stage 2: pose = free SE3Var, center = unused dummy constant.
     T_wc = T_rel @ T_wl (T_rel = identity for left eye, stereo transform for
@@ -194,8 +200,9 @@ def positioning_cost(vals, pose, center, point_var, scale_var, ray_cam,
     R_wc = T_rel.rotation() @ R_wl
     cam_pos_world = c_left - (R_wc.inverse() @ T_rel.translation())
     ray_world = R_wc.inverse() @ ray_cam
-    d_ik = jnp.exp(vals[scale_var])
-    residual = ray_world - d_ik * (vals[point_var] - cam_pos_world)
+    v = vals[point_var] - cam_pos_world
+    v_dir = v / (jnp.linalg.norm(v) + 1e-9)
+    residual = ray_world - jnp.dot(ray_world, v_dir) * v_dir
     return residual * jnp.sqrt(_robust_weight(residual, robust_scale, robust_kind))
 
 
@@ -433,7 +440,6 @@ def main():
             pose_arg,
             center_arg,
             Point3Var(id=jnp.asarray(point_ids)),
-            ScaleVar(id=jnp.arange(n_obs)),
             jnp.asarray(ray_cam),
             jnp.asarray(rel_wxyz_xyz),
             jnp.asarray(args.robust_scale),
@@ -453,7 +459,6 @@ def main():
     print("=== stage 1: frozen-rotation global positioning ===")
     center_vars = CamCenterVar(id=jnp.arange(n_frames))
     point_vars = Point3Var(id=jnp.arange(n_points))
-    scale_vars = ScaleVar(id=jnp.arange(n_obs))
     stage1_costs = positioning_and_smoothness_costs(
         np.asarray(rot_init_wxyz)[pose_ids],      # constant per-obs quats
         CamCenterVar(id=jnp.asarray(pose_ids)),
@@ -462,10 +467,9 @@ def main():
     stage1_vals = jaxls.VarValues.make([
         center_vars.with_value(center_init),
         point_vars.with_value(point_init),
-        scale_vars.with_value(jnp.zeros(n_obs)),
     ])
     solution1, cost_history = solve_problem(
-        stage1_costs, [center_vars, point_vars, scale_vars],
+        stage1_costs, [center_vars, point_vars],
         stage1_vals, args.max_iterations)
 
     # Convert stage-1 centers to SE3 poses (t = -R c) for stage 2 / output.
@@ -503,10 +507,9 @@ def main():
         stage2_vals = jaxls.VarValues.make([
             camera_vars.with_value(pose_from_stage1),
             point_vars.with_value(solution1[Point3Var]),
-            scale_vars.with_value(solution1[ScaleVar]),
         ])
         solution, cost_history2 = solve_problem(
-            refine_costs, [camera_vars, point_vars, scale_vars],
+            refine_costs, [camera_vars, point_vars],
             stage2_vals, refine_iters)
         cost_history = np.concatenate([cost_history, cost_history2])
         poses_out = solution[jaxls.SE3Var]
