@@ -97,6 +97,12 @@ def parse_args():
                          "reduced system, cholmod is CPU-bound and slower")
     p.add_argument("--gauss-newton", action="store_true",
                     help="trust_region=None -- diverges here, not recommended")
+    p.add_argument("--schur", choices=("auto", "off"), default="auto",
+                    help="jaxls variable elimination. With ScaleVars gone the "
+                         "landmark block is the only elimination candidate; "
+                         "'off' skips the (host-side, slow) elimination-plan "
+                         "construction in analyze() at the cost of a bigger "
+                         "CG system")
     p.add_argument("--early-termination", action="store_true",
                     help="stop on jaxls's tolerances instead of running all "
                          "iterations. OFF by default: it false-positives on this "
@@ -385,7 +391,8 @@ def main():
     def solve_problem(costs, var_groups, initial_vals, max_iterations):
         """Analyze + solve one least-squares problem, with timing/cost prints."""
         t0 = time.time()
-        problem = jaxls.LeastSquaresProblem(costs, var_groups).analyze()
+        problem = jaxls.LeastSquaresProblem(costs, var_groups).analyze(
+            schur_elimination=args.schur)
         print(f"[timing] analyze(): {time.time() - t0:.2f}s")
 
         if args.profile_compile:
