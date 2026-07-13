@@ -185,3 +185,20 @@ a blurry frame. THEN phase 2 (temporal) / phase 3 (mono fill).
   a moving, unmasked object — leaves partial ghosts; manipulated-object
   masking is the next lever, then Tier-2 depth quality (calm-frame FFS
   recompute at higher res / accurate checkpoint).
+- 2026-07-13 (later): **dynamic residual layer + pass-2 rebuild** shipped.
+  `ffs_dynamic_residual.py` = static/dynamic decomposition by
+  reconstruction-vs-observation disagreement (raycast static mesh per
+  frame; dynamic = measured >3 cm in front, despeckled, cone-gated —
+  WITHOUT cone gating 30% of pixels false-flag since the mesh only covers
+  the forward integration cone). Captures hands + manipulated objects
+  (phone) with no object heuristics. `ffs_tsdf_segment.py --engine vbg`
+  (CUDA VoxelBlockGrid) adds `--weight-threshold` (kills 1-2-view lace)
+  and `--mask-against <prior mesh>` (pass-2 rebuild: residual-masked
+  integration; orphan clause off so pass 2 can fill pass-1 holes).
+  Segment quality gradient maps the regime: A (still, 2.5°/s) excellent;
+  C (seated manipulation) good after pass-2 (blanket smear → coherent);
+  D (kitchen, glass+steel, 29°/s) fair; 5 s walking clip weak static —
+  locomotion is out-of-regime, as expected. GOTCHA: recordings differ in
+  fps (long-test1 30, long-test2 40) — read from the video, never assume.
+  Viewer: `ffs_tsdf_viewer.py --dynamic --mesh` (single-writer play loop;
+  do NOT hold a lock across viser setters — ABBA deadlock).
