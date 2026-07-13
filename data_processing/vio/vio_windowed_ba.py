@@ -91,6 +91,14 @@ def parse_args():
     p.add_argument("--pad-quantile", type=float, default=50.0,
                     help="percentile of per-window obs counts used as the padded "
                          "problem size; windows above it are subsampled")
+    p.add_argument("--linear-solver",
+                    choices=("conjugate_gradient", "dense_cholesky"),
+                    default="dense_cholesky",
+                    help="windows are tiny (~1.7k vars), so a dense factorization "
+                         "beats CG: no data-dependent inner-iteration count, so "
+                         "per-window cost is uniform (CG varied 2-90s/window on "
+                         "ill-conditioned fast-motion windows) and vmap lockstep "
+                         "isn't dragged down by the slowest window")
     p.add_argument("--no-vmap", action="store_true",
                     help="solve windows sequentially instead of vmapped -- "
                          "prints per-window wall time (jit-cache sanity check: "
@@ -288,7 +296,7 @@ def main():
 
     def _solve_one(prob, v0):
         sol = prob.solve(
-            v0, linear_solver="conjugate_gradient",
+            v0, linear_solver=args.linear_solver,
             trust_region=jaxls.TrustRegionConfig(),
             termination=jaxls.TerminationConfig(
                 max_iterations=args.iters, early_termination=False),
