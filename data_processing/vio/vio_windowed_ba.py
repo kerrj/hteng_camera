@@ -58,10 +58,10 @@ def parse_args():
                     help="default: <recording>/derived/trajectory_windowed.npz")
     p.add_argument("--window-s", type=float, default=3.0)
     p.add_argument("--overlap-s", type=float, default=1.0)
-    p.add_argument("--iters", type=int, default=10,
+    p.add_argument("--iters", type=int, default=20,
                     help="LM iterations per window (small window converges fast)")
     p.add_argument("--robust-scale", type=float, default=0.05)
-    p.add_argument("--pad-quantile", type=float, default=100.0,
+    p.add_argument("--pad-quantile", type=float, default=50.0,
                     help="percentile of per-window obs counts used as the padded "
                          "problem size; windows above it are subsampled")
     p.add_argument("--device", default="cuda")
