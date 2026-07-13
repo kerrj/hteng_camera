@@ -91,6 +91,12 @@ def parse_args():
     p.add_argument("--pad-quantile", type=float, default=50.0,
                     help="percentile of per-window obs counts used as the padded "
                          "problem size; windows above it are subsampled")
+    p.add_argument("--max-obs", type=int, default=12000,
+                    help="hard cap on (padded) observations per window. The "
+                         "window has only ~5k unknowns, so 12k 3-dim residuals "
+                         "is still ~7x over-determined -- and dense_cholesky "
+                         "materializes the dense Jacobian (obs*3 x vars), which "
+                         "OOMs at 56k obs x 15 windows (~108GB). 0 = no cap")
     p.add_argument("--linear-solver",
                     choices=("conjugate_gradient", "dense_cholesky"),
                     default="dense_cholesky",
@@ -209,6 +215,8 @@ def main():
     # Fixed padded sizes across windows -> one JIT compile.
     counts = row_hi - row_lo
     n_obs_pad = int(np.percentile(counts, args.pad_quantile))
+    if args.max_obs > 0:
+        n_obs_pad = min(n_obs_pad, args.max_obs)
     # points per window bounded by obs (each point >=2 obs)
     n_pts_pad = 0
     win_data = []
