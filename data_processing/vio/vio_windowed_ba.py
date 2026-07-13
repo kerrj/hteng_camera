@@ -220,58 +220,63 @@ def main():
         wr = jax.lax.stop_gradient(1.0 / (1.0 + (abs_r / robust_scale) ** 2))
         return r * (w * jnp.sqrt(wr))
 
-    def solve_window(wi):
-        centers = CamCenterVar(id=jnp.arange(W))
-        points = Point3Var(id=jnp.arange(n_pts_pad))
-        scales = ScaleVar(id=jnp.arange(n_obs_pad))
-        costs = [win_positioning_cost(
-            CamCenterVar(id=jnp.asarray(P_pose[wi])),
-            Point3Var(id=jnp.asarray(P_point[wi])),
-            ScaleVar(id=jnp.arange(n_obs_pad)),
-            jnp.asarray(R_init[wi])[jnp.asarray(P_pose[wi])],
-            jnp.asarray(P_ray[wi]),
-            jnp.asarray(P_rel[wi]),
-            jnp.asarray(P_w[wi]),
-            jnp.asarray(args.robust_scale),
-        )]
-        key = jax.random.PRNGKey(wi)
-        k1, k2 = jax.random.split(key)
-        vals0 = jaxls.VarValues.make([
-            centers.with_value(jax.random.normal(k1, (W, 3)) * 0.1),
-            points.with_value(jax.random.normal(k2, (n_pts_pad, 3)) * 0.5
-                              + jnp.array([0, 0, 1.0])),
-            scales.with_value(jnp.zeros(n_obs_pad)),
-        ])
-        problem = jaxls.LeastSquaresProblem(costs, [centers, points, scales]).analyze()
-        sol = problem.solve(
-            vals0, linear_solver="conjugate_gradient",
-            trust_region=jaxls.TrustRegionConfig(),
-            termination=jaxls.TerminationConfig(
-                max_iterations=args.iters, early_termination=False),
-            verbose=False)
-        return np.asarray(sol[CamCenterVar]), np.asarray(sol[Point3Var])
+    # ALL windows in ONE block-diagonal problem: window wi's variables live at
+    # id offsets wi*W / wi*n_pts_pad / wi*n_obs_pad. Windows share no variables
+    # (block-diagonal), so this is exactly N independent solves -- but with ONE
+    # analyze, ONE compile, and the GPU working on all windows concurrently.
+    t0 = time.time()
+    off_pose = (np.arange(N)[:, None] * W + P_pose).reshape(-1)
+    off_point = (np.arange(N)[:, None] * n_pts_pad + P_point).reshape(-1)
+    off_scale = np.arange(N * n_obs_pad)
+    quat_flat = np.take_along_axis(R_init, P_pose[..., None], axis=1).reshape(-1, 4)
 
-    # --- solve all windows + stitch ------------------------------------------
+    centers = CamCenterVar(id=jnp.arange(N * W))
+    points = Point3Var(id=jnp.arange(N * n_pts_pad))
+    scales = ScaleVar(id=jnp.arange(N * n_obs_pad))
+    costs = [win_positioning_cost(
+        CamCenterVar(id=jnp.asarray(off_pose)),
+        Point3Var(id=jnp.asarray(off_point)),
+        ScaleVar(id=jnp.asarray(off_scale)),
+        jnp.asarray(quat_flat),
+        jnp.asarray(P_ray.reshape(-1, 3)),
+        jnp.asarray(P_rel.reshape(-1, 7)),
+        jnp.asarray(P_w.reshape(-1)),
+        jnp.asarray(args.robust_scale),
+    )]
+    key = jax.random.PRNGKey(0)
+    k1, k2 = jax.random.split(key)
+    vals0 = jaxls.VarValues.make([
+        centers.with_value(jax.random.normal(k1, (N * W, 3)) * 0.1),
+        points.with_value(jax.random.normal(k2, (N * n_pts_pad, 3)) * 0.5
+                          + jnp.array([0, 0, 1.0])),
+        scales.with_value(jnp.zeros(N * n_obs_pad)),
+    ])
+    problem = jaxls.LeastSquaresProblem(costs, [centers, points, scales]).analyze()
+    print(f"[timing] analyze (once, all windows): {time.time() - t0:.2f}s")
+    t0 = time.time()
+    sol = problem.solve(
+        vals0, linear_solver="conjugate_gradient",
+        trust_region=jaxls.TrustRegionConfig(),
+        termination=jaxls.TerminationConfig(
+            max_iterations=args.iters, early_termination=False),
+        verbose=False)
+    c_all = np.asarray(sol[CamCenterVar]).reshape(N, W, 3)
+    p_all = np.asarray(sol[Point3Var]).reshape(N, n_pts_pad, 3)
+    print(f"[timing] solve (once, all {N} windows): {time.time() - t0:.2f}s")
+
+    # --- stitch ---------------------------------------------------------------
     centers_glob = np.zeros((n_frames, 3))
     R_glob = np.zeros((n_frames, 4))
     have = np.zeros(n_frames, bool)
-    t_first = t_rest = 0.0
     merged_pts = []
     for wi, (s, rows, local_pid, npts) in enumerate(win_data):
-        t0 = time.time()
-        c_win, p_win = solve_window(wi)
-        dt = time.time() - t0
-        if wi == 0:
-            t_first = dt
-        else:
-            t_rest += dt
+        c_win, p_win = c_all[wi], p_all[wi]
         q_win = R_init[wi]  # rotations frozen per window
 
         if wi == 0:
             centers_glob[s:s + W] = c_win
             R_glob[s:s + W] = q_win
             have[s:s + W] = True
-            A = np.eye(3); b = np.zeros(3)
         else:
             # SE3-align this window onto the stitched trajectory over overlap.
             ov = np.arange(s, s + W)[have[s:s + W]]
@@ -290,14 +295,9 @@ def main():
             have[new] = True
             p_win = p_win @ Aw.T + bw
         merged_pts.append(p_win[:npts])
-        if wi % 10 == 0:
-            print(f"  window {wi + 1}/{N} ({dt:.2f}s)")
 
     assert have.all()
-    n_rest = max(N - 1, 1)
-    print(f"[timing] first window (compile): {t_first:.2f}s; "
-          f"rest: {t_rest:.2f}s total, {t_rest / n_rest:.3f}s/window; "
-          f"wall total {time.time() - t_wall0:.1f}s")
+    print(f"[timing] wall total {time.time() - t_wall0:.1f}s")
 
     # Recenter cam0 at origin; convert to WORLD->CAM t = -R c.
     centers_glob -= centers_glob[0]
