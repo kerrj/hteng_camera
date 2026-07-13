@@ -65,7 +65,10 @@ def _win_residual(vals, center, point_var, pose_quat, ray, rel, w,
     ray_w = R_wc.inverse() @ ray
     v = vals[point_var] - cam_pos
     v_dir = v / (jnp.linalg.norm(v) + 1e-9)
-    r = ray_w - jnp.dot(ray_w, v_dir) * v_dir   # perpendicular component
+    # d* clamped >= 0 (see vio_bundle_adjust.positioning_cost): without the
+    # clamp a behind-camera landmark costs ~0 and the solve diverges.
+    d_star = jnp.maximum(jnp.dot(ray_w, v_dir), 0.0)
+    r = ray_w - d_star * v_dir
     abs_r = jnp.linalg.norm(r) + 1e-9
     wr = jax.lax.stop_gradient(1.0 / (1.0 + (abs_r / robust_scale) ** 2))
     return r * (w * jnp.sqrt(wr))

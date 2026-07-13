@@ -202,7 +202,13 @@ def positioning_cost(vals, pose, center, point_var, ray_cam,
     ray_world = R_wc.inverse() @ ray_cam
     v = vals[point_var] - cam_pos_world
     v_dir = v / (jnp.linalg.norm(v) + 1e-9)
-    residual = ray_world - jnp.dot(ray_world, v_dir) * v_dir
+    # d* clamped >= 0: GLOMAP's d=exp(s)>0 forbids behind-camera landmarks;
+    # the raw perpendicular component is sign-invariant in v (a landmark
+    # BEHIND the camera would cost ~0 and the solve diverges -- observed).
+    # Clamping makes a behind-camera landmark cost the full ray (norm 1, the
+    # bounded max), restoring the constraint.
+    d_star = jnp.maximum(jnp.dot(ray_world, v_dir), 0.0)
+    residual = ray_world - d_star * v_dir
     return residual * jnp.sqrt(_robust_weight(residual, robust_scale, robust_kind))
 
 
