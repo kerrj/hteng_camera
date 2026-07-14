@@ -534,7 +534,15 @@ def main():
         print(f"wrote {rout} ({len(fr)} frames)", flush=True)
 
     if args.engine == "vbg":
-        mesh = vbg.extract_triangle_mesh(
+        # CUDA extraction breaks (illegal memory access) somewhere above
+        # ~100k active blocks even with hashmap headroom; the CPU path is
+        # fine. Decide BEFORE extracting -- a CUDA fault poisons the context,
+        # so a try/except fallback could never run.
+        src_vbg = vbg if nblk <= 100_000 else vbg.cpu()
+        if src_vbg is not vbg:
+            print(f"extracting on CPU ({nblk:,} blocks > CUDA-safe limit)",
+                  flush=True)
+        mesh = src_vbg.extract_triangle_mesh(
             weight_threshold=args.weight_threshold).to_legacy()
     else:
         mesh = vol.extract_triangle_mesh()
