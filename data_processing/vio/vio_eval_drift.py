@@ -63,6 +63,8 @@ def main():
     ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--window-s", type=float, default=10.0)
     ap.add_argument("--stride-s", type=float, default=2.0)
+    ap.add_argument("--plot", default=None,
+                    help="optional output PNG with error versus window start")
     args = ap.parse_args()
 
     fr, cr, Rr = load_traj(args.ref)
@@ -77,9 +79,10 @@ def main():
 
     W = int(args.window_s * args.fps)
     S = max(1, int(args.stride_s * args.fps))
-    max_pos, end_pos, rot_err = [], [], []
+    starts_s, max_pos, end_pos, rot_err = [], [], [], []
     for s in range(0, len(common) - W, S):
         sl = slice(s, s + W)
+        starts_s.append(s / args.fps)
         R, t = rigid_align(cc[sl], cr[sl])
         aligned = cc[sl] @ R.T + t
         err = np.linalg.norm(aligned - cr[sl], axis=1)
@@ -99,6 +102,26 @@ def main():
           f"p90={1e3*np.percentile(end_pos,90):.1f} worst={1e3*end_pos.max():.1f}")
     print(f"win rot err (deg):    p50={np.median(rot_err):.2f} "
           f"p90={np.percentile(rot_err,90):.2f} worst={rot_err.max():.2f}")
+
+    if args.plot:
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+        axes[0].plot(starts_s, 1e3 * max_pos, marker="o")
+        axes[0].set_ylabel("Max position (mm)")
+        axes[1].plot(starts_s, 1e3 * end_pos, marker="o", color="#d97706")
+        axes[1].set_ylabel("End position (mm)")
+        axes[2].plot(starts_s, rot_err, marker="o", color="#0f766e")
+        axes[2].set_ylabel("Median rotation (deg)")
+        axes[2].set_xlabel("Window start (s)")
+        for ax in axes:
+            ax.grid(alpha=0.25)
+        fig.suptitle(
+            f"Local trajectory drift ({args.window_s:g}s windows, "
+            f"{args.stride_s:g}s stride)")
+        fig.tight_layout()
+        fig.savefig(args.plot, dpi=160)
+        print(f"wrote {args.plot}")
 
 
 if __name__ == "__main__":

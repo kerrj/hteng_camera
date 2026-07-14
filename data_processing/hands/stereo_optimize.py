@@ -398,6 +398,220 @@ def build_data(jsonl, calib_dir, left_serial, right_serial, hand,
     return data, t_init, frames, Rvl_arr, want_right
 
 
+def _set_accel_indices(data, frames):
+    """Rebuild acceleration triples after phase-1 frame filtering."""
+    fr = np.asarray(frames)
+    mid = np.arange(1, len(fr) - 1)
+    adjacent = ((fr[mid] - fr[mid - 1] == 1)
+                & (fr[mid + 1] - fr[mid] == 1))
+    tri_mid = mid[adjacent]
+    data["accel_i0"] = jnp.asarray(tri_mid - 1)
+    data["accel_i1"] = jnp.asarray(tri_mid)
+    data["accel_i2"] = jnp.asarray(tri_mid + 1)
+
+
+def subset_data(data, keep, frames):
+    """Select accepted observations and rebuild their temporal topology."""
+    keep = np.asarray(keep)
+    n = len(keep)
+    out = {}
+    for key, value in data.items():
+        if key.startswith("accel_"):
+            continue
+        if hasattr(value, "shape") and getattr(value, "ndim", 0) > 0 \
+                and value.shape[0] == n:
+            out[key] = value[keep]
+        else:
+            out[key] = value
+    _set_accel_indices(out, frames)
+    return out
+
+
+def solve_independent_frames(M, data, t_init, beta_frozen, huber_px, w_shape,
+                             w_beta, iters, batch_size, linear_solver):
+    """Solve one jaxls problem per frame, vmapped in fixed-size batches.
+
+    Each problem has its own LM trust-region state. This is intentionally
+    different from a block-diagonal multi-frame problem, whose single damping
+    value lets one singular frame destabilize every independent fit.
+    """
+    out_size = data["out_size"]
+    mirror = data["mirror"]
+
+    def solve_one(kpL, kpR, f_px, R_lr, t_lr, conf, shape_mean, quat0, trans0):
+        one = {
+            "pose0": jnp.zeros((1, 48)),
+            "kpL": kpL[None],
+            "kpR": kpR[None],
+            "f_px": f_px[None],
+            "R_lr": R_lr[None],
+            "t_lr": t_lr[None],
+            "confL": conf[None],
+            "shape_mean": shape_mean[None],
+            "out_size": out_size,
+            "mirror": mirror,
+            "accel_i0": jnp.zeros((0,), dtype=jnp.int32),
+            "accel_i1": jnp.zeros((0,), dtype=jnp.int32),
+            "accel_i2": jnp.zeros((0,), dtype=jnp.int32),
+        }
+        costs, _ = make_costs(
+            M, one, huber_px, w_shape, 0.0, 0.0, 0.0, w_beta,
+            beta_frozen=beta_frozen, temporal=False)
+        ids = jnp.arange(1)
+        variables = [PoseVar(ids), TransVar(ids)]
+        init = jaxls.VarValues.make([
+            PoseVar(ids).with_value(quat0[None]),
+            TransVar(ids).with_value(trans0[None]),
+        ])
+        problem = jaxls.LeastSquaresProblem(costs, variables).analyze()
+        solution = problem.solve(
+            init,
+            trust_region=jaxls.TrustRegionConfig(),
+            linear_solver=linear_solver,
+            termination=jaxls.TerminationConfig(max_iterations=iters),
+            verbose=False)
+        return solution[PoseVar][0], solution[TransVar][0]
+
+    solve_batch = jax.jit(jax.vmap(solve_one))
+    inputs = (
+        data["kpL"], data["kpR"], data["f_px"], data["R_lr"], data["t_lr"],
+        data["confL"], data["shape_mean"], data["quat0"], t_init,
+    )
+    n = len(t_init)
+    batch_size = min(max(1, batch_size), n)
+    quat_parts, trans_parts = [], []
+    for start in range(0, n, batch_size):
+        count = min(batch_size, n - start)
+        batch = [x[start:start + count] for x in inputs]
+        if count < batch_size:
+            batch = [
+                jnp.concatenate([x, jnp.repeat(x[-1:], batch_size - count, axis=0)])
+                for x in batch
+            ]
+        quat, trans = solve_batch(*batch)
+        quat_parts.append(np.asarray(quat[:count]))
+        trans_parts.append(np.asarray(trans[:count]))
+        if start == 0 or start + count == n or (start + count) % 512 == 0:
+            print(f"[phase1/fit] {start + count}/{n}", flush=True)
+    return np.concatenate(quat_parts), np.concatenate(trans_parts)
+
+
+def evaluate_fits(M, data, quat, trans, beta, Rvl_arr):
+    """Compute phase-1 geometry and reprojection metrics for quality gating."""
+    mirror = float(data["mirror"])
+    out_size = data["out_size"]
+
+    R = jax.vmap(lambda q: jaxlie.SO3(q).as_matrix())(jnp.asarray(quat))
+    joints = jax.vmap(lambda Ri: MJ.mano_forward_R(M, Ri, beta))(R)
+    joints = joints.at[:, :, 0].multiply(mirror)
+    cam_l = joints + jnp.asarray(trans)[:, None, :]
+    cam_r = (jnp.einsum("nkc,ndc->nkd", cam_l, data["R_lr"])
+             + data["t_lr"][:, None, :])
+
+    c = (out_size - 1) / 2.0
+
+    def proj(cam):
+        f = data["f_px"][:, None]
+        return jnp.stack([
+            f * cam[:, :, 0] / cam[:, :, 2] + c,
+            f * cam[:, :, 1] / cam[:, :, 2] + c,
+        ], axis=-1)
+
+    p_l, p_r = proj(cam_l), proj(cam_r)
+    err = jnp.concatenate([
+        jnp.linalg.norm(p_l - data["kpL"], axis=2),
+        jnp.linalg.norm(p_r - data["kpR"], axis=2),
+    ], axis=1)
+    root_fish = np.einsum("nij,nj->ni", Rvl_arr, np.asarray(trans))
+    return {
+        "mean_reproj_px": np.asarray(jnp.mean(err, axis=1)),
+        "p90_reproj_px": np.asarray(jnp.percentile(err, 90, axis=1)),
+        "median_epipolar_px": np.median(
+            np.abs(np.asarray(data["kpL"])[:, :, 1]
+                   - np.asarray(data["kpR"])[:, :, 1]), axis=1),
+        "min_joint_z_m": np.asarray(
+            jnp.minimum(jnp.min(cam_l[:, :, 2], axis=1),
+                        jnp.min(cam_r[:, :, 2], axis=1))),
+        "depth_m": root_fish[:, 2],
+        "root_fish": root_fish,
+    }
+
+
+def quality_mask(metrics, min_depth, max_depth, min_joint_z,
+                 max_reproj_px, max_epipolar_px):
+    """Return accepted phase-1 fits and a per-reason rejection summary."""
+    arrays = list(metrics.values())
+    finite = np.ones(len(arrays[0]), dtype=bool)
+    for value in arrays:
+        finite &= np.all(np.isfinite(value).reshape(len(finite), -1), axis=1)
+    checks = {
+        "nonfinite": finite,
+        "depth": ((metrics["depth_m"] >= min_depth)
+                  & (metrics["depth_m"] <= max_depth)),
+        "joint_z": metrics["min_joint_z_m"] >= min_joint_z,
+        "reprojection": metrics["mean_reproj_px"] <= max_reproj_px,
+        "epipolar": metrics["median_epipolar_px"] <= max_epipolar_px,
+    }
+    keep = np.ones(len(finite), dtype=bool)
+    rejected = {}
+    for name, passed in checks.items():
+        rejected[name] = int(np.sum(keep & ~passed))
+        keep &= passed
+    return keep, rejected
+
+
+def quat_slerp(q0, q1, alpha):
+    """Shortest-path interpolation of wxyz unit quaternions."""
+    q0 = np.asarray(q0, np.float64)
+    q1 = np.asarray(q1, np.float64)
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    dot = np.clip(dot, -1.0, 1.0)
+    if dot > 0.9995:
+        q = q0 + alpha * (q1 - q0)
+        return (q / np.linalg.norm(q)).astype(np.float32)
+    theta = np.arccos(dot)
+    q = (np.sin((1.0 - alpha) * theta) * q0
+         + np.sin(alpha * theta) * q1) / np.sin(theta)
+    return q.astype(np.float32)
+
+
+def quat_to_matrix(q):
+    w, x, y, z = np.asarray(q)
+    return np.array([
+        [1 - 2 * (y*y + z*z), 2 * (x*y - z*w), 2 * (x*z + y*w)],
+        [2 * (x*y + z*w), 1 - 2 * (x*x + z*z), 2 * (y*z - x*w)],
+        [2 * (x*z - y*w), 2 * (y*z + x*w), 1 - 2 * (x*x + y*y)],
+    ], np.float32)
+
+
+def matrix_to_quat(R):
+    """Convert a proper rotation matrix to a wxyz unit quaternion."""
+    R = np.asarray(R, np.float64)
+    candidates = np.array([
+        1 + np.trace(R),
+        1 + R[0, 0] - R[1, 1] - R[2, 2],
+        1 - R[0, 0] + R[1, 1] - R[2, 2],
+        1 - R[0, 0] - R[1, 1] + R[2, 2],
+    ])
+    i = int(np.argmax(candidates))
+    if i == 0:
+        q = np.array([candidates[0], R[2, 1] - R[1, 2],
+                      R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+    elif i == 1:
+        q = np.array([R[2, 1] - R[1, 2], candidates[1],
+                      R[0, 1] + R[1, 0], R[0, 2] + R[2, 0]])
+    elif i == 2:
+        q = np.array([R[0, 2] - R[2, 0], R[0, 1] + R[1, 0],
+                      candidates[2], R[1, 2] + R[2, 1]])
+    else:
+        q = np.array([R[1, 0] - R[0, 1], R[0, 2] + R[2, 0],
+                      R[1, 2] + R[2, 1], candidates[3]])
+    return (q / np.linalg.norm(q)).astype(np.float32)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -451,7 +665,27 @@ def main():
                          "beyond). With the shape prior, inlier reproj is p90~4.5px, "
                          "so 5px robustifies the noisy mid-tail; was 10px (barely "
                          "active). Normalized internally to match residual scale.")
-    ap.add_argument("--iters", type=int, default=50)
+    ap.add_argument("--phase1-iters", type=int, default=30,
+                    help="LM iterations for each independent per-frame fit")
+    ap.add_argument("--phase1-batch", type=int, default=32,
+                    help="equal-sized one-frame solves vmapped per GPU batch")
+    ap.add_argument("--phase1-linear", default="dense_cholesky",
+                    help="jaxls linear solver for each small independent fit")
+    ap.add_argument("--min-depth", type=float, default=0.08,
+                    help="reject phase-1 roots shallower than this (metres)")
+    ap.add_argument("--max-depth", type=float, default=2.0,
+                    help="reject phase-1 roots deeper than this (metres)")
+    ap.add_argument("--min-joint-z", type=float, default=0.02,
+                    help="reject if any joint is behind/too near either camera")
+    ap.add_argument("--max-reproj-px", type=float, default=15.0,
+                    help="reject phase-1 fits above this two-eye mean error")
+    ap.add_argument("--max-epipolar-px", type=float, default=12.0,
+                    help="reject detections above this median stereo |dy|")
+    ap.add_argument("--interp-max-gap", type=int, default=5,
+                    help="linearly/SO3 interpolate enclosed gaps up to N frames; "
+                         "0 disables")
+    ap.add_argument("--iters", type=int, default=30,
+                    help="LM iterations for the filtered temporal solve")
     ap.add_argument("--frame-min", type=int, default=None)
     ap.add_argument("--frame-max", type=int, default=None)
     ap.add_argument("--linear", default="conjugate_gradient",
@@ -467,27 +701,47 @@ def main():
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     M = MJ.load_mano(args.mano)
-    data, t_init, frames, Rvl_arr, want_right = build_data(
+    data_all, t_init_all, frames_all, Rvl_all, want_right = build_data(
         args.jsonl, args.calib_dir, args.left_serial, args.right_serial,
         args.hand, args.frame_min, args.frame_max,
         args.w_wrist, args.w_mcp, args.w_pip, args.w_tip)
-    n = len(frames)
-    out_size = data["out_size"]
+    out_size = data_all["out_size"]
 
     import time
-    # ONE big coupled solve over all n frames (reproj into both eyes + the accel
-    # smoother). This is the design that worked well; a two-phase (eliminable
-    # fit, then add smoothing) variant was tried and reverted — phase 1 at high
-    # iters DIVERGED (one global LM lambda, poisoned by the few singular/negative-
-    # depth frames), so the extra complexity bought nothing but instability. With
-    # the accel smoother on, PoseVar/TransVar are temporally coupled (banded),
-    # so jaxls Schur-eliminates NOTHING and CG solves the full banded system;
-    # that's fine (matrix-free, exploits the sparsity). ~50 LM iters converges.
     beta_var = args.optimize_beta
-    beta_frozen = None if beta_var else jnp.mean(data["beta0"], axis=0)
+    beta_phase1 = jnp.mean(data_all["beta0"], axis=0)
+    beta_frozen = None if beta_var else beta_phase1
+
+    # Phase 1: truly independent one-frame problems. A vmapped solve gives every
+    # frame its own LM damping state while still compiling/running efficiently.
+    t = time.time()
+    quat1, trans1 = solve_independent_frames(
+        M, data_all, t_init_all, beta_phase1, args.huber_px, args.w_shape,
+        args.w_beta, args.phase1_iters, args.phase1_batch, args.phase1_linear)
+    metrics1 = evaluate_fits(
+        M, data_all, quat1, trans1, beta_phase1, Rvl_all)
+    keep, rejected = quality_mask(
+        metrics1, args.min_depth, args.max_depth, args.min_joint_z,
+        args.max_reproj_px, args.max_epipolar_px)
+    print(f"phase 1 solved {len(frames_all)} frames in {time.time()-t:.1f}s")
+    print(f"phase 1 accepted {int(keep.sum())}/{len(keep)}; "
+          + ", ".join(f"{k}={v}" for k, v in rejected.items()))
+    if not keep.any():
+        raise RuntimeError("phase-1 quality gates rejected every frame")
+
+    frames = list(np.asarray(frames_all)[keep])
+    Rvl_arr = Rvl_all[keep]
+    data = subset_data(data_all, keep, frames)
+    t_init = jnp.asarray(trans1[keep])
+    quat_init = jnp.asarray(quat1[keep])
+    n = len(frames)
+
+    # Phase 2: only accepted observations enter the coupled min-acceleration
+    # solve. Rejected/missing samples cannot contribute a reprojection factor or
+    # poison the trust region.
     fids = jnp.arange(n)
     var_list = [PoseVar(fids), TransVar(fids)]
-    init_vars = [PoseVar(fids).with_value(data["quat0"]),
+    init_vars = [PoseVar(fids).with_value(quat_init),
                  TransVar(fids).with_value(t_init)]
     if beta_var:
         var_list.append(BetaVar(0))
@@ -522,7 +776,7 @@ def main():
     crit = np.array(summary.termination_criteria)   # [cost, gradient, parameter]
     why = ["cost", "gradient", "parameter"]
     stopped = ", ".join(w for w, c in zip(why, crit) if c) or "max_iters"
-    print(f"solved {n} frames in {time.time()-t:.1f}s")
+    print(f"phase 2 solved {n} accepted frames in {time.time()-t:.1f}s")
     print(f"CONVERGENCE: {n_it} LM iters (max {args.iters}); stopped on: {stopped}")
     print(f"  cost:   {ch[0]:.3e} -> {ch[-1]:.3e}  ({ch[-1]/ch[0]*100:.1f}% of init)")
     print(f"  lambda: {lh[0]:.1e} -> {lh[-1]:.1e}  "
@@ -537,7 +791,7 @@ def main():
     print(f"betas ({'optimized' if beta_var else 'FROZEN to WiLoR mean'}): "
           f"{beta_solved.round(2)}")
 
-    quat0_np = np.array(data["quat0"])
+    quat0_np = np.array(quat_init)
     beta = np.broadcast_to(beta_solved, (n, 10))        # shared shape, per frame
     valid_np = np.array(data["validL"])  # (n,21) inlier mask
     kpL_np = np.array(data["kpL"]); kpR_np = np.array(data["kpR"]); fpx_np = np.array(data["f_px"])
@@ -607,15 +861,18 @@ def main():
     print(f"\nDEPTH (m): median={np.median(d_arr):.3f} mean={d_arr.mean():.3f} "
           f"std={d_arr.std():.3f}  range=[{d_arr.min():.3f},{d_arr.max():.3f}]")
     print(f"  depth percentiles: {pct(d_arr,(5,50,95))}")
-    print(f"\nPARAM DRIFT from WiLoR init:")
+    print(f"\nPARAM DRIFT from independent phase-1 fit:")
     print(f"  |Δpose| (rad): mean={dpose.mean():.3f} {pct(dpose)}  (15 joints+global)")
     print(f"  trans xy spread (m): x[{trans[:,0].min():.2f},{trans[:,0].max():.2f}] "
           f"y[{trans[:,1].min():.2f},{trans[:,1].max():.2f}]")
-    # temporal jitter (consecutive KEPT frames; gap-agnostic)
+    # Temporal jitter on genuinely adjacent accepted observations.
     if n > 1:
-        dj = np.abs(np.diff(d_arr)) * 1000
-        print(f"\nTEMPORAL (consecutive kept frames):")
-        print(f"  depth jump (mm): median={np.median(dj):.1f} {pct(dj,(50,90,99)).replace('p','p')}")
+        adjacent = np.diff(frames) == 1
+        dj = np.abs(np.diff(d_arr)[adjacent]) * 1000
+        if len(dj):
+            print(f"\nTEMPORAL (adjacent accepted frames):")
+            print(f"  depth jump (mm): median={np.median(dj):.1f} "
+                  f"{pct(dj,(50,90,99))}")
     print("==========================================================\n")
 
     # Convert results from the per-frame LEFT-VIRTUAL frame back to the common
@@ -632,6 +889,96 @@ def main():
         jnp.asarray(quat[:, 0])))                                   # (n,3,3)
     R_glob_fish_all = np.einsum("nij,njk->nik", Rvl_arr, R_glob_v_all)
     beta_wilor_mean = np.mean(np.array(data["beta0"]), axis=0)
+
+    # Re-apply the geometry gates after smoothing. The temporal solve is warm-
+    # started from valid fits, but this guarantees that a failed phase 2 can
+    # never emit negative/non-finite depth.
+    metrics2 = evaluate_fits(
+        M, data, quat, trans, jnp.asarray(beta_solved), Rvl_arr)
+    keep2, rejected2 = quality_mask(
+        metrics2, args.min_depth, args.max_depth, args.min_joint_z,
+        args.max_reproj_px, args.max_epipolar_px)
+    if not keep2.all():
+        print(f"phase 2 output gate accepted {int(keep2.sum())}/{len(keep2)}; "
+              + ", ".join(f"{k}={v}" for k, v in rejected2.items()))
+
+    phase1_kept = {
+        key: np.asarray(value)[keep] for key, value in metrics1.items()
+        if key != "root_fish"
+    }
+    records = []
+    for i, fr in enumerate(frames):
+        if not keep2[i]:
+            continue
+        records.append({
+            "frame": int(fr), "is_right": want_right,
+            "trans": root_fish[i].tolist(),
+            "depth_m": float(root_fish[i][2]),
+            "joints_3d_cam": j_fish_all[i].tolist(),
+            "Rv_l": Rvl_arr[i].tolist(),
+            "global_orient_R": R_glob_fish_all[i].tolist(),
+            "quat": quat[i].tolist(),
+            "trans_virtual": trans[i].tolist(),
+            "interpolated": False,
+            "phase1_mean_reproj_px": float(phase1_kept["mean_reproj_px"][i]),
+            "phase1_p90_reproj_px": float(phase1_kept["p90_reproj_px"][i]),
+            "phase1_median_epipolar_px": float(
+                phase1_kept["median_epipolar_px"][i]),
+            "phase1_depth_m": float(phase1_kept["depth_m"][i]),
+        })
+
+    # Fill only enclosed short gaps. Position is linear in the common fisheye
+    # frame; rotations follow shortest SO(3) arcs. Internal MANO rotations are
+    # interpolated independently, then FK regenerates coherent 3D joints.
+    interpolated = []
+    if args.interp_max_gap > 0:
+        for left, right in zip(records[:-1], records[1:]):
+            gap = right["frame"] - left["frame"] - 1
+            if gap < 1 or gap > args.interp_max_gap:
+                continue
+            root0, root1 = np.array(left["trans"]), np.array(right["trans"])
+            q0, q1 = np.array(left["quat"]), np.array(right["quat"])
+            q_rvl0 = matrix_to_quat(left["Rv_l"])
+            q_rvl1 = matrix_to_quat(right["Rv_l"])
+            q_glob0 = matrix_to_quat(left["global_orient_R"])
+            q_glob1 = matrix_to_quat(right["global_orient_R"])
+            for offset in range(1, gap + 1):
+                alpha = offset / (gap + 1)
+                root = (1.0 - alpha) * root0 + alpha * root1
+                Rvl_i = quat_to_matrix(quat_slerp(q_rvl0, q_rvl1, alpha))
+                Rglob_i = quat_to_matrix(quat_slerp(q_glob0, q_glob1, alpha))
+                qi = np.stack([
+                    quat_slerp(q0[j], q1[j], alpha) for j in range(16)
+                ])
+                qi[0] = matrix_to_quat(Rvl_i.T @ Rglob_i)
+                trans_i = Rvl_i.T @ root
+                interpolated.append({
+                    "frame": left["frame"] + offset,
+                    "is_right": want_right,
+                    "trans": root.tolist(),
+                    "depth_m": float(root[2]),
+                    "Rv_l": Rvl_i.tolist(),
+                    "global_orient_R": Rglob_i.tolist(),
+                    "quat": qi.tolist(),
+                    "trans_virtual": trans_i.tolist(),
+                    "interpolated": True,
+                    "source_frames": [left["frame"], right["frame"]],
+                })
+
+    if interpolated:
+        qi = jnp.asarray(np.array([r["quat"] for r in interpolated]))
+        ti = np.array([r["trans_virtual"] for r in interpolated])
+        Ri = np.array([r["Rv_l"] for r in interpolated])
+        bi = jnp.broadcast_to(jnp.asarray(beta_solved), (len(interpolated), 10))
+        ji = np.asarray(fk_R_batched(qi, bi)) + ti[:, None, :]
+        ji = np.einsum("nkc,ndc->nkd", ji, Ri)
+        for record, joints in zip(interpolated, ji):
+            record["joints_3d_cam"] = joints.tolist()
+        records.extend(interpolated)
+        records.sort(key=lambda record: record["frame"])
+    print(f"output: {len(records) - len(interpolated)} measured + "
+          f"{len(interpolated)} interpolated frames")
+
     with open(args.out, "w") as f:
         # first line: file-level meta (shared shape + the WiLoR-mean for the viz
         # "default vs optimized beta" toggle). Distinguished by "meta": True.
@@ -639,20 +986,20 @@ def main():
             "meta": True, "is_right": want_right, "mirror": mirror,
             "beta_opt": beta_solved.tolist(),
             "beta_wilor_mean": beta_wilor_mean.tolist(),
+            "phase1_input_frames": len(frames_all),
+            "phase1_accepted_frames": int(keep.sum()),
+            "phase2_accepted_frames": int(keep2.sum()),
+            "interpolated_frames": len(interpolated),
+            "quality_thresholds": {
+                "min_depth_m": args.min_depth,
+                "max_depth_m": args.max_depth,
+                "min_joint_z_m": args.min_joint_z,
+                "max_mean_reproj_px": args.max_reproj_px,
+                "max_median_epipolar_px": args.max_epipolar_px,
+            },
         }) + "\n")
-        for i, fr in enumerate(frames):
-            f.write(json.dumps({
-                "frame": int(fr), "is_right": want_right,
-                "trans": root_fish[i].tolist(),          # root in left-fisheye frame
-                "depth_m": float(root_fish[i][2]),       # optical-axis depth
-                "joints_3d_cam": j_fish_all[i].tolist(),  # LEFT-FISHEYE frame
-                "Rv_l": Rvl_arr[i].tolist(),             # virtual→fisheye (for ref)
-                "global_orient_R": R_glob_fish_all[i].tolist(),  # wrist rot, fisheye frame
-                # viz re-poser needs pose quats + LEFT-VIRTUAL trans (mesh is
-                # built in left-virtual then placed by + trans, @ Rv_l → fisheye):
-                "quat": quat[i].tolist(),                # (16,4) per-joint wxyz
-                "trans_virtual": trans[i].tolist(),      # (3,) left-virtual root
-            }) + "\n")
+        for record in records:
+            f.write(json.dumps(record) + "\n")
     print(f"wrote {args.out}")
 
 
