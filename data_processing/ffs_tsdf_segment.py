@@ -534,11 +534,12 @@ def main():
         print(f"wrote {rout} ({len(fr)} frames)", flush=True)
 
     if args.engine == "vbg":
-        # CUDA extraction breaks (illegal memory access) somewhere above
-        # ~100k active blocks even with hashmap headroom; the CPU path is
-        # fine. Decide BEFORE extracting -- a CUDA fault poisons the context,
-        # so a try/except fallback could never run.
-        src_vbg = vbg if nblk <= 100_000 else vbg.cpu()
+        # CUDA extraction faults above ~87k active blocks even with hashmap
+        # headroom (93k crashed, 43k fine) -- consistent with an int32
+        # overflow at blocks*4096voxels*6 ~ 2^31. The CPU path is fine.
+        # Decide BEFORE extracting: a CUDA fault poisons the context, so a
+        # try/except fallback could never run.
+        src_vbg = vbg if nblk <= 80_000 else vbg.cpu()
         if src_vbg is not vbg:
             print(f"extracting on CPU ({nblk:,} blocks > CUDA-safe limit)",
                   flush=True)
