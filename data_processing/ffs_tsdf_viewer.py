@@ -40,6 +40,12 @@ def main():
     ap.add_argument("--mesh", default=None,
                     help="mesh ply override (e.g. a decimated _tsdf_view.ply "
                          "for big segments); default <prefix>_tsdf_mesh.ply")
+    ap.add_argument("--gamma", type=float, default=2.2,
+                    help="linearize sRGB-stored colors before serving: "
+                         "three.js treats vertex colors as LINEAR and applies "
+                         "an sRGB output transform, so serving sRGB values "
+                         "as-is double-encodes and washes everything pastel. "
+                         "Set 1.0 to disable.")
     args = ap.parse_args()
 
     seg = json.load(open(f"{args.prefix}_segment.json"))
@@ -48,8 +54,9 @@ def main():
         args.fps = seg.get("fps", 30.0)
 
     mesh = o3d.io.read_triangle_mesh(args.mesh or f"{args.prefix}_tsdf_mesh.ply")
+    vcol = np.power(np.clip(np.asarray(mesh.vertex_colors), 0, 1), args.gamma)
     tm = trimesh.Trimesh(np.asarray(mesh.vertices), np.asarray(mesh.triangles),
-                         vertex_colors=(np.asarray(mesh.vertex_colors) * 255).astype(np.uint8),
+                         vertex_colors=(vcol * 255).astype(np.uint8),
                          process=False)
 
     tr = np.load(args.trajectory)
@@ -64,7 +71,8 @@ def main():
     dyn = None
     if args.dynamic:
         d = np.load(args.dynamic)
-        dyn = {"points": d["points"], "colors": d["colors"],
+        dcol = (np.power(d["colors"] / 255.0, args.gamma) * 255).astype(np.uint8)
+        dyn = {"points": d["points"], "colors": dcol,
                "slice_of": {int(f): (int(d["offsets"][k]), int(d["offsets"][k + 1]))
                             for k, f in enumerate(d["frames"])}}
 
