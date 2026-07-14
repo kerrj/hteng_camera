@@ -37,3 +37,48 @@ def test_rasterize_hand_mask_dilates():
     m = TS.rasterize_hand_mask(px, 100, 100, dilate_px=5)
     assert m[50, 50] and m[50, 55] and not m[50, 70]
     assert m.sum() > 50  # dilation grew the two seeds into a blob
+
+
+def _random_pose(rng):
+    q = rng.normal(size=4)
+    q /= np.linalg.norm(q)
+    E = np.eye(4)
+    E[:3, :3] = TS.quat_to_R(q)
+    E[:3, 3] = rng.normal(size=3)
+    return E
+
+
+def test_R_to_quat_roundtrip():
+    rng = np.random.default_rng(0)
+    for _ in range(50):
+        q = rng.normal(size=4)
+        q /= np.linalg.norm(q)
+        q2 = TS.R_to_quat(TS.quat_to_R(q))
+        assert abs(np.dot(q, q2)) > 1 - 1e-9  # equal up to sign
+
+
+def test_apply_world_correction_reobserves_moved_points():
+    # ICP says the frame's world points X really sit at dT @ X. The corrected
+    # camera must see dT @ X at the SAME camera coords the guess saw X at.
+    rng = np.random.default_rng(1)
+    for _ in range(20):
+        ext, dT = _random_pose(rng), _random_pose(rng)
+        X = np.append(rng.normal(size=3), 1.0)
+        cam_before = ext @ X
+        cam_after = TS.apply_world_correction(ext, dT) @ (dT @ X)
+        assert np.allclose(cam_before, cam_after, atol=1e-10)
+
+
+def test_cam_to_world_correction_matches_world_icp():
+    # An ICP run in the guess camera's frame and one run in world frame
+    # describe the same alignment: conjugation must map one to the other.
+    rng = np.random.default_rng(2)
+    for _ in range(20):
+        ext, dT_c = _random_pose(rng), _random_pose(rng)
+        X_w = np.append(rng.normal(size=3), 1.0)
+        # camera-frame ICP moved the measured cam-frame point onto the model
+        model_c = dT_c @ (ext @ X_w)
+        # the world-frame correction must land on the same model point
+        dT_w = TS.cam_to_world_correction(ext, dT_c)
+        model_w = np.linalg.inv(ext) @ model_c
+        assert np.allclose(dT_w @ X_w, model_w, atol=1e-10)

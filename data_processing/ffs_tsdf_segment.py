@@ -41,6 +41,44 @@ def quat_to_R(q):  # wxyz -> (3,3)
         [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]], np.float64)
 
 
+def R_to_quat(R):  # (3,3) -> wxyz (Shepperd's method, always well-conditioned)
+    m00, m01, m02 = R[0]
+    m10, m11, m12 = R[1]
+    m20, m21, m22 = R[2]
+    tr = m00 + m11 + m22
+    if tr > 0:
+        s = np.sqrt(tr + 1.0) * 2
+        q = np.array([0.25 * s, (m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s])
+    elif m00 >= m11 and m00 >= m22:
+        s = np.sqrt(1.0 + m00 - m11 - m22) * 2
+        q = np.array([(m21 - m12) / s, 0.25 * s, (m01 + m10) / s, (m02 + m20) / s])
+    elif m11 >= m22:
+        s = np.sqrt(1.0 + m11 - m00 - m22) * 2
+        q = np.array([(m02 - m20) / s, (m01 + m10) / s, 0.25 * s, (m12 + m21) / s])
+    else:
+        s = np.sqrt(1.0 + m22 - m00 - m11) * 2
+        q = np.array([(m10 - m01) / s, (m02 + m20) / s, (m12 + m21) / s, 0.25 * s])
+    return q / np.linalg.norm(q)
+
+
+def apply_world_correction(ext, dT):
+    """ICP found dT aligning this frame's world points onto the model
+    (X_model = dT @ X_frame). The camera that observes the corrected points at
+    the same pixels is ext' = ext @ inv(dT): ext' (dT X) = ext X."""
+    return ext @ np.linalg.inv(dT)
+
+
+def cam_to_world_correction(ext, dT_c):
+    """Conjugate a camera-frame ICP correction (X_model_c = dT_c @ X_meas_c,
+    both clouds lifted with identity extrinsic at guess pose ext = world->cam)
+    into the equivalent world-frame correction."""
+    return np.linalg.inv(ext) @ dT_c @ ext
+
+
+def rot_angle_deg(R):
+    return float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
+
+
 def pick_segment(centers, frame_idx, gyro_dps, gyro_frames, hand_frames,
                  window, stride, min_hand_frac):
     """Score sliding windows: prefer small camera-center extent + low gyro
@@ -124,6 +162,26 @@ def main():
                          "depth disagrees (in front by >3 cm, despeckled) are "
                          "masked out of integration IN ADDITION to MANO -- "
                          "catches manipulated objects, blankets, unfit hands")
+    ap.add_argument("--refine-poses", action="store_true",
+                    help="vbg only: frame-to-model ICP pose polish. Raycast the "
+                         "accumulating TSDF from the VIO pose, point-to-plane "
+                         "ICP measured-vs-model, integrate at the corrected "
+                         "pose. The VIO pose stays the per-frame prior, so "
+                         "corrections are bounded (no odometry drift). Writes "
+                         "<out-prefix>_trajectory_refined.npz")
+    ap.add_argument("--refine-warmup", type=int, default=20,
+                    help="integrate this many frames at VIO poses before ICP "
+                         "(model too thin to track against earlier)")
+    ap.add_argument("--refine-max-corr", type=float, default=0.015,
+                    help="ICP max correspondence distance (m)")
+    ap.add_argument("--refine-stride", type=int, default=4,
+                    help="pixel stride when lifting depth images to ICP clouds")
+    ap.add_argument("--refine-gate-t", type=float, default=0.03,
+                    help="reject corrections translating more than this (m)")
+    ap.add_argument("--refine-gate-deg", type=float, default=2.0,
+                    help="reject corrections rotating more than this (deg)")
+    ap.add_argument("--refine-min-fitness", type=float, default=0.5,
+                    help="reject ICP results with inlier fraction below this")
     args = ap.parse_args()
 
     meta = json.load(open(f"{args.range_dir}/meta.json"))
@@ -231,6 +289,14 @@ def main():
     gyro_of = np.zeros(int(frame_idx[-1]) + 2, np.float64)
     gyro_of[np.asarray(gyro_frames, int)] = gyro_dps
 
+    refine = args.refine_poses and args.engine == "vbg"
+    if refine:
+        import open3d.t.pipelines.registration as treg
+        icp_eye = o3c.Tensor(np.eye(4), o3c.float64)
+        eye4_d = o3c.Tensor(np.eye(4), o3c.float64).to(dev)
+        used_poses = {}                     # vf -> world->cam ext actually used
+        corr_t, corr_deg, n_rej = [], [], 0
+
     used = skipped_blur = missing_hand = 0
     offs = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
     for vf in range(s0, e0, args.frame_stride):
@@ -304,6 +370,47 @@ def main():
             ext_t = o3c.Tensor(ext, o3c.float64)
             blocks = vbg.compute_unique_block_coordinates(
                 d_t, K_t, ext_t, 1.0, args.max_range)
+            if refine and used >= args.refine_warmup:
+                rc = vbg.ray_cast(block_coords=blocks, intrinsic=K_t,
+                                  extrinsic=ext_t, width=W, height=H,
+                                  render_attributes=["depth"], depth_scale=1.0,
+                                  depth_min=0.05, depth_max=args.max_range,
+                                  weight_threshold=1.0)
+                model_d = o3d.t.geometry.Image(rc["depth"])
+                # Lift both clouds in the GUESS pose's camera frame (identity
+                # extrinsic): with_normals=True + non-identity extrinsic hits
+                # an Open3D CUDA bug (normal-rotation matmul lands on CPU).
+                # ICP's camera-frame dT_c is conjugated back to world below.
+                K_d = K_t.to(dev)
+                src = o3d.t.geometry.PointCloud.create_from_depth_image(
+                    d_t, K_d, eye4_d, 1.0, args.max_range, args.refine_stride)
+                tgt = o3d.t.geometry.PointCloud.create_from_depth_image(
+                    model_d, K_d, eye4_d, 1.0, args.max_range,
+                    args.refine_stride, with_normals=True)
+                ok_icp = False
+                if len(src.point.positions) > 1000 and len(tgt.point.positions) > 1000:
+                    res = treg.icp(
+                        src, tgt, args.refine_max_corr, icp_eye,
+                        treg.TransformationEstimationPointToPlane(),
+                        treg.ICPConvergenceCriteria(max_iteration=15))
+                    dT_c = res.transformation.cpu().numpy()
+                    dT = cam_to_world_correction(ext, dT_c)
+                    dt_m = float(np.linalg.norm(dT[:3, 3]))
+                    dr_deg = rot_angle_deg(dT[:3, :3])
+                    ok_icp = (res.fitness >= args.refine_min_fitness
+                              and dt_m <= args.refine_gate_t
+                              and dr_deg <= args.refine_gate_deg)
+                if ok_icp:
+                    ext = apply_world_correction(ext, dT)
+                    ext_t = o3c.Tensor(ext, o3c.float64)
+                    blocks = vbg.compute_unique_block_coordinates(
+                        d_t, K_t, ext_t, 1.0, args.max_range)
+                    corr_t.append(dt_m)
+                    corr_deg.append(dr_deg)
+                else:
+                    n_rej += 1
+            if refine:
+                used_poses[vf] = ext.copy()
             vbg.integrate(blocks, d_t, c_t, K_t, K_t, ext_t, 1.0, args.max_range)
         else:
             rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
@@ -315,6 +422,36 @@ def main():
     cap.release()
     print(f"integrated {used} frames (skipped {skipped_blur} blurred; "
           f"{missing_hand} frame-sides lacked a hand fit)", flush=True)
+
+    if refine:
+        if corr_t:
+            print(f"ICP refine: corrected {len(corr_t)} frames "
+                  f"(rejected {n_rej}); |t| median {1e3*np.median(corr_t):.1f}mm "
+                  f"p90 {1e3*np.percentile(corr_t, 90):.1f}mm; "
+                  f"rot median {np.median(corr_deg):.3f}deg", flush=True)
+        else:
+            print(f"ICP refine: 0 corrections accepted ({n_rej} rejected)",
+                  flush=True)
+        # trajectory-format npz: refined ext where a frame was integrated,
+        # the VIO pose otherwise -- downstream (dynamic residual, viewer)
+        # can point --trajectory here and see every segment frame
+        fr, pq = [], []
+        for vf in range(s0, e0):
+            if vf in used_poses:
+                E = used_poses[vf]
+            elif vf in pose_of:
+                i = pose_of[vf]
+                E = np.eye(4)
+                E[:3, :3] = Rws[i]
+                E[:3, 3] = poses[i, 4:]
+            else:
+                continue
+            fr.append(vf)
+            pq.append(np.concatenate([R_to_quat(E[:3, :3]), E[:3, 3]]))
+        rout = f"{args.out_prefix}_trajectory_refined.npz"
+        np.savez(rout, frame_idx=np.array(fr, np.int64),
+                 pose_wxyz_xyz=np.array(pq, np.float64))
+        print(f"wrote {rout} ({len(fr)} frames)", flush=True)
 
     if args.engine == "vbg":
         mesh = vbg.extract_triangle_mesh(
