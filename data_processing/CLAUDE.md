@@ -202,3 +202,14 @@ a blurry frame. THEN phase 2 (temporal) / phase 3 (mono fill).
   fps (long-test1 30, long-test2 40) — read from the video, never assume.
   Viewer: `ffs_tsdf_viewer.py --dynamic --mesh` (single-writer play loop;
   do NOT hold a lock across viser setters — ABBA deadlock).
+- 2026-07-14: **Tier-2 depth validated on segment C** (`out/lt2_video_hq`).
+  The fisheye captures ~774 px/rad but the baseline 960 px/100° tiles
+  sample at ~403 px/rad — a 1.9× angular undersample. Tier-2 = native-res
+  tiles (`--tile-w 1856`) + accurate checkpoint `23-36-37` + `--iters 16`
+  + `--max-disp 416` (at native fx a 25 cm hand is ~220 px disparity; the
+  default 192 cap would clip it) + `--tile-chunk 1` (batched 5-tile
+  forward exceeds a cuDNN grid_sample size limit at native res; single
+  tile saturates the GPU anyway). Cost: ~3× baseline, 900 frames on
+  8 GPUs ≈ 5 min — cheap enough to be the default for task segments.
+  Result: pass-2 mesh 2.75M → 3.02M verts, visibly fewer holes, solid
+  chair/bed surfaces, laptop legible (`out/lt2_segC_ab_hq.png`).

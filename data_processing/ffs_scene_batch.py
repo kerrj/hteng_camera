@@ -47,15 +47,22 @@ def build_geom(b_hat, Rs, W, hfov, vfov, dev):
     return fx, H, dirs, Rv_ls, Rv_rs
 
 
-def ffs_batch(model, tiles_l, tiles_r, dev):
+def ffs_batch(model, tiles_l, tiles_r, dev, chunk=0):
+    """chunk=0: all tiles in one forward. chunk=k: k tiles per forward -- needed
+    for native-res tiles, where the batched geo-volume grid_sample exceeds
+    cuDNN's size limit (CUDNN_STATUS_NOT_SUPPORTED)."""
     a = torch.stack([torch.nan_to_num(x) for x in tiles_l]).to(dev)
     b = torch.stack([torch.nan_to_num(x) for x in tiles_r]).to(dev)
     padder = M.InputPadder(a.shape, divis_by=32, force_square=False)
     a, b = padder.pad(a, b)
+    k = chunk or len(a)
+    outs = []
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=True, dtype=M.AMP_DTYPE):
-        d = model.forward(a, b, iters=model.args.valid_iters,
-                          test_mode=True, optimize_build_volume="pytorch1")
-    return padder.unpad(d.float())                           # (T,1,H,W) or (T,H,W)
+        for i in range(0, len(a), k):
+            outs.append(model.forward(a[i:i + k], b[i:i + k],
+                                      iters=model.args.valid_iters,
+                                      test_mode=True, optimize_build_volume="pytorch1"))
+    return padder.unpad(torch.cat(outs).float())             # (T,1,H,W) or (T,H,W)
 
 
 def fuse_range_gpu(disps, dirs, Rv_ls, fx, baseline, Kl, Dl,
@@ -86,7 +93,8 @@ def worker(args):
     dev = torch.device("cuda")
     Kl, Dl, Kr, Dr, Rs, ts, b_hat, baseline = M.load_calib(
         args.calib_dir, args.left_serial, args.right_serial, dev)
-    model = M.load_ffs(args.weights, dev, valid_iters=args.iters)
+    model = M.load_ffs(args.weights, dev, valid_iters=args.iters,
+                       max_disp=args.max_disp)
     fx, H, dirs, Rv_ls, Rv_rs = build_geom(b_hat, Rs, args.tile_w, args.hfov, args.vfov, dev)
 
     to_t = lambda b: torch.tensor(cv2.cvtColor(b, cv2.COLOR_BGR2RGB),
@@ -120,7 +128,8 @@ def worker(args):
             fL, fR = to_t(fr[:, :half]), to_t(fr[:, half:])
         tl = [M.render_tile(fL, Rv, dirs, Kl, Dl, args.tile_w, H) for Rv in Rv_ls]
         tr = [M.render_tile(fR, Rv, dirs, Kr, Dr, args.tile_w, H) for Rv in Rv_rs]
-        disps = ffs_batch(model, tl, tr, dev).reshape(len(tl), H, args.tile_w)
+        disps = ffs_batch(model, tl, tr, dev,
+                          chunk=args.tile_chunk).reshape(len(tl), H, args.tile_w)
         rmap = fuse_range_gpu(disps, dirs, Rv_ls, fx, baseline, Kl, Dl,
                               Wf, Hf, args.scale, args.min_disp, args.max_depth, dev)
         stack[i] = rmap.cpu().numpy().astype(np.float16)
@@ -147,6 +156,7 @@ def launcher(args):
                    "left_serial": args.left_serial, "right_serial": args.right_serial,
                    "scale": args.scale, "tile_w": args.tile_w, "hfov": args.hfov,
                    "vfov": args.vfov, "pitches": PITCHES, "iters": args.iters,
+                   "max_disp": args.max_disp,
                    "min_disp": args.min_disp, "max_depth": args.max_depth,
                    "start": args.start, "end": args.end,
                    "slices": [list(map(int, s)) for s in slices],
@@ -161,6 +171,7 @@ def launcher(args):
                "--out-dir", args.out_dir, "--tile-w", str(args.tile_w),
                "--hfov", str(args.hfov), "--vfov", str(args.vfov),
                "--scale", str(args.scale), "--iters", str(args.iters),
+               "--max-disp", str(args.max_disp), "--tile-chunk", str(args.tile_chunk),
                "--min-disp", str(args.min_disp), "--max-depth", str(args.max_depth)]
         if args.video_right:
             cmd += ["--video-right", args.video_right]
@@ -190,6 +201,12 @@ def main():
     ap.add_argument("--vfov", type=float, default=52.0)
     ap.add_argument("--scale", type=float, default=0.5, help="range-map res vs full fisheye")
     ap.add_argument("--iters", type=int, default=8)
+    ap.add_argument("--max-disp", type=int, default=192,
+                    help="cost-volume disparity cap; raise for high-res tiles "
+                         "(min depth = fx*baseline/max_disp)")
+    ap.add_argument("--tile-chunk", type=int, default=0,
+                    help="tiles per FFS forward (0 = all); use 1-2 for "
+                         "native-res tiles to stay under cuDNN size limits")
     ap.add_argument("--min-disp", type=float, default=1.0)
     ap.add_argument("--max-depth", type=float, default=20.0)
     args = ap.parse_args()
