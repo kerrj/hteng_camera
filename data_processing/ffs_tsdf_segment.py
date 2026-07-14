@@ -396,11 +396,13 @@ def main():
         ext[:3, :3] = Rws[i]
         ext[:3, 3] = poses[i, 4:]                            # world->cam = o3d extrinsic
         if args.engine == "vbg":
-            from torch.utils.dlpack import to_dlpack
-            d_t = o3d.t.geometry.Image(o3c.Tensor.from_dlpack(
-                to_dlpack(depth_t.contiguous())))
-            c_t = o3d.t.geometry.Image(o3c.Tensor.from_dlpack(
-                to_dlpack((color_t.float() / 255.0).contiguous())))
+            # NOT dlpack zero-copy: torch's caching allocator recycles the
+            # buffer while o3d's async stream may still read it -- illegal
+            # memory access surfacing later at extract. ~4ms/frame is cheap.
+            d_t = o3d.t.geometry.Image(o3c.Tensor(
+                depth_t.cpu().numpy(), device=dev))
+            c_t = o3d.t.geometry.Image(o3c.Tensor(
+                (color_t.float() / 255.0).cpu().numpy(), device=dev))
             ext_t = o3c.Tensor(ext, o3c.float64)
             blocks = vbg.compute_unique_block_coordinates(
                 d_t, K_t, ext_t, 1.0, args.max_range)
