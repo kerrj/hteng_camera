@@ -177,6 +177,11 @@ def main():
                     help="skip motion-blurred frames above this gyro rate")
     ap.add_argument("--max-range", type=float, default=2.0)
     ap.add_argument("--voxel", type=float, default=0.005)
+    ap.add_argument("--block-count", type=int, default=100_000,
+                    help="VBG hashmap capacity (preallocated). Stationary "
+                         "workspaces need ~50k at 3mm; large swept volumes "
+                         "(kitchen, walking) overflow 100k -> illegal memory "
+                         "access at extract. ~82KB GPU per block.")
     ap.add_argument("--hfov", type=float, default=110.0)
     ap.add_argument("--img-w", type=int, default=800)
     ap.add_argument("--mask-dilate-px", type=int, default=12)
@@ -307,8 +312,8 @@ def main():
             attr_names=("tsdf", "weight", "color"),
             attr_dtypes=(o3c.float32, o3c.float32, o3c.float32),
             attr_channels=((1), (1), (3)),
-            voxel_size=args.voxel, block_resolution=16, block_count=100_000,
-            device=dev)
+            voxel_size=args.voxel, block_resolution=16,
+            block_count=args.block_count, device=dev)
         K_t = o3c.Tensor([[fx, 0, cx], [0, fx, cy], [0, 0, 1]], o3c.float64)
     else:
         vol = o3d.pipelines.integration.ScalableTSDFVolume(
@@ -485,6 +490,12 @@ def main():
     cap.release()
     print(f"integrated {used} frames (skipped {skipped_blur} blurred; "
           f"{missing_hand} frame-sides lacked a hand fit)", flush=True)
+    if args.engine == "vbg":
+        nblk = vbg.hashmap().size()
+        print(f"VBG blocks: {nblk:,} / {args.block_count:,} capacity", flush=True)
+        assert nblk < args.block_count, (
+            "block hashmap overflowed -- raise --block-count (mesh would be "
+            "corrupt; extraction crashes with illegal memory access)")
 
     if refine:
         if corr_t:
