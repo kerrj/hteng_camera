@@ -213,3 +213,19 @@ a blurry frame. THEN phase 2 (temporal) / phase 3 (mono fill).
   8 GPUs ≈ 5 min — cheap enough to be the default for task segments.
   Result: pass-2 mesh 2.75M → 3.02M verts, visibly fewer holes, solid
   chair/bed surfaces, laptop legible (`out/lt2_segC_ab_hq.png`).
+- 2026-07-14 (later): **full quality stack** = Tier-2 depth + `--img-w
+  1280` (the 800px integration view had become the res bottleneck) +
+  `--voxel 0.003` + `--refine-poses` (frame-to-model colored ICP; see
+  the flag's help and commit 8ebd161 for the three motion-phase fixes:
+  comparable-pixel filter, colored ICP vs in-plane sliding, <1.2m
+  near-field cap). Keyboard keys resolve; ICP removes the 3mm-voxel
+  surface breakup (`out/lt2_segC_ab3_stack.png`). Convergence check:
+  pass-2 re-refine corrections drop to 6.2mm median vs pass-1's
+  10.3mm. Chain the passes: pass-2 takes pass-1's
+  `_trajectory_refined.npz` as `--trajectory`, dynamic residual takes
+  pass-2's. Dynamic pts 167M → 146M (fewer misalignment residuals).
+  Motion-phase VIO error is real: smooth ~1.5-2.5cm corrections (some
+  beyond the 3cm gate -> integrated at VIO pose; raising the gate is
+  untested). Open3D gotchas: create_from_depth_image(with_normals) +
+  non-identity extrinsic = CUDA device-mismatch bug (lift in cam frame,
+  conjugate); multi_scale_icp needs o3d.utility.DoubleVector args.
