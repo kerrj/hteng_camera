@@ -119,6 +119,37 @@ def pick_segment(centers, frame_idx, gyro_dps, gyro_frames, hand_frames,
                   "fallback": fallback}
 
 
+def splat_zbuffer_torch(P, C, fx, cx, cy, W, H):
+    """3x3 z-buffer splat of camera-frame points into a virtual pinhole.
+
+    torch (CUDA when the tensors live there); replaces the numpy painter's
+    loop, which was 78% of the integration loop's wall clock. Nearest point
+    wins per pixel; ties broken by point index (packed key: depth | index).
+    P (N,3) float32, C (N,3) uint8 -> depth (H,W) float32, color (H,W,3) uint8.
+    """
+    assert len(P) < (1 << 22), "point index no longer fits the packed key"
+    Z = P[:, 2]
+    u0 = torch.round(fx * P[:, 0] / Z + cx).long()
+    v0 = torch.round(fx * P[:, 1] / Z + cy).long()
+    zq = (Z * 1e4).long().clamp(min=0)                  # 0.1mm depth quanta
+    key = (zq << 22) | torch.arange(len(Z), device=Z.device)
+    empty = 1 << 62
+    best = torch.full((H * W,), empty, dtype=torch.int64, device=Z.device)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            u, v = u0 + dx, v0 + dy
+            ok = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+            best.scatter_reduce_(0, v[ok] * W + u[ok], key[ok],
+                                 reduce="amin", include_self=True)
+    hit = best < empty
+    idx = best[hit] & ((1 << 22) - 1)
+    depth = torch.zeros(H * W, dtype=torch.float32, device=Z.device)
+    color = torch.zeros((H * W, 3), dtype=torch.uint8, device=Z.device)
+    depth[hit] = Z[idx]
+    color[hit] = C[idx]
+    return depth.reshape(H, W), color.reshape(H, W, 3)
+
+
 def rasterize_hand_mask(verts_px, H, W, dilate_px):
     """Splat projected MANO verts -> dilated boolean mask (H,W)."""
     m = np.zeros((H, W), np.uint8)
@@ -310,7 +341,7 @@ def main():
         fits = []
 
     used = skipped_blur = missing_hand = 0
-    offs = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
+    tdev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     for vf in range(s0, e0, args.frame_stride):
         if vf not in pose_of:
             continue
@@ -356,29 +387,20 @@ def main():
         u2 = np.clip((xs[m] / scale).astype(int), 0, rgb.shape[1] - 1)
         v2 = np.clip((ys[m] / scale).astype(int), 0, rgb.shape[0] - 1)
         C = rgb[v2, u2]
-        # project into the virtual pinhole; far-to-near painter's ordering
-        Z = P[:, 2]
-        keep = Z > 0.05
-        P, C, Z = P[keep], C[keep], Z[keep]
-        u = np.round(fx * P[:, 0] / Z + cx).astype(int)
-        v = np.round(fx * P[:, 1] / Z + cy).astype(int)
-        order = np.argsort(-Z)
-        u, v, Z, C = u[order], v[order], Z[order], C[order]
-        depth = np.zeros((H, W), np.float32)
-        color = np.zeros((H, W, 3), np.uint8)
-        for dx, dy in offs:                                  # 3x3 splat
-            uu, vv = u + dx, v + dy
-            ok = (uu >= 0) & (uu < W) & (vv >= 0) & (vv < H)
-            depth[vv[ok], uu[ok]] = Z[ok]                    # later = nearer wins
-            color[vv[ok], uu[ok]] = C[ok]
+        keep = P[:, 2] > 0.05
+        P_t = torch.tensor(P[keep], dtype=torch.float32, device=tdev)
+        C_t = torch.tensor(C[keep], device=tdev)
+        depth_t, color_t = splat_zbuffer_torch(P_t, C_t, fx, cx, cy, W, H)
         i = pose_of[vf]
         ext = np.eye(4)
         ext[:3, :3] = Rws[i]
         ext[:3, 3] = poses[i, 4:]                            # world->cam = o3d extrinsic
         if args.engine == "vbg":
-            d_t = o3d.t.geometry.Image(o3c.Tensor(depth, device=dev))
-            c_t = o3d.t.geometry.Image(o3c.Tensor(
-                (color.astype(np.float32) / 255.0), device=dev))
+            from torch.utils.dlpack import to_dlpack
+            d_t = o3d.t.geometry.Image(o3c.Tensor.from_dlpack(
+                to_dlpack(depth_t.contiguous())))
+            c_t = o3d.t.geometry.Image(o3c.Tensor.from_dlpack(
+                to_dlpack((color_t.float() / 255.0).contiguous())))
             ext_t = o3c.Tensor(ext, o3c.float64)
             blocks = vbg.compute_unique_block_coordinates(
                 d_t, K_t, ext_t, 1.0, args.max_range)
@@ -452,7 +474,8 @@ def main():
             vbg.integrate(blocks, d_t, c_t, K_t, K_t, ext_t, 1.0, args.max_range)
         else:
             rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-                o3d.geometry.Image(color), o3d.geometry.Image(depth),
+                o3d.geometry.Image(np.ascontiguousarray(color_t.cpu().numpy())),
+                o3d.geometry.Image(np.ascontiguousarray(depth_t.cpu().numpy())),
                 depth_scale=1.0, depth_trunc=args.max_range,
                 convert_rgb_to_intensity=False)
             vol.integrate(rgbd, intr, ext)

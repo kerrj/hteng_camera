@@ -39,6 +39,18 @@ def test_rasterize_hand_mask_dilates():
     assert m.sum() > 50  # dilation grew the two seeds into a blob
 
 
+def test_splat_zbuffer_nearest_wins():
+    import torch
+    fx, cx, cy, W, H = 100.0, 32, 32, 64, 64
+    # two points hitting the same pixel: the nearer one must win
+    P = torch.tensor([[0.0, 0.0, 2.0], [0.0, 0.0, 1.0]])
+    C = torch.tensor([[255, 0, 0], [0, 255, 0]], dtype=torch.uint8)
+    d, c = TS.splat_zbuffer_torch(P, C, fx, cx, cy, W, H)
+    assert d[32, 32] == 1.0 and tuple(c[32, 32].tolist()) == (0, 255, 0)
+    assert d[33, 33] == 1.0          # inside the 3x3 footprint
+    assert d[30, 30] == 0.0          # outside it
+
+
 def _random_pose(rng):
     q = rng.normal(size=4)
     q /= np.linalg.norm(q)
