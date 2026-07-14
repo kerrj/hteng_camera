@@ -176,12 +176,20 @@ def main():
                     help="ICP max correspondence distance (m)")
     ap.add_argument("--refine-stride", type=int, default=4,
                     help="pixel stride when lifting depth images to ICP clouds")
+    ap.add_argument("--refine-max-depth", type=float, default=1.2,
+                    help="ICP uses only points nearer than this: stereo depth "
+                         "noise grows as Z^2 and passes the correspondence "
+                         "cap (~1.5cm) around 1.3m -- beyond that, points "
+                         "dilute fitness with pure noise")
     ap.add_argument("--refine-gate-t", type=float, default=0.03,
                     help="reject corrections translating more than this (m)")
     ap.add_argument("--refine-gate-deg", type=float, default=2.0,
                     help="reject corrections rotating more than this (deg)")
-    ap.add_argument("--refine-min-fitness", type=float, default=0.5,
-                    help="reject ICP results with inlier fraction below this")
+    ap.add_argument("--refine-min-fitness", type=float, default=0.35,
+                    help="reject ICP results with inlier fraction below this. "
+                         "0.35 validated on segment C: accepted corrections "
+                         "are temporally smooth (real pose error), and the "
+                         "magnitude gates bound any residual ICP noise")
     args = ap.parse_args()
 
     meta = json.load(open(f"{args.range_dir}/meta.json"))
@@ -286,7 +294,9 @@ def main():
         prior_fns = (residual_mask, despeckle)
         ray_norm = np.linalg.norm(rays, axis=-1)
 
-    gyro_of = np.zeros(int(frame_idx[-1]) + 2, np.float64)
+    # size by BOTH ranges: a segment-only --trajectory (e.g. a refined npz)
+    # ends before the recording's gyro frames do
+    gyro_of = np.zeros(int(max(frame_idx[-1], gyro_frames.max())) + 2, np.float64)
     gyro_of[np.asarray(gyro_frames, int)] = gyro_dps
 
     refine = args.refine_poses and args.engine == "vbg"
@@ -296,6 +306,8 @@ def main():
         eye4_d = o3c.Tensor(np.eye(4), o3c.float64).to(dev)
         used_poses = {}                     # vf -> world->cam ext actually used
         corr_t, corr_deg, n_rej = [], [], 0
+        rej_fit, rej_gate, rej_pts = 0, 0, 0
+        fits = []
 
     used = skipped_blur = missing_hand = 0
     offs = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
@@ -373,33 +385,59 @@ def main():
             if refine and used >= args.refine_warmup:
                 rc = vbg.ray_cast(block_coords=blocks, intrinsic=K_t,
                                   extrinsic=ext_t, width=W, height=H,
-                                  render_attributes=["depth"], depth_scale=1.0,
+                                  render_attributes=["depth", "color"],
+                                  depth_scale=1.0,
                                   depth_min=0.05, depth_max=args.max_range,
                                   weight_threshold=1.0)
-                model_d = o3d.t.geometry.Image(rc["depth"])
+                model_raw = rc["depth"].reshape((H, W))
+                model_d = o3d.t.geometry.Image(model_raw)
+                model_c = o3d.t.geometry.Image(
+                    rc["color"].reshape((H, W, 3)).to(o3c.float32))
+                # Restrict the source to pixels comparable with the model:
+                # (a) the raycast hit (surface the model has already seen);
+                # (b) measured NOT well in front of it -- that's a dynamic
+                # occluder (unfit hand, held object) the static model
+                # rightly lacks. Both would dilute fitness with pixels that
+                # cannot have correspondences at any pose.
+                d_meas = d_t.as_tensor().reshape((H, W))
+                comparable = (model_raw > 0) & (d_meas > model_raw - 0.05)
+                overlap_d = o3d.t.geometry.Image(
+                    d_meas * comparable.to(o3c.float32))
                 # Lift both clouds in the GUESS pose's camera frame (identity
                 # extrinsic): with_normals=True + non-identity extrinsic hits
                 # an Open3D CUDA bug (normal-rotation matmul lands on CPU).
                 # ICP's camera-frame dT_c is conjugated back to world below.
                 K_d = K_t.to(dev)
-                src = o3d.t.geometry.PointCloud.create_from_depth_image(
-                    d_t, K_d, eye4_d, 1.0, args.max_range, args.refine_stride)
-                tgt = o3d.t.geometry.PointCloud.create_from_depth_image(
-                    model_d, K_d, eye4_d, 1.0, args.max_range,
+                src = o3d.t.geometry.PointCloud.create_from_rgbd_image(
+                    o3d.t.geometry.RGBDImage(c_t, overlap_d),
+                    K_d, eye4_d, 1.0, args.refine_max_depth,
+                    args.refine_stride)
+                tgt = o3d.t.geometry.PointCloud.create_from_rgbd_image(
+                    o3d.t.geometry.RGBDImage(model_c, model_d),
+                    K_d, eye4_d, 1.0, args.refine_max_depth,
                     args.refine_stride, with_normals=True)
                 ok_icp = False
                 if len(src.point.positions) > 1000 and len(tgt.point.positions) > 1000:
+                    # Colored ICP: the near field during motion phases is
+                    # often one dominant plane (desk/wall) -- point-to-plane
+                    # alone slides in-plane; color gradients pin those DOFs.
                     res = treg.icp(
                         src, tgt, args.refine_max_corr, icp_eye,
-                        treg.TransformationEstimationPointToPlane(),
-                        treg.ICPConvergenceCriteria(max_iteration=15))
+                        treg.TransformationEstimationForColoredICP(),
+                        treg.ICPConvergenceCriteria(max_iteration=20))
                     dT_c = res.transformation.cpu().numpy()
                     dT = cam_to_world_correction(ext, dT_c)
                     dt_m = float(np.linalg.norm(dT[:3, 3]))
                     dr_deg = rot_angle_deg(dT[:3, :3])
-                    ok_icp = (res.fitness >= args.refine_min_fitness
-                              and dt_m <= args.refine_gate_t
-                              and dr_deg <= args.refine_gate_deg)
+                    fits.append(res.fitness)
+                    if res.fitness < args.refine_min_fitness:
+                        rej_fit += 1
+                    elif dt_m > args.refine_gate_t or dr_deg > args.refine_gate_deg:
+                        rej_gate += 1
+                    else:
+                        ok_icp = True
+                else:
+                    rej_pts += 1
                 if ok_icp:
                     ext = apply_world_correction(ext, dT)
                     ext_t = o3c.Tensor(ext, o3c.float64)
@@ -426,12 +464,18 @@ def main():
     if refine:
         if corr_t:
             print(f"ICP refine: corrected {len(corr_t)} frames "
-                  f"(rejected {n_rej}); |t| median {1e3*np.median(corr_t):.1f}mm "
+                  f"(rejected {n_rej}: fitness {rej_fit}, gate {rej_gate}, "
+                  f"too-few-pts {rej_pts}); "
+                  f"|t| median {1e3*np.median(corr_t):.1f}mm "
                   f"p90 {1e3*np.percentile(corr_t, 90):.1f}mm; "
                   f"rot median {np.median(corr_deg):.3f}deg", flush=True)
         else:
-            print(f"ICP refine: 0 corrections accepted ({n_rej} rejected)",
+            print(f"ICP refine: 0 corrections accepted ({n_rej} rejected: "
+                  f"fitness {rej_fit}, gate {rej_gate}, too-few-pts {rej_pts})",
                   flush=True)
+        if fits:
+            print(f"ICP fitness p10/50/90: "
+                  f"{np.percentile(fits, [10, 50, 90]).round(3)}", flush=True)
         # trajectory-format npz: refined ext where a frame was integrated,
         # the VIO pose otherwise -- downstream (dynamic residual, viewer)
         # can point --trajectory here and see every segment frame
