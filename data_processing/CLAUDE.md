@@ -245,3 +245,16 @@ a blurry frame. THEN phase 2 (temporal) / phase 3 (mono fill).
   swept regimes: A/C 3mm, D 4mm, walking 5mm. Winning config per
   segment in `out/lt2_seg{Ahi2,Cg2,Dhi2,5shi2}_*`; zsh does NOT
   word-split $VARS -- spell out multi-token args in launch commands.
+- 2026-07-15: **VGGT trajectories integrated** (merged main ddfd1fb;
+  jkerr's VGGT-Omega pipeline replaces BA, which now lives in
+  `vio/_deprecated_BA_vio/`). His precomputed long-test2 trajectories
+  copied into `long-test2/derived/trajectory_vggt_omega_fullrun*.npz`
+  (full 40fps frame coverage, our exact npz format -- drop-in via
+  `--trajectory`). Segment-C referee (ICP corrections, pass-1, gate
+  4.5): our BA 9.9mm median vs VGGT 14.0mm (15Hz keyframes spline-
+  interpolated to 40fps = local smoothing), but post-ICP meshes are at
+  visual parity (`out/lt2_segC_ba_vs_vggt.png`). Use VGGT + `--refine-
+  poses` going forward: minutes of compute, loop closure, active
+  upstream support; ICP recovers the local slop. NOTE: VGGT world
+  frame has a different yaw gauge than the old trajectory.npz --
+  never mix trajectories within one segment build chain.
