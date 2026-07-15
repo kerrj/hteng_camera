@@ -5,7 +5,8 @@ MANO params to fit stereo keypoints. Replicates wilor_mini's MANO wrapper:
 16 MANO joints (J_regressor) + 5 fingertip vertices, remapped to the 21-joint
 OpenPose order. Validated against the torch smplx output (see validate_mano_jax).
 
-Load the tensors bundle with ``load_mano(npz_path)`` (produced by extract_mano).
+Load the tensors bundle with ``load_mano(npz_path)``. Generate it with
+``export_mano_jax.py``.
 """
 import jax
 import jax.numpy as jnp

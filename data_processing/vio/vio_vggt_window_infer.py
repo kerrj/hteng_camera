@@ -153,14 +153,13 @@ def remap_fisheye_batch(frames, grid):
     """Remap an NCHW uint8 RGB batch to normalized float images on-device."""
     import torch.nn.functional as F
 
-    sampled = F.grid_sample(
+    return F.grid_sample(
         frames.float().div_(255.0),
         grid.expand(len(frames), -1, -1, -1),
         mode="bilinear",
         padding_mode="zeros",
         align_corners=True,
     )
-    return sampled
 
 
 class DirectStereoVideoLoader:
@@ -218,8 +217,7 @@ class DirectStereoVideoLoader:
                 selected_frames = frame_idx[selected_positions].tolist()
                 decoded = self.decoders[eye_id].get_frames_at(
                     selected_frames).data
-                remapped = remap_fisheye_batch(
-                    decoded, self.grids[eye_id])
+                remapped = remap_fisheye_batch(decoded, self.grids[eye_id])
                 if output_size != self.image_size:
                     remapped = F.interpolate(
                         remapped,

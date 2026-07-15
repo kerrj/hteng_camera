@@ -92,8 +92,45 @@ def compose_stereo_poses(left_poses, R_stereo, t_stereo):
     ], axis=1)
 
 
-def interpolate_poses(frame_idx, poses, native_fps, target_frame_idx=None):
-    """Interpolate world-to-camera poses at every native video frame."""
+def repaired_frame_times(frame_idx, frame_time_us):
+    """Return monotonic relative seconds while preserving observed frame gaps.
+
+    Camera timestamps can jump backward when their counters are reset near the
+    start of a recording. Replace only nonpositive intervals with the median
+    positive interval; all valid observed timing variation is retained.
+    """
+    frame_idx = np.asarray(frame_idx, np.int64)
+    frame_time_us = np.asarray(frame_time_us, np.float64)
+    if frame_idx.ndim != 1 or frame_time_us.shape != frame_idx.shape:
+        raise ValueError("frame indices and timestamps must be matching vectors")
+    if np.any(np.diff(frame_idx) <= 0):
+        raise ValueError("timestamp frame indices must be strictly increasing")
+    if len(frame_idx) < 2:
+        return np.zeros(len(frame_idx), np.float64)
+    delta_us = np.diff(frame_time_us)
+    positive = delta_us[delta_us > 0]
+    if not len(positive):
+        raise ValueError("frame timestamps contain no positive intervals")
+    replacement_us = float(np.median(positive))
+    delta_us = np.where(delta_us > 0, delta_us, replacement_us)
+    return np.concatenate([[0.0], np.cumsum(delta_us) / 1e6])
+
+
+def frame_times_at(source_frame_idx, source_times, target_frame_idx):
+    source_frame_idx = np.asarray(source_frame_idx, np.int64)
+    target_frame_idx = np.asarray(target_frame_idx, np.int64)
+    positions = np.searchsorted(source_frame_idx, target_frame_idx)
+    if (np.any(positions >= len(source_frame_idx))
+            or not np.array_equal(source_frame_idx[positions],
+                                  target_frame_idx)):
+        raise ValueError("missing observed timestamp for an interpolation frame")
+    return np.asarray(source_times, np.float64)[positions]
+
+
+def interpolate_poses(frame_idx, poses, native_fps=None,
+                      target_frame_idx=None, frame_times=None,
+                      target_frame_times=None):
+    """Interpolate centers cubically and orientations with RotationSpline."""
     from scipy.interpolate import CubicSpline
     from scipy.spatial.transform import Rotation, RotationSpline
 
@@ -104,7 +141,6 @@ def interpolate_poses(frame_idx, poses, native_fps, target_frame_idx=None):
     if np.any(np.diff(frame_idx) <= 0):
         raise ValueError("pose frame indices must be strictly increasing")
 
-    key_times = frame_idx.astype(np.float64) / float(native_fps)
     if target_frame_idx is None:
         full_frame_idx = np.arange(
             frame_idx[0], frame_idx[-1] + 1, dtype=np.int64)
@@ -112,7 +148,26 @@ def interpolate_poses(frame_idx, poses, native_fps, target_frame_idx=None):
         full_frame_idx = np.asarray(target_frame_idx, np.int64)
         if np.any(np.diff(full_frame_idx) <= 0):
             raise ValueError("target frame indices must be strictly increasing")
-    full_times = full_frame_idx.astype(np.float64) / float(native_fps)
+    if (frame_times is None) != (target_frame_times is None):
+        raise ValueError(
+            "frame_times and target_frame_times must be provided together")
+    if frame_times is None:
+        if native_fps is None or native_fps <= 0:
+            raise ValueError("native_fps must be positive without frame times")
+        key_times = frame_idx.astype(np.float64) / float(native_fps)
+        full_times = full_frame_idx.astype(np.float64) / float(native_fps)
+    else:
+        key_times = np.asarray(frame_times, np.float64)
+        full_times = np.asarray(target_frame_times, np.float64)
+        if key_times.shape != frame_idx.shape:
+            raise ValueError("frame_times must match pose frame_idx")
+        if full_times.shape != full_frame_idx.shape:
+            raise ValueError(
+                "target_frame_times must match target_frame_idx")
+        if np.any(np.diff(key_times) <= 0):
+            raise ValueError("pose frame times must be strictly increasing")
+        if np.any(np.diff(full_times) <= 0):
+            raise ValueError("target frame times must be strictly increasing")
 
     rotation_wc = Rotation.from_quat(poses[:, [1, 2, 3, 0]])
     rotation_cw = rotation_wc.inv()
@@ -157,6 +212,26 @@ def visual_relative_cost(vals, pose_i, pose_j, scale_var, measured,
     return jnp.concatenate([translation, rotation])
 
 
+def visual_relative_cauchy_cost(
+        vals, pose_i, pose_j, scale_var, measured,
+        translation_weight, rotation_weight, cauchy_scale):
+    residual = visual_relative_cost(
+        vals,
+        pose_i,
+        pose_j,
+        scale_var,
+        measured,
+        translation_weight,
+        rotation_weight,
+    )
+    squared_norm = jnp.sum(residual**2)
+    # JAXLS relinearizes each iteration; freeze the current IRLS weight in
+    # each local Jacobian.
+    robust_weight = jax.lax.stop_gradient(
+        1.0 / (1.0 + squared_norm / cauchy_scale**2))
+    return residual * jnp.sqrt(robust_weight)
+
+
 def baseline_cost(vals, scale_var, predicted_baseline, known_baseline,
                   weight):
     # A dimensionless log ratio gives this factor comparable leverage at any
@@ -182,8 +257,15 @@ def gravity_cost(vals, pose_var, measured_down, weight):
     return (predicted - measured_down) * weight
 
 
-def pose_anchor_cost(vals, pose_var, target, weight):
-    return (jaxlie.SE3(target).inverse() @ vals[pose_var]).log() * weight
+def gauge_anchor_cost(vals, pose_var, translation_weight, rotation_weight):
+    """Softly fix the global gauge; weak rotation lets gravity set roll/pitch."""
+    pose = vals[pose_var]
+    center = -(pose.rotation().inverse() @ pose.translation())
+    rotation = pose.rotation().log()
+    return jnp.concatenate([
+        center * translation_weight,
+        rotation * rotation_weight,
+    ])
 
 
 def constant_velocity_cost(vals, pose_prev, pose, pose_next,
@@ -374,7 +456,6 @@ def build_measurements(windows, baseline_m):
         "edges": edges,
         "predicted_baselines": np.asarray(predicted_baselines, np.float32),
         "initial_log_scales": np.asarray(initial_log_scales, np.float32),
-        "window_quality": np.asarray(window_quality, np.float32),
     }
 
 
@@ -432,6 +513,10 @@ def solve_graph(args, windows, manifest, imu):
         args.window_anchor_weight if edge[6] == "window_anchor" else 1.0
         for edge in measurements["edges"]
     ], np.float32)
+    if args.visual_cauchy_scale > 0:
+        print(
+            f"graph: Cauchy scale {args.visual_cauchy_scale:g} on all "
+            f"{len(measurements['edges'])} visual edges")
 
     imu_i, imu_j, imu_delta = [], [], []
     for index in range(n_poses - 1):
@@ -477,24 +562,28 @@ def solve_graph(args, windows, manifest, imu):
 
     poses = jaxls.SE3Var(id=jnp.arange(n_poses))
     scales = WindowLogScaleVar(id=jnp.arange(n_windows))
+    visual_cost_args = (
+        jaxls.SE3Var(id=jnp.asarray(edge_i)),
+        jaxls.SE3Var(id=jnp.asarray(edge_j)),
+        WindowLogScaleVar(id=jnp.asarray(edge_window)),
+        jnp.asarray(edge_pose),
+        jnp.asarray(
+            args.visual_translation_weight
+            * edge_quality
+            * edge_pair_weight),
+        jnp.asarray(
+            args.visual_rotation_weight
+            * edge_quality
+            * edge_pair_weight),
+    )
+    if args.visual_cauchy_scale > 0:
+        visual_cost = visual_relative_cauchy_cost
+        visual_cost_args += (jnp.asarray(args.visual_cauchy_scale),)
+    else:
+        visual_cost = visual_relative_cost
+
     costs = [
-        jaxls.Cost(
-            visual_relative_cost,
-            (
-                jaxls.SE3Var(id=jnp.asarray(edge_i)),
-                jaxls.SE3Var(id=jnp.asarray(edge_j)),
-                WindowLogScaleVar(id=jnp.asarray(edge_window)),
-                jnp.asarray(edge_pose),
-                jnp.asarray(
-                    args.visual_translation_weight
-                    * edge_quality
-                    * edge_pair_weight),
-                jnp.asarray(
-                    args.visual_rotation_weight
-                    * edge_quality
-                    * edge_pair_weight),
-            ),
-        ),
+        jaxls.Cost(visual_cost, visual_cost_args),
         jaxls.Cost(
             baseline_cost,
             (
@@ -513,11 +602,11 @@ def solve_graph(args, windows, manifest, imu):
             ),
         ),
         jaxls.Cost(
-            pose_anchor_cost,
+            gauge_anchor_cost,
             (
                 jaxls.SE3Var(id=jnp.asarray(0)),
-                jnp.asarray(pose_init[0], np.float32),
-                jnp.asarray(args.anchor_weight),
+                jnp.asarray(args.anchor_translation_weight),
+                jnp.asarray(args.anchor_rotation_weight),
             ),
         ),
     ]
@@ -619,6 +708,15 @@ def parse_args():
     parser.add_argument("--visual-translation-weight", type=float, default=10.0)
     parser.add_argument("--visual-rotation-weight", type=float, default=10.0)
     parser.add_argument(
+        "--visual-cauchy-scale",
+        type=float,
+        default=2.0,
+        help=(
+            "Cauchy scale for each grouped 6D VGGT edge residual; "
+            "0 uses plain L2"
+        ),
+    )
+    parser.add_argument(
         "--window-anchor-weight",
         type=float,
         default=1.0,
@@ -634,7 +732,18 @@ def parse_args():
         help="Gaussian taper width for |mean accel|-1g gravity confidence",
     )
     parser.add_argument("--constant-velocity-weight", type=float, default=0.1)
-    parser.add_argument("--anchor-weight", type=float, default=1000.0)
+    parser.add_argument(
+        "--anchor-translation-weight",
+        type=float,
+        default=1.0,
+        help="soft gauge weight pulling the first camera center to the origin",
+    )
+    parser.add_argument(
+        "--anchor-rotation-weight",
+        type=float,
+        default=0.01,
+        help="weak rotational gauge weight; gravity determines roll/pitch",
+    )
     return parser.parse_args()
 
 
@@ -653,15 +762,23 @@ def main():
         imu_path = os.path.join(recording, "imu_relative.npz")
     imu = np.load(imu_path)
     result = solve_graph(args, windows, manifest, imu)
-    native_frame_count = max(
-        int(manifest.get("native_frame_count", 0)),
-        int(np.max(imu["frame_idx"])) + 1,
-    )
+    native_frame_count = int(manifest.get("native_frame_count", 0))
+    if native_frame_count <= 0:
+        native_frame_count = int(np.max(imu["frame_idx"])) + 1
+    target_frame_idx = np.arange(native_frame_count, dtype=np.int64)
+    timeline_frame_idx = np.asarray(imu["frame_idx"], np.int64)
+    timeline_time_s = repaired_frame_times(
+        timeline_frame_idx, imu["frame_time_us"])
+    keyframe_time_s = frame_times_at(
+        timeline_frame_idx, timeline_time_s, result["frame_idx"])
+    target_time_s = frame_times_at(
+        timeline_frame_idx, timeline_time_s, target_frame_idx)
     frame_idx, poses = interpolate_poses(
         result["frame_idx"],
         result["poses"],
-        manifest["native_fps"],
-        target_frame_idx=np.arange(native_frame_count, dtype=np.int64),
+        target_frame_idx=target_frame_idx,
+        frame_times=keyframe_time_s,
+        target_frame_times=target_time_s,
     )
     R_stereo = np.asarray(manifest["R_stereo"], np.float64)
     t_stereo = np.asarray(manifest["t_stereo"], np.float64)
@@ -683,6 +800,10 @@ def main():
         keyframe_pose_wxyz_xyz=result["poses"],
         keyframe_pose_wxyz_xyz_left=result["poses"],
         keyframe_pose_wxyz_xyz_right=keyframe_right_poses,
+        interpolation_frame_time_s=target_time_s,
+        keyframe_time_s=keyframe_time_s,
+        interpolation_time_source=np.asarray(
+            "observed_camera_timestamps_repaired"),
         R_stereo=R_stereo,
         t_stereo=t_stereo,
         baseline_m=np.asarray(manifest["baseline_m"]),
@@ -697,6 +818,10 @@ def main():
         graph_final_cost=np.asarray(result["final_cost"]),
         graph_cost_history=result["cost_history"],
         wall_seconds=np.asarray(result["wall_seconds"]),
+        visual_cauchy_scale=np.asarray(args.visual_cauchy_scale),
+        anchor_translation_weight=np.asarray(
+            args.anchor_translation_weight),
+        anchor_rotation_weight=np.asarray(args.anchor_rotation_weight),
     )
     print(f"wrote {out_path}")
 

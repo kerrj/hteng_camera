@@ -8,7 +8,7 @@ world orientation whose x-axis lies along the stereo baseline. Then image rows
 are epipolar lines: disparity is purely horizontal and is a clean depth cue
 (validated: residual |dy| ~1-5px vs disparity dx ~20-50px).
 
-Design (decided 2026-06-25, see CLAUDE.md):
+Design:
   - Per hand, unproject the bbox-centre pixel through the LEFT fisheye model to a
     gaze ray ``g`` (left-camera frame).
   - Build a virtual rotation ``Rv`` (cv2 camera frame: z=g forward, x along the
@@ -71,8 +71,11 @@ def triangulate_rays(g_l, g_r, Rs, ts):
     v = Rs.T @ g_r                                   # right ray dir, left frame
     v = v / torch.linalg.norm(v)
     w0 = -cr                                         # O_left(=0) - cr
-    a = u @ u; b = u @ v; c = v @ v
-    d = u @ w0; e = v @ w0
+    a = u @ u
+    b = u @ v
+    c = v @ v
+    d = u @ w0
+    e = v @ w0
     denom = a * c - b * b                            # 0 ⇔ rays parallel
     denom = torch.where(denom.abs() < 1e-8, torch.ones_like(denom), denom)
     s = (b * e - c * d) / denom                      # param along left ray

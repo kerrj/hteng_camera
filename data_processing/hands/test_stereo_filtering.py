@@ -1,4 +1,6 @@
 import numpy as np
+import os
+import tempfile
 
 import stereo_optimize as SO
 
@@ -60,3 +62,42 @@ def test_subset_data_rebuilds_only_consecutive_acceleration_triples():
     np.testing.assert_array_equal(out["accel_i0"], [2])
     np.testing.assert_array_equal(out["accel_i1"], [3])
     np.testing.assert_array_equal(out["accel_i2"], [4])
+
+
+def test_acceleration_scales_use_observed_frame_intervals():
+    data = {
+        "frame_time_s": np.array([0.0, 0.025, 0.075]),
+        "frame_time_reference_s": 0.025,
+    }
+    SO._set_accel_indices(data, [0, 1, 2])
+
+    np.testing.assert_allclose(data["accel_prev_scale"], [1.0])
+    np.testing.assert_allclose(data["accel_next_scale"], [0.5])
+
+
+def test_load_vio_world_transforms_matches_frames_and_inverts_poses():
+    angle = np.pi / 2
+    poses = np.array([
+        [1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0],
+        [np.cos(angle / 2), 0.0, 0.0, np.sin(angle / 2),
+         0.5, -0.25, 1.0],
+    ])
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "trajectory.npz")
+        np.savez(path, frame_idx=np.array([10, 20]), pose_wxyz_xyz=poses)
+        R_cw, t_cw = SO.load_vio_world_transforms(path, [20, 10])
+
+    R_wl_20 = SO.quat_to_matrix(poses[1, :4])
+    np.testing.assert_allclose(R_cw[0], R_wl_20.T, atol=1e-6)
+    np.testing.assert_allclose(t_cw[0], -R_wl_20.T @ poses[1, 4:], atol=1e-6)
+    np.testing.assert_allclose(R_cw[1], np.eye(3), atol=1e-6)
+    np.testing.assert_allclose(t_cw[1], -poses[0, 4:], atol=1e-6)
+
+
+if __name__ == "__main__":
+    test_quality_mask_rejects_invalid_geometry_and_bad_fit()
+    test_quaternion_matrix_round_trip_and_slerp()
+    test_subset_data_rebuilds_only_consecutive_acceleration_triples()
+    test_acceleration_scales_use_observed_frame_intervals()
+    test_load_vio_world_transforms_matches_frames_and_inverts_poses()
+    print("5 stereo filtering tests passed")

@@ -1,5 +1,4 @@
-"""VIO pipeline stage 4: turn raw IMU samples into per-frame priors for stage 5
-bundle adjustment.
+"""Turn raw IMU samples into frame-aligned pose-graph priors.
 
 Two separate quantities, not fused together:
 
@@ -24,8 +23,8 @@ imu.cam_reset_perf_counter_us, landing in imu_log.csv's host_time_us clock.
 One frame's t_left_us can be pre-reset garbage -- detected generically via
 timestamp non-monotonicity, not a hardcoded index.
 
-Run (from data_processing/vio/):
-    python vio_imu_prior.py ../../testimu --out ../../testimu/imu_relative.npz
+Run from the repository root:
+    python data_processing/vio/vio_imu_prior.py testimu
 """
 import argparse
 import bisect
@@ -216,8 +215,7 @@ def main():
         )
         # gravity_cam stores the DOWN direction (toward Earth) -- frame_gravity
         # returns "up" (see its docstring on the accel sign convention), so
-        # flip here to match this field's name/what downstream consumers
-        # (vio_visualize_imu_prior.py, the BA gravity prior) both expect.
+        # flip here to match the pose graph's measured-down convention.
         gravity_cam[k] = -(R_CI @ up_imu)
         gravity_accel_norm_g[k] = accel_norm_g
         gravity_weight[k] = w if frame_valid[k] else 0.0

@@ -1,36 +1,20 @@
-"""Stereo MANO bundle adjustment over a hand track, with jaxls.
+"""Robust stereo MANO optimization for one hand track.
 
-Keypoints-only (no images, no ViT) — so a dense, temporally-coupled solve over
-the whole video is cheap (seconds on CPU). For each frame we have WiLoR's
-per-eye 2D keypoints in two baseline-aligned pinhole crops that VERGE on the
-hand (both virtual cameras aimed at the triangulated point P; rows stay epipolar
-but the optical axes are NOT parallel). We optimize, per frame:
+Input is the per-eye WiLoR keypoints and virtual-camera geometry produced by
+``wilor_hands_pinhole.py``. The solver runs in two stages:
 
-    pose       (16,4) per-joint unit quats (wxyz) on the SO(3) manifold;
-                      joint 0 = global_orient, 1..15 = finger joints. The
-                      optimizer retracts tangent steps via SO3.exp (egoallo style).
-    betas      (10,) shape — ONE shared instance optimized for the whole video
-    t          (3,)  MANO-root translation in the LEFT-VIRTUAL crop frame
+1. Fit each frame independently, with a separate LM trust region per frame.
+2. Reject invalid geometry and poor stereo fits, then jointly optimize accepted
+   consecutive frames with a VIO-world minimum-acceleration prior.
 
-against three factor types:
-  - left reprojection:  project MANO joints (at t) into the left virtual cam
-  - right reprojection: project (R_lr @ (joints+t) + t_lr) into the right cam,
-                        where R_lr = Rv_r^T Rs Rv_l, t_lr = Rv_r^T ts encode the
-                        VERGED stereo geometry exactly (no baseline/disparity
-                        shortcut — that only held for parallel axes).
-  - temporal:           smoothness on (pose, t) between consecutive frames
+MANO shape is fixed to the track's mean WiLoR estimate. Pose uses 16 SO(3)
+variables (wrist plus 15 finger joints); translation is represented in each
+frame's left virtual camera. Results are converted to the common left-fisheye
+camera frame. Enclosed short gaps can be interpolated after the final quality
+gate.
 
-Reprojection is weighted PER KEYPOINT GROUP (wrist/mcp/pip/tip; default uniform).
-There is NO pose prior: stereo gives strictly better depth/pose than WiLoR's
-monocular regression. betas stay frozen to WiLoR.
-
-Results are converted from the per-frame left-virtual frame back to the common
-LEFT-FISHEYE (optical-axis) frame before saving (joints_3d_cam, trans, depth_m,
-global_orient_R), so they're comparable across frames.
-
-Run:  python stereo_optimize.py --calib-dir ../../long-test2 --hand right
-      (reads <calib-dir>/derived/hands.jsonl, writes
-       <calib-dir>/derived/hands3d_<hand>.jsonl; override with --jsonl/--out)
+Typical run:
+    python stereo_optimize.py --calib-dir ../../long-test2 --hand right
 """
 import argparse
 import json
@@ -65,11 +49,6 @@ class TransVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.array([0., 0., 
     """MANO-root translation in the rectified-left-crop camera frame (metres)."""
 
 
-class BetaVar(jaxls.Var[jax.Array], default_factory=lambda: jnp.zeros(10)):
-    """MANO shape (10,). ONE instance shared across the whole video (the hand's
-    shape is constant), so every frame's reproj cost references BetaVar(0)."""
-
-
 def project(joints_cam, f_px, out_size):
     """Pinhole project (N,3) camera-frame points → (N,2) crop pixels."""
     c = (out_size - 1) / 2.0
@@ -78,12 +57,7 @@ def project(joints_cam, f_px, out_size):
     return jnp.stack([x, y], axis=-1)
 
 
-# OpenPose-21 keypoint groups (after joint_map remap). Used to build the
-# per-keypoint reprojection weight vector. Wrist is root-relative (0,0,0) in the
-# MANO frame, so its reproj depends ONLY on translation t — weighting it up is
-# how we let stereo disparity pin down metric depth. Tips are single skinned
-# verts at the chain ends: noisiest in detection + most pose-sensitive, so we
-# weight them DOWN, not up.
+# OpenPose-21 keypoint groups, used for optional reprojection weighting.
 KP_GROUPS = {
     "wrist": [0],
     "mcp":   [1, 5, 9, 13, 17],          # finger base joints
@@ -101,21 +75,15 @@ def kp_weights(w_wrist, w_mcp, w_pip, w_tip):
     return jnp.asarray(w)
 
 
-def make_costs(M, data, huber_px, w_shape,
-               w_accel_pose, w_accel_pose_global, w_accel_trans, w_beta,
-               beta_frozen=None, temporal=True):
+def make_costs(M, data, beta, huber_px, w_shape,
+               w_accel_pose, w_accel_pose_global, w_accel_trans,
+               temporal=True):
     """Build batched jaxls costs from the per-frame stacked arrays in ``data``.
 
-    beta_frozen: if a (10,) array, MANO shape is a CONSTANT (not solved) — the
-    default, since a shared free beta absorbs pose error and blows up; trust
-    WiLoR. If None, beta is a single shared BetaVar(0) with the w_beta prior.
-
-    temporal: include the acceleration smoother (couples adjacent frames). Set
-    False for the fast phase-1 solve — with no pose↔pose / trans↔trans coupling,
-    PoseVar is block-diagonal so jaxls Schur-eliminates it (tiny reduced system,
-    cheap per-iter). Phase 2 re-runs with temporal=True to polish smoothness.
+    ``beta`` is fixed for the track. ``temporal=False`` creates the independent
+    phase-1 problem; ``temporal=True`` adds acceleration factors for phase 2.
     """
-    n = data["pose0"].shape[0]
+    n = data["kpL"].shape[0]
     fids = jnp.arange(n)
 
     # Residuals are normalized to image fractions by dividing pixel error by
@@ -135,12 +103,8 @@ def make_costs(M, data, huber_px, w_shape,
         a = jnp.abs(res_px_norm) + 1e-8
         return jax.lax.stop_gradient(jnp.where(a > huber_n, huber_n / a, 1.0))
 
-    # beta (MANO shape) is FROZEN to WiLoR's per-frame estimate — passed as a
-    # constant into the projection, not a variable. Hand shape shouldn't vary
-    # per frame and isn't useful to fit at this stage, so dropping it removes
-    # 10 vars/frame and the competing beta prior.
-    # forward-mode AD: the residual has few inputs (51 tangent dims) relative to
-    # outputs, and jacfwd benchmarked ~2x faster than jacrev on the MANO chain.
+    # Shape is fixed to the track mean. Forward-mode AD is faster here because
+    # each frame has 51 tangent inputs and 84 reprojection residuals.
     # mirror: +1 for right hand, -1 for left. mano_jax is MANO_RIGHT; WiLoR
     # mirrors left hands by negating joint x (and axis-angle comps 1,2), so its
     # stored left-hand pose only matches the keypoints after we x-negate the
@@ -165,33 +129,15 @@ def make_costs(M, data, huber_px, w_shape,
         # conf is the per-keypoint group weight; applied AFTER the Huber weight.
         return res_px * conf[:, None] * jnp.sqrt(huber_w(res_px))
 
-    # BOTH eyes in ONE cost: the MANO forward kinematics (the expensive part, and
-    # what forward-mode AD differentiates through) runs ONCE per frame; the
-    # shared joints are then projected into each eye. Two separate per-eye costs
-    # would run FK + its Jacobian twice.
-    # beta handling: FROZEN (a constant closed over here) is the default — a
-    # shared free beta absorbs pose/detection error and blows up (β₀→2.8 on the
-    # full video), so trust WiLoR's per-frame shape. If beta_frozen is None,
-    # beta is a shared BetaVar(0) solved with the w_beta prior (opt-in).
-    beta_is_var = beta_frozen is None
-    beta_const = None if beta_is_var else jnp.asarray(beta_frozen)
+    # Both eyes share one cost so MANO forward kinematics and its Jacobian run
+    # once per frame.
+    beta = jnp.asarray(beta)
 
     @jaxls.Cost.factory(jac_mode="forward")
-    def reproj_var_beta(vals, pose_v, t_v, beta_v,
-                        obsL, fL, RL, tL, obsR, fR, RR, tR, conf):
-        R = jaxlie.SO3(vals[pose_v]).as_matrix()           # (16,4)quat -> (16,3,3)
-        joints = MJ.mano_forward_R(M, R, vals[beta_v])     # shared shape var
-        joints = joints.at[:, 0].multiply(mirror)          # left-hand x-mirror
-        x = joints + vals[t_v][None, :]                    # left-virtual frame
-        rL = eye_residual(x, obsL, conf, fL, RL, tL)
-        rR = eye_residual(x, obsR, conf, fR, RR, tR)
-        return jnp.concatenate([rL.ravel(), rR.ravel()])
-
-    @jaxls.Cost.factory(jac_mode="forward")
-    def reproj_frozen_beta(vals, pose_v, t_v,
-                           obsL, fL, RL, tL, obsR, fR, RR, tR, conf):
+    def reproj(vals, pose_v, t_v,
+               obsL, fL, RL, tL, obsR, fR, RR, tR, conf):
         R = jaxlie.SO3(vals[pose_v]).as_matrix()
-        joints = MJ.mano_forward_R(M, R, beta_const)       # constant shape
+        joints = MJ.mano_forward_R(M, R, beta)
         joints = joints.at[:, 0].multiply(mirror)
         x = joints + vals[t_v][None, :]
         rL = eye_residual(x, obsL, conf, fL, RL, tL)
@@ -209,39 +155,54 @@ def make_costs(M, data, huber_px, w_shape,
         res = (jaxlie.SO3(mean15).inverse() @ R).log()        # (15,3)
         return (w_shape * res).reshape(-1)
 
-    # ACCELERATION (Laplacian) smoother on consecutive-in-time triples (i-1,i,i+1).
-    # Penalizing the 2nd difference resists changes in velocity → favors constant-
-    # velocity motion (zero cost for any straight-line trajectory), so it removes
-    # jitter without fighting genuine hand motion. (1st-diff/velocity would drag
-    # toward a static pose; jerk/3rd-diff over-smooths with wider support.)
+    # ACCELERATION smoother on consecutive frame-index triples. Each displacement
+    # is divided by its observed frame interval, then multiplied by the median
+    # interval so equal-cadence triples exactly recover the old second difference.
+    # This keeps the tuned weights while correctly handling capture gaps.
     #
-    # Pose acceleration is the geodesic 2nd difference in the SO3 tangent: the
-    # difference of consecutive log-relative-rotations, per joint. Weighted per
-    # joint: INTERNAL fingers (1..15) smoothed STRONGLY (articulation changes
-    # slowly), GLOBAL wrist (joint 0) more weakly (the whole hand can rotate fast).
-    # per-joint accel weight (16,1): joint 0 global (weaker), 1..15 internal.
-    # Closed over (a compile-time constant) rather than passed as a cost arg, so
-    # jaxls doesn't try to broadcast it along the per-triple batch axis.
-    wj_accel = jnp.concatenate([
-        jnp.full((1, 1), w_accel_pose_global),
-        jnp.full((15, 1), w_accel_pose)], axis=0)
+    @jaxls.Cost.factory
+    def accel_pose(vals, a, b, c, prev_scale, next_scale,
+                   R_cw_a, R_cw_b, R_cw_c, R_vl_a, R_vl_b, R_vl_c):
+        Ra = jaxlie.SO3(vals[a])
+        Rb = jaxlie.SO3(vals[b])
+        Rc = jaxlie.SO3(vals[c])
+
+        # Internal rotations are parent-relative and already share a common
+        # representation. Express both increments in the middle pose's tangent.
+        Ra_internal = jaxlie.SO3(vals[a][1:])
+        Rb_internal = jaxlie.SO3(vals[b][1:])
+        Rc_internal = jaxlie.SO3(vals[c][1:])
+        internal = (
+            prev_scale * (Rb_internal.inverse() @ Ra_internal).log()
+            + next_scale * (Rb_internal.inverse() @ Rc_internal).log()
+        )
+
+        # The wrist rotation is stored in a different virtual crop frame each
+        # frame. Lift it through left-fisheye camera coordinates into the fixed
+        # VIO world before taking its second difference.
+        Rw_a = jaxlie.SO3.from_matrix(R_cw_a @ R_vl_a @ Ra.as_matrix()[0])
+        Rw_b = jaxlie.SO3.from_matrix(R_cw_b @ R_vl_b @ Rb.as_matrix()[0])
+        Rw_c = jaxlie.SO3.from_matrix(R_cw_c @ R_vl_c @ Rc.as_matrix()[0])
+        global_accel = (
+            prev_scale * (Rw_b.inverse() @ Rw_a).log()
+            + next_scale * (Rw_b.inverse() @ Rw_c).log()
+        )
+        return jnp.concatenate([
+            w_accel_pose_global * global_accel,
+            (w_accel_pose * internal).reshape(-1),
+        ])
 
     @jaxls.Cost.factory
-    def accel_pose(vals, a, b, c):
-        v0 = (jaxlie.SO3(vals[a]).inverse() @ jaxlie.SO3(vals[b])).log()  # (16,3)
-        v1 = (jaxlie.SO3(vals[b]).inverse() @ jaxlie.SO3(vals[c])).log()
-        return (wj_accel * (v1 - v0)).reshape(-1)
-
-    @jaxls.Cost.factory
-    def accel_trans(vals, a, b, c):
-        return w_accel_trans * (vals[a] - 2.0 * vals[b] + vals[c])
-
-    # weak prior keeping the shared shape near beta=0 (MANO mean hand). 10 betas
-    # over thousands of frames are well-constrained, but this guards against
-    # drift into implausible shapes / the shape absorbing pose error.
-    @jaxls.Cost.factory
-    def beta_prior(vals, beta_v):
-        return w_beta * vals[beta_v]
+    def accel_trans(vals, a, b, c, prev_scale, next_scale,
+                    R_cw_a, R_cw_b, R_cw_c,
+                    t_cw_a, t_cw_b, t_cw_c,
+                    R_vl_a, R_vl_b, R_vl_c):
+        p_a = R_cw_a @ R_vl_a @ vals[a] + t_cw_a
+        p_b = R_cw_b @ R_vl_b @ vals[b] + t_cw_b
+        p_c = R_cw_c @ R_vl_c @ vals[c] + t_cw_c
+        velocity_delta = (
+            prev_scale * (p_a - p_b) + next_scale * (p_c - p_b))
+        return w_accel_trans * velocity_delta
 
     costs = []
     eye_I = jnp.broadcast_to(jnp.eye(3), (n, 3, 3))     # left-virtual cam = identity
@@ -250,29 +211,31 @@ def make_costs(M, data, huber_px, w_shape,
     # right = (R_lr, t_lr) (verged rigid transform into the right-virtual frame).
     reproj_args = (data["kpL"], data["f_px"], eye_I, eye_0,
                    data["kpR"], data["f_px"], data["R_lr"], data["t_lr"],
-                   data["confL"])
-    if beta_is_var:
-        beta_ids = jnp.zeros(n, dtype=jnp.int32)   # ONE shared BetaVar(0), all frames
-        costs.append(reproj_var_beta(PoseVar(fids), TransVar(fids),
-                                     BetaVar(beta_ids), *reproj_args))
-        if w_beta > 0:
-            costs.append(beta_prior(BetaVar(0)))
-    else:
-        costs.append(reproj_frozen_beta(PoseVar(fids), TransVar(fids), *reproj_args))
+                   data["kp_weight"])
+    costs.append(reproj(PoseVar(fids), TransVar(fids), *reproj_args))
     # shape prior: internal finger pose toward the two-eye geodesic mean
     if w_shape > 0:
         costs.append(shape_prior(PoseVar(fids), data["shape_mean"]))
-    # acceleration smoother over consecutive-in-time triples. Couples adjacent
-    # frames → the pose Hessian is block-TRIDIAGONAL (banded) so PoseVar is no
-    # longer block-diagonal / Schur-eliminable; CG solves the full banded system.
-    # Skipped entirely when temporal=False (phase-1 fast solve stays eliminable).
+    # Acceleration factors only connect consecutive accepted frame triples.
     i0, i1, i2 = data["accel_i0"], data["accel_i1"], data["accel_i2"]
-    if temporal and (w_accel_pose > 0 or w_accel_trans > 0) and i0.shape[0] > 0:
-        if w_accel_pose > 0:
-            costs.append(accel_pose(PoseVar(i0), PoseVar(i1), PoseVar(i2)))
+    if temporal and (w_accel_pose > 0 or w_accel_pose_global > 0
+                     or w_accel_trans > 0) and i0.shape[0] > 0:
+        if w_accel_pose > 0 or w_accel_pose_global > 0:
+            costs.append(accel_pose(
+                PoseVar(i0), PoseVar(i1), PoseVar(i2),
+                data["accel_prev_scale"], data["accel_next_scale"],
+                data["R_cw"][i0], data["R_cw"][i1], data["R_cw"][i2],
+                data["R_vl"][i0], data["R_vl"][i1], data["R_vl"][i2],
+            ))
         if w_accel_trans > 0:
-            costs.append(accel_trans(TransVar(i0), TransVar(i1), TransVar(i2)))
-    return costs, fids
+            costs.append(accel_trans(
+                TransVar(i0), TransVar(i1), TransVar(i2),
+                data["accel_prev_scale"], data["accel_next_scale"],
+                data["R_cw"][i0], data["R_cw"][i1], data["R_cw"][i2],
+                data["t_cw"][i0], data["t_cw"][i1], data["t_cw"][i2],
+                data["R_vl"][i0], data["R_vl"][i1], data["R_vl"][i2],
+            ))
+    return costs
 
 
 def build_data(jsonl, calib_dir, left_serial, right_serial, hand,
@@ -280,8 +243,8 @@ def build_data(jsonl, calib_dir, left_serial, right_serial, hand,
                w_wrist=1.0, w_mcp=1.0, w_pip=1.0, w_tip=1.0):
     """Gather per-frame arrays + precompute the optimizer's ``data`` dict.
 
-    Returns (data, t_init, frames, Rvl_arr, want_right). No outlier rejection —
-    every detected hand's 21 keypoints in both eyes are kept.
+    Returns all candidate observations. Quality filtering happens after the
+    independent phase-1 fits.
     """
     want_right = 1 if hand == "right" else 0
     # stereo extrinsics (X_right = Rs @ X_left + ts), for the verged per-eye
@@ -320,12 +283,10 @@ def build_data(jsonl, calib_dir, left_serial, right_serial, hand,
         hp_right.append(np.array(h["hand_pose_right"], np.float32))  # (45,)
     n = len(frames)
     assert n > 0, "no frames with a detection of the requested hand"
-    # all keypoints valid (no rejection); per-keypoint group weight (uniform).
-    valid = [np.ones(21, np.float32)] * n
     kpw = kp_weights(w_wrist, w_mcp, w_pip, w_tip)
-    confL = confR = np.broadcast_to(np.array(kpw), (n, 21)).copy()
+    kp_weight = np.broadcast_to(np.array(kpw), (n, 21)).copy()
     out_size = next((h["out_size"] for d in rows for h in d["hands"]), 256)
-    print(f"hand={hand}: {n} frames with a detection (no filtering)")
+    print(f"hand={hand}: {n} candidate frames")
 
     pose0_arr = np.stack(pose0).reshape(n, 16, 3)                # (n,16,3) axis-angle
     # WiLoR stores left-hand pose in a MIRRORED convention (negate axis-angle
@@ -361,34 +322,21 @@ def build_data(jsonl, calib_dir, left_serial, right_serial, hand,
     Rvl_arr = np.stack(Rvl)                                       # (n,3,3)
     P_arr = np.stack(Parr)                                        # (n,3) left-fisheye
     data = {
-        "pose0": pose0_arr,
         "quat0": quat0,
         "beta0": jnp.asarray(np.stack(beta0)),
         "kpL": jnp.asarray(np.stack(kpL)),
         "kpR": jnp.asarray(np.stack(kpR)),
-        "validL": jnp.asarray(np.stack(valid)),
-        "validR": jnp.asarray(np.stack(valid)),
-        "confL": jnp.asarray(confL),
-        "confR": jnp.asarray(confR),
+        "kp_weight": jnp.asarray(kp_weight),
         "f_px": jnp.asarray(np.array(fpx, np.float32)),
         "R_lr": jnp.asarray(np.stack(R_lr)),         # (n,3,3) left-virt→right-virt
         "t_lr": jnp.asarray(np.stack(t_lr)),         # (n,3)
         "shape_mean": shape_mean,                    # (n,15,4) geodesic-mean internal pose
+        "R_vl": jnp.asarray(Rvl_arr),                # left-virtual -> left-fisheye
         "out_size": out_size,
         "mirror": 1.0 if want_right else -1.0,   # left-hand x-mirror (MANO_RIGHT)
     }
 
-    # Acceleration-smoother triples: indices (i-1,i,i+1) of kept frames that are
-    # CONSECUTIVE IN REAL TIME (frame numbers differ by exactly 1 on both sides).
-    # Dropped/rejected frames create time gaps; we skip triples spanning a gap
-    # rather than over-penalizing across them.
-    fr = np.asarray(frames)
-    mid = np.arange(1, n - 1)
-    adj = (fr[mid] - fr[mid - 1] == 1) & (fr[mid + 1] - fr[mid] == 1)
-    tri_mid = mid[adj]
-    data["accel_i0"] = jnp.asarray(tri_mid - 1)
-    data["accel_i1"] = jnp.asarray(tri_mid)
-    data["accel_i2"] = jnp.asarray(tri_mid + 1)
+    _set_accel_indices(data, frames)
 
     # init: WiLoR pose; translation from the triangulated point P (left-fisheye
     # frame) expressed in the LEFT-VIRTUAL frame: t0 = Rv_l^T @ P. The MANO root
@@ -399,8 +347,14 @@ def build_data(jsonl, calib_dir, left_serial, right_serial, hand,
 
 
 def _set_accel_indices(data, frames):
-    """Rebuild acceleration triples after phase-1 frame filtering."""
+    """Rebuild timestamp-aware acceleration triples after frame filtering."""
     fr = np.asarray(frames)
+    times = np.asarray(data.get("frame_time_s", fr), np.float64)
+    if times.shape != fr.shape or np.any(np.diff(times) <= 0):
+        raise ValueError("hand frame times must be matching and increasing")
+    reference_dt = float(data.get("frame_time_reference_s", 1.0))
+    if reference_dt <= 0:
+        raise ValueError("frame_time_reference_s must be positive")
     mid = np.arange(1, len(fr) - 1)
     adjacent = ((fr[mid] - fr[mid - 1] == 1)
                 & (fr[mid + 1] - fr[mid] == 1))
@@ -408,6 +362,12 @@ def _set_accel_indices(data, frames):
     data["accel_i0"] = jnp.asarray(tri_mid - 1)
     data["accel_i1"] = jnp.asarray(tri_mid)
     data["accel_i2"] = jnp.asarray(tri_mid + 1)
+    data["accel_prev_scale"] = jnp.asarray(
+        reference_dt / (times[tri_mid] - times[tri_mid - 1]),
+        dtype=jnp.float32)
+    data["accel_next_scale"] = jnp.asarray(
+        reference_dt / (times[tri_mid + 1] - times[tri_mid]),
+        dtype=jnp.float32)
 
 
 def subset_data(data, keep, frames):
@@ -427,8 +387,8 @@ def subset_data(data, keep, frames):
     return out
 
 
-def solve_independent_frames(M, data, t_init, beta_frozen, huber_px, w_shape,
-                             w_beta, iters, batch_size, linear_solver):
+def solve_independent_frames(M, data, t_init, beta, huber_px, w_shape,
+                             iters, batch_size, linear_solver):
     """Solve one jaxls problem per frame, vmapped in fixed-size batches.
 
     Each problem has its own LM trust-region state. This is intentionally
@@ -438,25 +398,27 @@ def solve_independent_frames(M, data, t_init, beta_frozen, huber_px, w_shape,
     out_size = data["out_size"]
     mirror = data["mirror"]
 
-    def solve_one(kpL, kpR, f_px, R_lr, t_lr, conf, shape_mean, quat0, trans0):
+    def solve_one(kpL, kpR, f_px, R_lr, t_lr, kp_weight,
+                  shape_mean, quat0, trans0):
         one = {
-            "pose0": jnp.zeros((1, 48)),
             "kpL": kpL[None],
             "kpR": kpR[None],
             "f_px": f_px[None],
             "R_lr": R_lr[None],
             "t_lr": t_lr[None],
-            "confL": conf[None],
+            "kp_weight": kp_weight[None],
             "shape_mean": shape_mean[None],
             "out_size": out_size,
             "mirror": mirror,
             "accel_i0": jnp.zeros((0,), dtype=jnp.int32),
             "accel_i1": jnp.zeros((0,), dtype=jnp.int32),
             "accel_i2": jnp.zeros((0,), dtype=jnp.int32),
+            "accel_prev_scale": jnp.zeros((0,), dtype=jnp.float32),
+            "accel_next_scale": jnp.zeros((0,), dtype=jnp.float32),
         }
-        costs, _ = make_costs(
-            M, one, huber_px, w_shape, 0.0, 0.0, 0.0, w_beta,
-            beta_frozen=beta_frozen, temporal=False)
+        costs = make_costs(
+            M, one, beta, huber_px, w_shape, 0.0, 0.0, 0.0,
+            temporal=False)
         ids = jnp.arange(1)
         variables = [PoseVar(ids), TransVar(ids)]
         init = jaxls.VarValues.make([
@@ -475,7 +437,7 @@ def solve_independent_frames(M, data, t_init, beta_frozen, huber_px, w_shape,
     solve_batch = jax.jit(jax.vmap(solve_one))
     inputs = (
         data["kpL"], data["kpR"], data["f_px"], data["R_lr"], data["t_lr"],
-        data["confL"], data["shape_mean"], data["quat0"], t_init,
+        data["kp_weight"], data["shape_mean"], data["quat0"], t_init,
     )
     n = len(t_init)
     batch_size = min(max(1, batch_size), n)
@@ -612,6 +574,71 @@ def matrix_to_quat(R):
     return (q / np.linalg.norm(q)).astype(np.float32)
 
 
+def load_vio_world_transforms(path, frames):
+    """Load camera-to-world transforms for the requested video frames."""
+    with np.load(path) as trajectory:
+        required = {"frame_idx", "pose_wxyz_xyz"}
+        missing_keys = required - set(trajectory.files)
+        if missing_keys:
+            raise ValueError(
+                f"{path} is missing trajectory arrays: {sorted(missing_keys)}")
+        frame_idx = np.asarray(trajectory["frame_idx"], np.int64)
+        poses = np.asarray(trajectory["pose_wxyz_xyz"], np.float64)
+
+    if poses.shape != (len(frame_idx), 7):
+        raise ValueError(
+            f"{path}: pose_wxyz_xyz must have shape ({len(frame_idx)}, 7), "
+            f"got {poses.shape}")
+    if len(np.unique(frame_idx)) != len(frame_idx):
+        raise ValueError(f"{path}: frame_idx contains duplicates")
+    if not np.all(np.isfinite(poses)):
+        raise ValueError(f"{path}: trajectory poses contain non-finite values")
+
+    lookup = {int(frame): i for i, frame in enumerate(frame_idx)}
+    missing_frames = [int(frame) for frame in frames if int(frame) not in lookup]
+    if missing_frames:
+        preview = ", ".join(map(str, missing_frames[:10]))
+        suffix = "..." if len(missing_frames) > 10 else ""
+        raise ValueError(
+            f"{path}: no VIO pose for {len(missing_frames)} hand frames "
+            f"({preview}{suffix})")
+
+    selected = poses[[lookup[int(frame)] for frame in frames]]
+    quat = selected[:, :4]
+    quat_norm = np.linalg.norm(quat, axis=1)
+    if np.any(quat_norm < 1e-8):
+        raise ValueError(f"{path}: trajectory contains a zero quaternion")
+    quat = quat / quat_norm[:, None]
+    R_wl = np.stack([quat_to_matrix(q) for q in quat])
+    R_cw = R_wl.transpose(0, 2, 1)
+    t_cw = -np.einsum("nij,nj->ni", R_cw, selected[:, 4:])
+    return R_cw.astype(np.float32), t_cw.astype(np.float32)
+
+
+def load_vio_frame_times(path, frames):
+    """Load observed interpolation times for hand frames and nominal cadence."""
+    with np.load(path) as trajectory:
+        frame_idx = np.asarray(trajectory["frame_idx"], np.int64)
+        if "interpolation_frame_time_s" in trajectory:
+            frame_time_s = np.asarray(
+                trajectory["interpolation_frame_time_s"], np.float64)
+        else:
+            # Legacy trajectories used frame index as a uniform time axis.
+            frame_time_s = frame_idx.astype(np.float64)
+    if frame_time_s.shape != frame_idx.shape:
+        raise ValueError(f"{path}: interpolation frame times have wrong shape")
+    delta = np.diff(frame_time_s)
+    if np.any(delta <= 0):
+        raise ValueError(f"{path}: interpolation frame times are not increasing")
+    lookup = {int(frame): i for i, frame in enumerate(frame_idx)}
+    missing = [int(frame) for frame in frames if int(frame) not in lookup]
+    if missing:
+        raise ValueError(
+            f"{path}: no interpolation time for {len(missing)} hand frames")
+    selected = frame_time_s[[lookup[int(frame)] for frame in frames]]
+    return selected, float(np.median(delta)), dict(zip(frame_idx, frame_time_s))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -621,6 +648,9 @@ def main():
     ap.add_argument("--out", default=None,
                     help="output (default: <calib-dir>/derived/hands3d_<hand>.jsonl)")
     ap.add_argument("--calib-dir", default="../../long-test1")
+    ap.add_argument("--trajectory", required=True,
+                    help="VIO trajectory NPZ; pose_wxyz_xyz must be full-rate "
+                         "world-to-left-camera poses")
     ap.add_argument("--left-serial", default="046060323008")
     ap.add_argument("--right-serial", default="046060323001")
     ap.add_argument("--hand", choices=["left", "right"], default="right",
@@ -636,35 +666,14 @@ def main():
                     help="accel penalty on root translation")
     ap.add_argument("--w-shape", type=float, default=0.1,
                     help="weight pulling internal finger pose toward the two-eye "
-                         "geodesic-mean shape (radians-scale geodesic residual). "
-                         "Sweep (2026-06-29): 0->54px reproj p99 & 6rad pose drift; "
-                         "0.1 -> 1.9px p50 / 10px p99 / 0.3rad drift; 1.0 over-"
-                         "constrains. 0.1 is the knee.")
-    ap.add_argument("--optimize-beta", action="store_true",
-                    help="solve ONE shared MANO shape for the whole video (with "
-                         "the --w-beta prior). DEFAULT is OFF: beta is FROZEN to "
-                         "WiLoR's per-frame mean, because a free shared beta "
-                         "absorbs pose/detection error and blows up (β₀→2.8 on the "
-                         "full video vs WiLoR's 0.11).")
-    ap.add_argument("--w-beta", type=float, default=0.5,
-                    help="prior keeping the shared MANO shape near 0 (mean hand). "
-                         "Only used with --optimize-beta; set 0 to disable.")
-    # per-keypoint reprojection group weights (residual-space; cost ∝ w²).
-    # wrist high: it's root-relative (0,0,0) so it only constrains translation
-    # → lets stereo disparity fix metric depth. tips low: noisy + pose-sensitive.
-    # Default uniform: a sweep (2026-06-29) showed asymmetric group weights only
-    # hurt — down-weighting tips let fingers curl into bad minima (p50 2.9→5.6px)
-    # and up-weighting the wrist (root-relative → only constrains t) did nothing.
-    # Kept tunable as the hook for future per-frame detector confidence.
+                         "geodesic-mean articulation estimate")
+    # Per-keypoint reprojection group weights (residual-space; cost scales as w^2).
     ap.add_argument("--w-wrist", type=float, default=1.0)
     ap.add_argument("--w-mcp", type=float, default=1.0)
     ap.add_argument("--w-pip", type=float, default=1.0)
     ap.add_argument("--w-tip", type=float, default=1.0)
     ap.add_argument("--huber-px", type=float, default=5.0,
-                    help="Huber knee in PIXELS (cost is quadratic within, linear "
-                         "beyond). With the shape prior, inlier reproj is p90~4.5px, "
-                         "so 5px robustifies the noisy mid-tail; was 10px (barely "
-                         "active). Normalized internally to match residual scale.")
+                    help="Huber reprojection knee in pixels")
     ap.add_argument("--phase1-iters", type=int, default=30,
                     help="LM iterations for each independent per-frame fit")
     ap.add_argument("--phase1-batch", type=int, default=32,
@@ -673,7 +682,7 @@ def main():
                     help="jaxls linear solver for each small independent fit")
     ap.add_argument("--min-depth", type=float, default=0.08,
                     help="reject phase-1 roots shallower than this (metres)")
-    ap.add_argument("--max-depth", type=float, default=2.0,
+    ap.add_argument("--max-depth", type=float, default=1.5,
                     help="reject phase-1 roots deeper than this (metres)")
     ap.add_argument("--min-joint-z", type=float, default=0.02,
                     help="reject if any joint is behind/too near either camera")
@@ -705,21 +714,28 @@ def main():
         args.jsonl, args.calib_dir, args.left_serial, args.right_serial,
         args.hand, args.frame_min, args.frame_max,
         args.w_wrist, args.w_mcp, args.w_pip, args.w_tip)
+    R_cw_all, t_cw_all = load_vio_world_transforms(args.trajectory, frames_all)
+    frame_time_all, frame_time_reference_s, frame_time_by_index = (
+        load_vio_frame_times(args.trajectory, frames_all))
+    data_all["R_cw"] = jnp.asarray(R_cw_all)
+    data_all["t_cw"] = jnp.asarray(t_cw_all)
+    data_all["frame_time_s"] = jnp.asarray(frame_time_all)
+    data_all["frame_time_reference_s"] = frame_time_reference_s
+    _set_accel_indices(data_all, frames_all)
+    print(f"VIO world transforms: {args.trajectory}")
     out_size = data_all["out_size"]
 
     import time
-    beta_var = args.optimize_beta
-    beta_phase1 = jnp.mean(data_all["beta0"], axis=0)
-    beta_frozen = None if beta_var else beta_phase1
+    beta_fixed = jnp.mean(data_all["beta0"], axis=0)
 
     # Phase 1: truly independent one-frame problems. A vmapped solve gives every
     # frame its own LM damping state while still compiling/running efficiently.
     t = time.time()
     quat1, trans1 = solve_independent_frames(
-        M, data_all, t_init_all, beta_phase1, args.huber_px, args.w_shape,
-        args.w_beta, args.phase1_iters, args.phase1_batch, args.phase1_linear)
+        M, data_all, t_init_all, beta_fixed, args.huber_px, args.w_shape,
+        args.phase1_iters, args.phase1_batch, args.phase1_linear)
     metrics1 = evaluate_fits(
-        M, data_all, quat1, trans1, beta_phase1, Rvl_all)
+        M, data_all, quat1, trans1, beta_fixed, Rvl_all)
     keep, rejected = quality_mask(
         metrics1, args.min_depth, args.max_depth, args.min_joint_z,
         args.max_reproj_px, args.max_epipolar_px)
@@ -743,15 +759,12 @@ def main():
     var_list = [PoseVar(fids), TransVar(fids)]
     init_vars = [PoseVar(fids).with_value(quat_init),
                  TransVar(fids).with_value(t_init)]
-    if beta_var:
-        var_list.append(BetaVar(0))
-        init_vars.append(BetaVar(0).with_value(jnp.mean(data["beta0"], axis=0)))
     init = jaxls.VarValues.make(init_vars)
 
-    costs, _ = make_costs(M, data, args.huber_px, args.w_shape,
-                          args.w_accel_pose, args.w_accel_pose_global,
-                          args.w_accel_trans, args.w_beta,
-                          beta_frozen=beta_frozen, temporal=True)
+    costs = make_costs(
+        M, data, beta_fixed, args.huber_px, args.w_shape,
+        args.w_accel_pose, args.w_accel_pose_global, args.w_accel_trans,
+        temporal=True)
     prob = jaxls.LeastSquaresProblem(costs, var_list).analyze()
     # report what Schur elimination chose (analyze() logs it too). With temporal
     # smoothing on this is "no elimination"; printed to make it explicit.
@@ -784,16 +797,11 @@ def main():
 
     quat = np.array(sol[PoseVar])
     trans = np.array(sol[TransVar])
-    if beta_var:
-        beta_solved = np.array(sol[BetaVar]).reshape(-1)[:10]
-    else:
-        beta_solved = np.array(beta_frozen)                 # frozen WiLoR mean
-    print(f"betas ({'optimized' if beta_var else 'FROZEN to WiLoR mean'}): "
-          f"{beta_solved.round(2)}")
+    beta_solved = np.array(beta_fixed)
+    print(f"betas (fixed to WiLoR track mean): {beta_solved.round(2)}")
 
     quat0_np = np.array(quat_init)
     beta = np.broadcast_to(beta_solved, (n, 10))        # shared shape, per frame
-    valid_np = np.array(data["validL"])  # (n,21) inlier mask
     kpL_np = np.array(data["kpL"]); kpR_np = np.array(data["kpR"]); fpx_np = np.array(data["f_px"])
     R_lr_np = np.array(data["R_lr"]); t_lr_np = np.array(data["t_lr"])
 
@@ -827,11 +835,8 @@ def main():
     pL = np.array(pL); pR = np.array(pR)
     eL = np.linalg.norm(pL - kpL_np, axis=2)                        # (n,21)
     eR = np.linalg.norm(pR - kpR_np, axis=2)
-    m = valid_np > 0.5                                              # (n,21) all-True now
-    perkp_in = np.concatenate([eL[m], eR[m]])
-    perkp_out = np.concatenate([eL[~m], eR[~m]])
-    fmi = np.array([np.concatenate([eL[i][m[i]], eR[i][m[i]]]).mean()
-                    for i in range(n) if m[i].any()])
+    perkp = np.concatenate([eL.ravel(), eR.ravel()])
+    fmi = np.concatenate([eL, eR], axis=1).mean(axis=1)
     # report depth in the LEFT-FISHEYE frame (optical-axis z), not the per-frame
     # left-virtual z whose axis is tilted toward the hand. j_fish below uses the
     # same Rv_l transform.
@@ -847,17 +852,13 @@ def main():
         return "  ".join(f"p{p}={np.percentile(a,p):.2f}" for p in ps)
     print("\n================ OPTIMIZATION DIAGNOSTICS ================")
     print(f"frames solved: {n}   iters: {args.iters}   linear: {args.linear}")
-    beta_mode = ("optimized beta" if args.optimize_beta else "FROZEN beta (WiLoR)")
     print(f"weights: accel[pose={args.w_accel_pose} global={args.w_accel_pose_global} "
           f"trans={args.w_accel_trans}] shape={args.w_shape} "
           f"huber_px={args.huber_px}  ({len(np.asarray(data['accel_i1']))} accel "
-          f"triples; {beta_mode}; NO global/depth prior)")
-    print(f"\nREPROJ ERR inliers (px, {len(perkp_in)} kp): "
-          f"mean={perkp_in.mean():.2f}  {pct(perkp_in)}")
-    if len(perkp_out):
-        print(f"REPROJ ERR outliers(px, {len(perkp_out)} kp): "
-              f"mean={perkp_out.mean():.2f}  {pct(perkp_out)}  (masked, not fit)")
-    print(f"per-frame mean inlier err: mean={fmi.mean():.2f}  {pct(fmi)}")
+          f"triples; observed-time velocities in VIO world; fixed beta)")
+    print(f"\nREPROJ ERR (px, {len(perkp)} observations): "
+          f"mean={perkp.mean():.2f}  {pct(perkp)}")
+    print(f"per-frame mean error: mean={fmi.mean():.2f}  {pct(fmi)}")
     print(f"\nDEPTH (m): median={np.median(d_arr):.3f} mean={d_arr.mean():.3f} "
           f"std={d_arr.std():.3f}  range=[{d_arr.min():.3f},{d_arr.max():.3f}]")
     print(f"  depth percentiles: {pct(d_arr,(5,50,95))}")
@@ -888,8 +889,6 @@ def main():
     R_glob_v_all = np.array(jax.vmap(lambda q: jaxlie.SO3(q).as_matrix())(
         jnp.asarray(quat[:, 0])))                                   # (n,3,3)
     R_glob_fish_all = np.einsum("nij,njk->nik", Rvl_arr, R_glob_v_all)
-    beta_wilor_mean = np.mean(np.array(data["beta0"]), axis=0)
-
     # Re-apply the geometry gates after smoothing. The temporal solve is warm-
     # started from valid fits, but this guarantees that a failed phase 2 can
     # never emit negative/non-finite depth.
@@ -942,8 +941,12 @@ def main():
             q_rvl1 = matrix_to_quat(right["Rv_l"])
             q_glob0 = matrix_to_quat(left["global_orient_R"])
             q_glob1 = matrix_to_quat(right["global_orient_R"])
+            time0 = frame_time_by_index[left["frame"]]
+            time1 = frame_time_by_index[right["frame"]]
             for offset in range(1, gap + 1):
-                alpha = offset / (gap + 1)
+                frame = left["frame"] + offset
+                alpha = (
+                    (frame_time_by_index[frame] - time0) / (time1 - time0))
                 root = (1.0 - alpha) * root0 + alpha * root1
                 Rvl_i = quat_to_matrix(quat_slerp(q_rvl0, q_rvl1, alpha))
                 Rglob_i = quat_to_matrix(quat_slerp(q_glob0, q_glob1, alpha))
@@ -953,7 +956,7 @@ def main():
                 qi[0] = matrix_to_quat(Rvl_i.T @ Rglob_i)
                 trans_i = Rvl_i.T @ root
                 interpolated.append({
-                    "frame": left["frame"] + offset,
+                    "frame": frame,
                     "is_right": want_right,
                     "trans": root.tolist(),
                     "depth_m": float(root[2]),
@@ -980,16 +983,17 @@ def main():
           f"{len(interpolated)} interpolated frames")
 
     with open(args.out, "w") as f:
-        # first line: file-level meta (shared shape + the WiLoR-mean for the viz
-        # "default vs optimized beta" toggle). Distinguished by "meta": True.
+        # Keep beta_opt for compatibility with visualize_data.py and older files.
         f.write(json.dumps({
             "meta": True, "is_right": want_right, "mirror": mirror,
             "beta_opt": beta_solved.tolist(),
-            "beta_wilor_mean": beta_wilor_mean.tolist(),
             "phase1_input_frames": len(frames_all),
             "phase1_accepted_frames": int(keep.sum()),
             "phase2_accepted_frames": int(keep2.sum()),
             "interpolated_frames": len(interpolated),
+            "trajectory": os.path.abspath(args.trajectory),
+            "temporal_time_source": "trajectory_interpolation_frame_time_s",
+            "frame_time_reference_s": frame_time_reference_s,
             "quality_thresholds": {
                 "min_depth_m": args.min_depth,
                 "max_depth_m": args.max_depth,

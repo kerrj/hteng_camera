@@ -1,10 +1,10 @@
-"""Generic viser visualizer for data_processing outputs: the VIO camera
-trajectory + landmark point cloud, optionally composed with hand meshes
+"""Generic Viser visualizer for data_processing outputs: the VIO camera
+trajectory and optional point cloud, loop candidates, and hand meshes
 (FK'd from each hand's stereo-optimized MANO params, placed in world via the
 left camera's pose at that frame: hand_world(t) = T_cam_world(t) @
-hand_cam(t)). Supersedes vio/vio_visualize_trajectory.py.
+hand_cam(t)).
 
-Landmarks colored by their actual video pixel at first observation
+Optional landmarks are colored by their actual video pixel at first observation
 (--color-mode pixel, default) or a depth colormap. Left (orange) + right
 (cyan) stereo frustums per frame, right pose via T_wr = T_stereo @ T_wl.
 World is gravity-aligned (+z up), so viser's up-direction is +z. Static
@@ -70,6 +70,104 @@ def depth_to_color(z, lo, hi):
     return np.stack([r, g, b], axis=1)
 
 
+WORLD_UP = np.array([0.0, 0.0, 1.0])
+
+
+def presentation_camera_target(camera_center, camera_to_world_rotation, mode):
+    """Return gravity-stable viewer (position, look_at, up) for one ego pose."""
+    center = np.asarray(camera_center, np.float64)
+    rotation = np.asarray(camera_to_world_rotation, np.float64)
+    forward = rotation[:, 2]
+    forward /= max(np.linalg.norm(forward), 1e-12)
+    heading = forward - WORLD_UP * np.dot(forward, WORLD_UP)
+    heading_norm = np.linalg.norm(heading)
+    if heading_norm < 1e-6:
+        heading = rotation[:, 0]
+        heading -= WORLD_UP * np.dot(heading, WORLD_UP)
+        heading_norm = np.linalg.norm(heading)
+    heading /= max(heading_norm, 1e-12)
+
+    if mode == "Follow":
+        position = center - 0.75 * heading + 0.24 * WORLD_UP
+        look_at = center + 0.55 * forward + 0.04 * WORLD_UP
+    elif mode == "Ego":
+        position = center - 0.025 * forward
+        look_at = center + forward
+    else:
+        raise ValueError(f"unsupported presentation camera mode: {mode}")
+    return position, look_at, WORLD_UP.copy()
+
+
+def overview_camera_target(camera_centers):
+    """Return a stable three-quarter overview that frames the trajectory."""
+    centers = np.asarray(camera_centers, np.float64)
+    center = np.median(centers, axis=0)
+    radius = max(float(np.percentile(
+        np.linalg.norm(centers - center, axis=1), 95)), 0.75)
+    direction = np.array([1.15, -1.15, 0.85])
+    direction /= np.linalg.norm(direction)
+    position = center + direction * (2.7 * radius)
+    return position, center, WORLD_UP.copy()
+
+
+def smooth_camera_target(previous, target, dt, time_constant=0.22):
+    """Exponential camera smoothing independent of playback update rate."""
+    if previous is None or dt <= 0.0:
+        return tuple(np.asarray(value, np.float64) for value in target)
+    alpha = 1.0 - np.exp(-dt / max(time_constant, 1e-6))
+    smoothed = tuple(
+        np.asarray(old) + alpha * (np.asarray(new) - np.asarray(old))
+        for old, new in zip(previous, target)
+    )
+    up = smoothed[2] / max(np.linalg.norm(smoothed[2]), 1e-12)
+    return smoothed[0], smoothed[1], up
+
+
+def bidirectional_time_smooth(values, times, time_constant):
+    """Zero-phase-ish exponential smoothing using actual sample intervals."""
+    values = np.asarray(values, np.float64)
+    times = np.asarray(times, np.float64)
+    if values.shape[0] != len(times):
+        raise ValueError("smoothing values and times must have matching lengths")
+    if len(times) < 2 or time_constant <= 0.0:
+        return values.copy()
+    if np.any(np.diff(times) <= 0):
+        raise ValueError("smoothing times must be strictly increasing")
+
+    forward = values.copy()
+    for index in range(1, len(times)):
+        alpha = 1.0 - np.exp(
+            -(times[index] - times[index - 1]) / time_constant)
+        forward[index] = (
+            forward[index - 1] + alpha * (values[index] - forward[index - 1]))
+
+    backward = values.copy()
+    for index in range(len(times) - 2, -1, -1):
+        alpha = 1.0 - np.exp(
+            -(times[index + 1] - times[index]) / time_constant)
+        backward[index] = (
+            backward[index + 1]
+            + alpha * (values[index] - backward[index + 1]))
+    return 0.5 * (forward + backward)
+
+
+def smooth_presentation_trajectory(centers, rotations, times, time_constant):
+    """Smooth only the virtual viewer path, preserving the estimated poses."""
+    centers = bidirectional_time_smooth(centers, times, time_constant)
+    rotations = np.asarray(rotations, np.float64).copy()
+    forward = bidirectional_time_smooth(
+        rotations[:, :, 2], times, time_constant)
+    right = bidirectional_time_smooth(
+        rotations[:, :, 0], times, time_constant)
+    forward /= np.maximum(
+        np.linalg.norm(forward, axis=1, keepdims=True), 1e-12)
+    right /= np.maximum(
+        np.linalg.norm(right, axis=1, keepdims=True), 1e-12)
+    rotations[:, :, 2] = forward
+    rotations[:, :, 0] = right
+    return centers, rotations
+
+
 def make_frame_loader(video_path, thumb_w, requested_device="auto"):
     """Build a cached thumbnail loader and return it with the video's FPS.
 
@@ -109,17 +207,18 @@ def make_frame_loader(video_path, thumb_w, requested_device="auto"):
     # play loop and the scrub callback run on different threads.
     gpu_dec = dec if device == "cuda" else None
     cpu_dec = dec if device == "cpu" else None
+    cuda_decode_failed = False
 
     @functools.lru_cache(maxsize=128)
     def _decode(fr, random_access):
-        nonlocal gpu_dec, cpu_dec
+        nonlocal gpu_dec, cpu_dec, cuda_decode_failed
         if num_frames is not None:
             fr = min(max(fr, 0), int(num_frames) - 1)
         with lock:
             # Rapid nonlocal seeks can poison the NVDEC/FFmpeg decoder state.
             # Keep those seeks on an independent CPU decoder; playback remains
             # on the undisturbed CUDA decoder.
-            use_cpu = random_access or device == "cpu"
+            use_cpu = random_access or device == "cpu" or cuda_decode_failed
             if use_cpu and cpu_dec is None:
                 cpu_dec = new_decoder("cpu")
             if not use_cpu and gpu_dec is None:
@@ -136,6 +235,7 @@ def make_frame_loader(video_path, thumb_w, requested_device="auto"):
                 else:
                     print(f"[warn] CUDA seek failed; using CPU for frame {fr}: {exc}")
                     gpu_dec = None
+                    cuda_decode_failed = True
                     if cpu_dec is None:
                         cpu_dec = new_decoder("cpu")
                     f = cpu_dec.get_frames_in_range(
@@ -163,14 +263,11 @@ def load_hand_track(path):
     return meta, frames
 
 
-def hand_mesh_cam(M, faces, h, beta, mirror):
+def hand_mesh_cam(mano_mesh_fn, h, beta, mirror):
     """FK one hand's MANO mesh into the LEFT-FISHEYE CAMERA frame. Returns (778,3)."""
-    import jax.numpy as jnp
-    import jaxlie
-    import mano_jax as MJ
-
-    R = jaxlie.SO3(jnp.asarray(np.array(h["quat"]))).as_matrix()  # (16,3,3)
-    v = np.array(MJ.mano_mesh_R(M, R, jnp.asarray(beta)))          # (778,3) virtual
+    quaternions = np.asarray(h["quat"], np.float32)
+    beta = np.asarray(beta, np.float32)
+    v = np.array(mano_mesh_fn(quaternions, beta))                  # (778,3) virtual
     v[:, 0] *= mirror                                              # left-hand x-mirror
     v = v + np.array(h["trans_virtual"])[None, :]                  # place root
     v = v @ np.array(h["Rv_l"]).T                                   # -> left-fisheye cam
@@ -197,8 +294,8 @@ def main():
     ap.add_argument("--color-mode", choices=("pixel", "depth"), default="pixel",
                      help="pixel: sample each landmark's color from the actual "
                           "video frame/eye/px of its first observation (needs "
-                          "trajectory.npz's point_first_* fields, written by "
-                          "vio_bundle_adjust.py). depth: percentile colormap.")
+                          "trajectory point_first_* fields). depth: percentile "
+                          "colormap.")
     ap.add_argument("--no-color", action="store_true",
                     help="skip video decoding and render landmarks in one color")
     ap.add_argument("--hands-left", default=None,
@@ -217,24 +314,45 @@ def main():
     ap.add_argument("--playback-fps", type=float, default=40.0,
                     help="video timeline rate (default: 40)")
     ap.add_argument("--point-size", type=float, default=0.005)
-    ap.add_argument("--frustum-scale", type=float, default=0.03)
-    ap.add_argument("--trail-line-width", type=float, default=0.5,
+    ap.add_argument("--frustum-scale", type=float, default=0.04)
+    ap.add_argument("--trail-line-width", type=float, default=0.35,
                      help="static trail frustums drawn thin so the bright "
                           "current-frame frustums pop")
-    ap.add_argument("--trail-path-width", type=float, default=2.5,
-                    help="width of the connected camera path")
-    ap.add_argument("--current-line-width", type=float, default=3.0)
-    ap.add_argument("--camera-eyes", choices=("left", "both"), default="both",
-                    help="camera frustums to render")
-    ap.add_argument("--trail-stride", type=int, default=1,
+    ap.add_argument("--trail-path-width", type=float, default=1.25,
+                     help="width of the connected camera path")
+    ap.add_argument("--current-line-width", type=float, default=2.5)
+    ap.add_argument("--camera-eyes", choices=("left", "both"), default="left",
+                    help="initial camera frustums to render (default: left)")
+    ap.add_argument("--trail-stride", type=int, default=80,
                     help="render one static trail frustum every N poses")
+    ap.add_argument(
+        "--view-mode",
+        choices=("Overview", "Follow", "Ego"),
+        default="Follow",
+        help="initial viewer camera mode (default: Follow)",
+    )
+    ap.add_argument(
+        "--follow-smoothing",
+        type=float,
+        default=0.16,
+        help="follow-camera exponential smoothing time in seconds",
+    )
+    ap.add_argument(
+        "--follow-path-smoothing",
+        type=float,
+        default=0.45,
+        help="zero-lag smoothing applied only to the virtual viewer path",
+    )
     ap.add_argument("--port", type=int, default=8081)
     args = ap.parse_args()
     if args.trail_stride < 1:
         ap.error("--trail-stride must be at least 1")
     if args.playback_fps <= 0:
         ap.error("--playback-fps must be positive")
-
+    if args.follow_smoothing < 0:
+        ap.error("--follow-smoothing must be nonnegative")
+    if args.follow_path_smoothing < 0:
+        ap.error("--follow-path-smoothing must be nonnegative")
     derived = os.path.join(args.recording, "derived")
     traj_path = args.trajectory or os.path.join(derived, "trajectory.npz")
     # Hands default into derived/ too; auto-loaded below only if the file exists,
@@ -249,6 +367,18 @@ def main():
     d = np.load(traj_path)
     frame_idx = d["frame_idx"]
     pose_wxyz_xyz = d["pose_wxyz_xyz"]  # (n_frames, 7) T_wl (WORLD->CAMERA)
+    if "interpolation_frame_time_s" in d:
+        frame_time_s = np.asarray(d["interpolation_frame_time_s"], np.float64)
+        if (frame_time_s.shape != frame_idx.shape
+                or np.any(np.diff(frame_time_s) <= 0)):
+            raise ValueError("trajectory interpolation frame times are invalid")
+        frame_time_s = frame_time_s - frame_time_s[0]
+        print("playback timeline: observed camera frame times")
+    else:
+        frame_time_s = (
+            np.asarray(frame_idx, np.float64) - float(frame_idx[0])
+        ) / args.playback_fps
+        print(f"playback timeline: uniform {args.playback_fps:g} fps fallback")
     points = d["points"]  # (n_points, 3) world frame
     keep_points = d["point_alive"] if "point_alive" in d else np.ones(len(points), dtype=bool)
     n_dropped = int((~keep_points).sum())
@@ -291,6 +421,14 @@ def main():
         t_rw = -(R_rw @ t_wr)
         cam_pos_world_r[i] = t_rw
         cam_quat_world_r[i] = matrix_to_quat(R_rw)
+
+    presentation_pos_world, presentation_R_world = (
+        smooth_presentation_trajectory(
+            cam_pos_world,
+            cam_R_world,
+            frame_time_s,
+            args.follow_path_smoothing,
+        ))
 
     left_frame = None
     if os.path.exists(video_path):
@@ -363,19 +501,68 @@ def main():
     # --- optional hands -------------------------------------------------------
     hand_tracks = {}  # name -> (meta, {video_frame: hand dict}, color)
     if args.hands_left and os.path.exists(args.hands_left):
-        hand_tracks["left"] = (*load_hand_track(args.hands_left), (1.0, 0.5, 0.3))
+        hand_tracks["left"] = (*load_hand_track(args.hands_left), (0.3, 0.6, 1.0))
     if args.hands_right and os.path.exists(args.hands_right):
-        hand_tracks["right"] = (*load_hand_track(args.hands_right), (0.3, 0.6, 1.0))
-    M, faces = None, None
+        hand_tracks["right"] = (*load_hand_track(args.hands_right), (1.0, 0.4, 0.25))
+    M, faces, mano_mesh_fn = None, None, None
     if hand_tracks:
+        # The visualization FK is tiny. Keep JAX off the GPUs so its allocator
+        # cannot compete with torchcodec/NVDEC for thumbnail decode memory.
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        import jax
+        import jax.numpy as jnp
+        import jaxlie
         import mano_jax as MJ
+
         M = MJ.load_mano(args.mano)
         faces = np.asarray(M["faces"])
-        print(f"hands: {', '.join(hand_tracks)} (FK'd into world via left-cam pose)")
 
+        @jax.jit
+        def mano_mesh_fn(quaternions, beta):
+            rotations = jaxlie.SO3(jnp.asarray(quaternions)).as_matrix()
+            return MJ.mano_mesh_R(M, rotations, jnp.asarray(beta))
+
+        # Compile and synchronize once. Both hands have identical input shapes
+        # and dtypes and therefore reuse this executable for every frame.
+        warm_name = next(iter(hand_tracks))
+        warm_meta, warm_frames, _ = hand_tracks[warm_name]
+        warm_hand = next(iter(warm_frames.values()))
+        hand_mesh_cam(
+            mano_mesh_fn,
+            warm_hand,
+            warm_meta["beta_opt"],
+            warm_meta["mirror"],
+        )
+        print(f"hands: {', '.join(hand_tracks)} (CPU-JIT MANO FK; "
+              "compiled once; placed via left-cam pose)")
     server = viser.ViserServer(port=args.port)
     server.scene.world_axes.visible = False
     server.scene.set_up_direction("+z")  # stage-5 world is gravity-aligned
+
+    path_span = np.ptp(cam_pos_world[:, :2], axis=0)
+    grid_size = max(6.0, float(np.ceil(np.max(path_span) + 4.0)))
+    floor_height = float(np.median(cam_pos_world[:, 2]) - 1.778)
+    floor_grid = server.scene.add_grid(
+        "/floor",
+        width=grid_size,
+        height=grid_size,
+        plane="xy",
+        cell_color=(190, 195, 201),
+        cell_thickness=0.35,
+        cell_size=0.5,
+        section_color=(158, 166, 175),
+        section_thickness=0.7,
+        section_size=1.0,
+        fade_distance=max(grid_size * 0.65, 4.0),
+        fade_strength=1.5,
+        fade_from="camera",
+        shadow_opacity=0.08,
+        position=(
+            float(np.median(cam_pos_world[:, 0])),
+            float(np.median(cam_pos_world[:, 1])),
+            floor_height,
+        ),
+    )
 
     if keep_points.any():
         server.scene.add_point_cloud(
@@ -389,7 +576,7 @@ def main():
         "/trail/path",
         points=trail_segments,
         line_width=args.trail_path_width,
-        colors=(255, 176, 32),
+        colors=(214, 145, 42),
     )
     if args.loop_candidates:
         frame_to_slot = {
@@ -456,126 +643,303 @@ def main():
             f"{len(loop_candidates)} loop candidates overlaid from "
             f"{args.loop_candidates}")
 
-    # Static frustums show the trajectory shape; bright current frustums update
-    # at full rate even when the trail is subsampled.
+    # Sparse, small history frustums preserve heading context without competing
+    # with the textured current left camera.
+    trail_frustums_l = []
+    trail_frustums_r = []
+    show_stereo_initially = args.camera_eyes == "both"
     for i in range(0, n_frames, args.trail_stride):
-        server.scene.add_camera_frustum(
-            f"/trail/cam_l_{i}", fov=1.4, aspect=1.2, scale=args.frustum_scale * 0.6,
+        trail_frustums_l.append(server.scene.add_camera_frustum(
+            f"/trail/cam_l_{i}", fov=1.4, aspect=1.2,
+            scale=args.frustum_scale * 0.28,
             line_width=args.trail_line_width,
-            color=(0.6, 0.4, 0.1), wxyz=cam_quat_world[i], position=cam_pos_world[i])
-        if args.camera_eyes == "both":
-            server.scene.add_camera_frustum(
-                f"/trail/cam_r_{i}", fov=1.4, aspect=1.2,
-                scale=args.frustum_scale * 0.6,
-                line_width=args.trail_line_width,
-                color=(0.1, 0.4, 0.5), wxyz=cam_quat_world_r[i],
-                position=cam_pos_world_r[i])
+            color=(0.42, 0.31, 0.16),
+            wxyz=cam_quat_world[i],
+            position=cam_pos_world[i],
+            cast_shadow=False,
+        ))
+        trail_frustums_r.append(server.scene.add_camera_frustum(
+            f"/trail/cam_r_{i}", fov=1.4, aspect=1.2,
+            scale=args.frustum_scale * 0.28,
+            line_width=args.trail_line_width,
+            color=(0.12, 0.32, 0.38),
+            wxyz=cam_quat_world_r[i],
+            position=cam_pos_world_r[i],
+            visible=show_stereo_initially,
+            cast_shadow=False,
+        ))
+
+    initial_image = None
+    if left_frame is not None:
+        try:
+            initial_image = left_frame(int(frame_idx[fmin]))
+        except (RuntimeError, IndexError) as exc:
+            print(f"[warn] initial thumbnail unavailable: {exc}")
     current_frustum_l = server.scene.add_camera_frustum(
-        "/current_left", fov=1.4, aspect=1.2, scale=args.frustum_scale,
+        "/current_left", fov=1.4, aspect=1.2,
+        scale=args.frustum_scale * 2.25,
         line_width=args.current_line_width,
-        color=(1.0, 0.6, 0.0), wxyz=cam_quat_world[0], position=cam_pos_world[0])
-    current_frustum_r = None
-    if args.camera_eyes == "both":
-        current_frustum_r = server.scene.add_camera_frustum(
-            "/current_right", fov=1.4, aspect=1.2, scale=args.frustum_scale,
-            line_width=args.current_line_width,
-            color=(0.0, 0.8, 1.0), wxyz=cam_quat_world_r[0],
-            position=cam_pos_world_r[0])
+        color=(1.0, 0.58, 0.08),
+        image=initial_image,
+        format="jpeg",
+        jpeg_quality=85,
+        wxyz=cam_quat_world[0],
+        position=cam_pos_world[0],
+        cast_shadow=False,
+    )
+    current_frustum_r = server.scene.add_camera_frustum(
+        "/current_right", fov=1.4, aspect=1.2, scale=args.frustum_scale * 0.72,
+        line_width=args.current_line_width,
+        color=(0.0, 0.72, 0.88),
+        wxyz=cam_quat_world_r[0],
+        position=cam_pos_world_r[0],
+        visible=show_stereo_initially,
+        cast_shadow=False,
+    )
 
     n_v = int(np.asarray(faces).max()) + 1 if faces is not None else 0
     mesh_h = {name: server.scene.add_mesh_simple(
                   f"/hand_{name}", np.zeros((n_v, 3), np.float32), faces,
-                  color=color, flat_shading=False, visible=False)
+                  color=color, flat_shading=False, visible=False,
+                  cast_shadow=True, receive_shadow=True)
               for name, (_, _, color) in hand_tracks.items()}
 
-    gui_play = server.gui.add_checkbox("play", False)
-    gui_frame = server.gui.add_slider("frame", fmin, fmax, 1, fmin)
-    gui_info = server.gui.add_text("info", "", disabled=True)
-    gui_img = server.gui.add_image(left_frame(frame_idx[fmin]), label="left eye",
-                                    format="jpeg") if left_frame else None
+    gui_view = server.gui.add_dropdown(
+        "View", ("Overview", "Follow", "Ego"),
+        initial_value=args.view_mode)
+    gui_play = server.gui.add_checkbox("Play", False)
+    gui_speed = server.gui.add_slider(
+        "Speed", 0.25, 2.0, 0.25, 1.0)
+    gui_frame = server.gui.add_slider("Frame", fmin, fmax, 1, fmin)
+    gui_show_stereo = server.gui.add_checkbox(
+        "Stereo rig", show_stereo_initially)
+    gui_show_history = server.gui.add_checkbox("Camera history", True)
+    gui_show_floor = server.gui.add_checkbox("Floor grid", True)
+    gui_show_hands = server.gui.add_checkbox(
+        "Hands", bool(hand_tracks))
+    gui_frame_scene = server.gui.add_button("Frame scene")
 
     _update_lock = threading.Lock()
+    _timeline_lock = threading.Lock()
+    _timeline_state = {
+        "playhead_s": float(frame_time_s[fmin]),
+        "rendered_slot": fmin,
+    }
+    _camera_states = {}
+    overview_target = overview_camera_target(cam_pos_world)
 
-    def update(_=None):
+    def set_client_camera(
+            client_id, client, target, snap=False, already_atomic=False):
+        now = time.monotonic()
+        state = _camera_states.get(client_id)
+        previous = None if state is None else state["target"]
+        dt = 0.0 if state is None else now - state["time"]
+        if snap or args.follow_smoothing == 0.0:
+            smoothed = target
+        else:
+            smoothed = smooth_camera_target(
+                previous, target, dt, args.follow_smoothing)
+        def assign():
+            client.camera.position = smoothed[0]
+            client.camera.look_at = smoothed[1]
+            client.camera.up_direction = smoothed[2]
+        if already_atomic:
+            assign()
+        else:
+            with client.atomic():
+                assign()
+        _camera_states[client_id] = {
+            "target": smoothed,
+            "time": now,
+        }
+
+    def set_all_client_cameras(
+            target, snap=False, already_atomic=False):
+        for client_id, client in server.get_clients().items():
+            set_client_camera(
+                client_id,
+                client,
+                target,
+                snap=snap,
+                already_atomic=already_atomic,
+            )
+
+    def update_presentation_cameras(
+            frame_slot, snap=False, already_atomic=False):
+        mode = gui_view.value
+        if mode == "Overview":
+            return
+        target = presentation_camera_target(
+            presentation_pos_world[frame_slot],
+            presentation_R_world[frame_slot],
+            mode,
+        )
+        set_all_client_cameras(
+            target,
+            snap=snap or mode == "Ego",
+            already_atomic=already_atomic,
+        )
+
+    def update_layer_visibility():
+        history = bool(gui_show_history.value)
+        stereo = bool(gui_show_stereo.value)
+        ego = gui_view.value == "Ego"
+        for handle in trail_frustums_l:
+            handle.visible = history
+        for handle in trail_frustums_r:
+            handle.visible = history and stereo
+        current_frustum_l.visible = not ego
+        current_frustum_r.visible = stereo and not ego
+        floor_grid.visible = bool(gui_show_floor.value)
+
+    def render_frame(frame_slot, random_access=False, publish_slider=False):
         with _update_lock:
-            fr = int(gui_frame.value)
+            fr = int(frame_slot)
             vframe = int(frame_idx[fr])
             img = None
             if left_frame is not None:
                 try:
-                    user_scrub = (
-                        _ is not None and getattr(_, "client_id", None) is not None)
-                    img = left_frame(vframe, random_access=user_scrub)
+                    img = left_frame(vframe, random_access=random_access)
                 except (RuntimeError, IndexError) as exc:
                     # Keep the previous thumbnail. A bad video seek must not
                     # take down trajectory/hand scrubbing or the play loop.
                     print(f"[warn] thumbnail unavailable for frame {vframe}: {exc}")
-            lines = [
-                f"pose slot {fr} (video frame {vframe})",
-                f"  cam position (world): {cam_pos_world[fr]}",
-            ]
             hand_verts = {}
-            for name, (meta, frames, _) in hand_tracks.items():
-                h = frames.get(vframe)
-                if h is None:
-                    continue
-                v_cam = hand_mesh_cam(M, faces, h, meta["beta_opt"], meta["mirror"])
-                hand_verts[name] = (v_cam @ cam_R_world[fr].T
-                                    + cam_pos_world[fr][None, :]).astype(np.float32)
+            if gui_show_hands.value:
+                for name, (meta, frames, _) in hand_tracks.items():
+                    h = frames.get(vframe)
+                    if h is None:
+                        continue
+                    v_cam = hand_mesh_cam(
+                        mano_mesh_fn, h, meta["beta_opt"], meta["mirror"])
+                    hand_verts[name] = (
+                        v_cam @ cam_R_world[fr].T
+                        + cam_pos_world[fr][None, :]
+                    ).astype(np.float32)
             with server.atomic():
+                if publish_slider:
+                    gui_frame.value = fr
                 current_frustum_l.wxyz = cam_quat_world[fr]
                 current_frustum_l.position = cam_pos_world[fr]
-                if current_frustum_r is not None:
-                    current_frustum_r.wxyz = cam_quat_world_r[fr]
-                    current_frustum_r.position = cam_pos_world_r[fr]
+                current_frustum_r.wxyz = cam_quat_world_r[fr]
+                current_frustum_r.position = cam_pos_world_r[fr]
                 for name in hand_tracks:
-                    if name in hand_verts:
+                    if name in hand_verts and gui_show_hands.value:
                         mesh_h[name].vertices = hand_verts[name]
                         mesh_h[name].visible = True
                     else:
                         mesh_h[name].visible = False
-                gui_info.value = "\n".join(lines)
                 if img is not None:
-                    gui_img.image = img
+                    current_frustum_l.image = img
+                update_presentation_cameras(fr, already_atomic=True)
 
-    gui_frame.on_update(update)
-    update()
+    @gui_frame.on_update
+    def _on_frame_scrub(event):
+        # Server-side slider publication during playback has no client_id.
+        # Only a real client scrub is allowed to seek the central clock.
+        if getattr(event, "client_id", None) is None:
+            return
+        frame_slot = int(gui_frame.value)
+        with _timeline_lock:
+            _timeline_state["playhead_s"] = float(frame_time_s[frame_slot])
+            _timeline_state["rendered_slot"] = frame_slot
+        render_frame(frame_slot, random_access=True)
+
+    @gui_play.on_update
+    def _on_play_toggle(_event):
+        gui_frame.disabled = bool(gui_play.value)
+
+    @gui_view.on_update
+    def _(_event):
+        _camera_states.clear()
+        update_layer_visibility()
+        if gui_view.value == "Overview":
+            set_all_client_cameras(overview_target, snap=True)
+        else:
+            with _timeline_lock:
+                frame_slot = _timeline_state["rendered_slot"]
+            update_presentation_cameras(frame_slot, snap=True)
+
+    @gui_show_stereo.on_update
+    def _(_event):
+        update_layer_visibility()
+
+    @gui_show_history.on_update
+    def _(_event):
+        update_layer_visibility()
+
+    @gui_show_floor.on_update
+    def _(_event):
+        update_layer_visibility()
+
+    @gui_show_hands.on_update
+    def _(_event):
+        with _timeline_lock:
+            frame_slot = _timeline_state["rendered_slot"]
+        render_frame(frame_slot, random_access=True)
+
+    @gui_frame_scene.on_click
+    def _(_event):
+        gui_view.value = "Overview"
+        _camera_states.clear()
+        set_all_client_cameras(overview_target, snap=True)
+
+    @server.on_client_connect
+    def _(client):
+        client_id = getattr(client, "client_id", id(client))
+        if gui_view.value == "Overview":
+            set_client_camera(
+                client_id, client, overview_target, snap=True)
+        else:
+            with _timeline_lock:
+                frame_slot = _timeline_state["rendered_slot"]
+            target = presentation_camera_target(
+                presentation_pos_world[frame_slot],
+                presentation_R_world[frame_slot],
+                gui_view.value,
+            )
+            set_client_camera(client_id, client, target, snap=True)
+
+    update_layer_visibility()
+    render_frame(fmin)
 
     print(f"viser running on port {args.port} -- forward it: "
           f"ssh -L {args.port}:localhost:{args.port} <host>")
 
-    play_started_at = None
-    play_started_slot = fmin
-    last_play_slot = None
+    last_tick_s = time.monotonic()
+    was_playing = False
     while True:
-        if not gui_play.value:
-            play_started_at = None
-            last_play_slot = None
-            time.sleep(0.01)
-            continue
-
-        current_slot = int(gui_frame.value)
-        if (play_started_at is None
-                or (last_play_slot is not None and current_slot != last_play_slot)):
-            # Start/rebase playback here, including when the user scrubs while
-            # play remains enabled.
-            play_started_at = time.monotonic()
-            play_started_slot = current_slot
-
-        elapsed = time.monotonic() - play_started_at
-        target_video_frame = (
-            float(frame_idx[play_started_slot]) + elapsed * args.playback_fps)
-        if target_video_frame > float(frame_idx[fmax]):
-            play_started_at = time.monotonic()
-            play_started_slot = fmin
-            target_slot = fmin
-        else:
-            target_slot = int(np.searchsorted(
-                frame_idx, target_video_frame, side="right") - 1)
-        target_slot = max(fmin, target_slot)
-        if target_slot != current_slot:
-            gui_frame.value = target_slot
-        last_play_slot = target_slot
+        now_s = time.monotonic()
+        playing = bool(gui_play.value)
+        target_slot = None
+        with _timeline_lock:
+            if playing and was_playing:
+                _timeline_state["playhead_s"] += (
+                    now_s - last_tick_s) * float(gui_speed.value)
+                duration_s = float(frame_time_s[fmax] - frame_time_s[fmin])
+                if (_timeline_state["playhead_s"]
+                        > float(frame_time_s[fmax])):
+                    _timeline_state["playhead_s"] = (
+                        float(frame_time_s[fmin])
+                        + (_timeline_state["playhead_s"]
+                           - float(frame_time_s[fmin]))
+                        % max(duration_s, 1e-12)
+                    )
+                candidate_slot = int(np.searchsorted(
+                    frame_time_s,
+                    _timeline_state["playhead_s"],
+                    side="right",
+                ) - 1)
+                candidate_slot = max(fmin, min(candidate_slot, fmax))
+                if candidate_slot != _timeline_state["rendered_slot"]:
+                    _timeline_state["rendered_slot"] = candidate_slot
+                    target_slot = candidate_slot
+        last_tick_s = now_s
+        was_playing = playing
+        if target_slot is not None:
+            # The central clock renders directly. The slider is published in
+            # the same transaction and its server-side callback is ignored.
+            render_frame(target_slot, publish_slider=True)
         time.sleep(0.005)
 
 

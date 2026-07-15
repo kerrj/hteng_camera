@@ -1,7 +1,7 @@
 """Batched WiLoR hand pose on rectified PINHOLE crops, both eyes — sets up depth.
 
-Like wilor_hands_batched.py, but instead of feeding WiLoR a raw square crop we
-render an undistorted virtual-pinhole view aimed at each hand (fisheye_pinhole).
+Instead of feeding WiLoR a raw square crop, this renders an undistorted
+virtual-pinhole view aimed at each hand (fisheye_pinhole).
 Detection runs on BOTH eyes independently; per handedness we match the largest
 bbox in each eye, triangulate their centre rays to a common 3D point P (closest
 point to the skew rays), and render a *baseline-aligned VERGED* left+right
@@ -9,12 +9,10 @@ pinhole pair aimed at P (shared focal). Both crops are centred on the hand and
 rows stay epipolar (horizontal), but the optical axes verge — so this is NOT a
 parallel-axis rig: depth is recovered by the stereo optimizer from each eye's
 SO3 + pinhole projection, NOT f*baseline/disparity. We run the ViT on both eyes'
-crops (batched across the chunk) and save both keypoint sets in crop pixels.
+crops, batched across each chunk, and save both keypoint sets in crop pixels.
 
-Speed: pinhole rendering is two grid_samples — it *replaces* the raw crop op, so
-the only extra cost vs wilor_hands_batched is the 2nd eye's ViT pass (we run
-both eyes for stereo). Still gathers all crops across a 64-frame chunk into big
-ViT batches.
+Pinhole rendering replaces the raw crop operation. Both eyes are required for
+stereo, and all crops from a frame chunk are gathered into large ViT batches.
 
 Output: <out>/hands.jsonl, one JSON object per frame:
     {"frame", "width", "height", "baseline", "hands": [ {
@@ -36,7 +34,7 @@ import torch
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import fisheye_pinhole as FP
-import wilor_hands_batched as W
+import wilor_runtime as W
 
 # Reject a stereo hand whose triangulated depth is below this (metres). A hand
 # can't be this close; sub-0.1m (often negative) P comes from near-parallel or
@@ -62,6 +60,8 @@ def parse_args():
     p.add_argument("--vit-batch", type=int, default=32)
     p.add_argument("--conf", type=float, default=0.3)
     p.add_argument("--out-size", type=int, default=256)
+    p.add_argument("--model-dir", default=W.default_model_dir(),
+                   help="WiLoR asset cache prepared by prepare_wilor_models.py")
     p.add_argument("--max-frames", type=int, default=None)
     p.add_argument("--fp32", action="store_true")
     return p.parse_args()
@@ -127,8 +127,8 @@ def run_chunk(pipe, dtype, calib, frames_l_u8, frames_r_u8, frame_idxs,
             # REJECT implausible triangulation before rendering. Near-parallel or
             # mismatched (left/right boxes on different things) bbox-centre rays
             # give a closest-point P near/behind the baseline (z<0.1m, sometimes
-            # negative). Such frames create a projection singularity (1/z^2
-            # Jacobian) that poisons the shared LM trust-region in the solve.
+            # negative). Such geometry cannot define a useful virtual crop and
+            # is rejected before inference.
             g_l = FP.bbox_center_ray(bbox_l, Kl, Dl)
             g_r = FP.bbox_center_ray(bbox_r, Kr, Dr)
             P_chk = FP.triangulate_rays(g_l, g_r, Rs, ts)
@@ -216,7 +216,7 @@ def main():
     if args.out is None:
         args.out = os.path.join(args.calib_dir, "derived")
     os.makedirs(args.out, exist_ok=True)
-    pipe, dev, dtype = W.build_pipeline(args.fp32)
+    pipe, dev, dtype = W.build_pipeline(args.fp32, args.model_dir)
     calib = load_calib(args.calib_dir, args.left_serial, args.right_serial, dev)
 
     # Two per-eye files: decode each on-GPU, slice nothing. torchcodec decodes

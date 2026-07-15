@@ -14,12 +14,11 @@ Geometry (left-fisheye = reference; X_r = Rs X_l + ts):
 For P (given in LEFT-FISHEYE frame): its left-virtual coords are x = Rv_l^T P,
 which should reproject to centre in BOTH eyes.
 """
+import argparse
 import json
+import os
 
 import numpy as np
-
-from wilor_hands_pinhole import load_calib
-import torch
 
 
 def project(x, f_px, out_size):
@@ -28,15 +27,28 @@ def project(x, f_px, out_size):
 
 
 def main():
-    dev = torch.device("cpu")
-    Kl, Dl, Kr, Dr, Rs, ts, b_hat, baseline = load_calib(
-        "../../long-test1", "046060323008", "046060323001", dev)
-    Rs = np.array(Rs); ts = np.array(ts).reshape(3)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("recording")
+    parser.add_argument("--jsonl", default=None,
+                        help="default: <recording>/derived/hands.jsonl")
+    parser.add_argument("--left-serial", default="046060323008")
+    parser.add_argument("--right-serial", default="046060323001")
+    args = parser.parse_args()
+    if args.jsonl is None:
+        args.jsonl = os.path.join(args.recording, "derived", "hands.jsonl")
 
-    rows = [json.loads(l) for l in open("out/pinhole_verged_test/hands.jsonl")]
+    stereo_path = os.path.join(
+        args.recording,
+        f"stereo_{args.left_serial}_{args.right_serial}.json")
+    with open(stereo_path) as handle:
+        stereo = json.load(handle)
+    Rs = np.asarray(stereo["R"])
+    ts = np.asarray(stereo["t"]).reshape(3)
+
     errs_l, errs_r = [], []
     n = 0
-    for d in rows:
+    for line in open(args.jsonl):
+        d = json.loads(line)
         for h in d["hands"]:
             Rv_l = np.array(h["Rv_l"]); Rv_r = np.array(h["Rv_r"])
             f_px = h["f_px"]; OUT = h["out_size"]; c = (OUT - 1) / 2.0
@@ -52,12 +64,17 @@ def main():
             errs_l.append(np.linalg.norm(uL - c))
             errs_r.append(np.linalg.norm(uR - c))
             n += 1
-    errs_l = np.array(errs_l); errs_r = np.array(errs_r)
+    if not n:
+        raise RuntimeError(f"no hand observations in {args.jsonl}")
+    errs_l = np.array(errs_l)
+    errs_r = np.array(errs_r)
     print(f"{n} hands.  P should reproject to crop centre ({c:.1f},{c:.1f}).")
     print(f"  LEFT  eye centre err (px): mean={errs_l.mean():.3f} max={errs_l.max():.3f}")
     print(f"  RIGHT eye centre err (px): mean={errs_r.mean():.3f} max={errs_r.max():.3f}")
     ok = errs_l.max() < 1.0 and errs_r.max() < 1.0
-    print("PASS" if ok else "FAIL — projection math is off")
+    if not ok:
+        raise RuntimeError("projection math is off")
+    print("PASS")
 
 
 if __name__ == "__main__":

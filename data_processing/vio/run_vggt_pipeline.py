@@ -95,6 +95,11 @@ def parse_args():
     parser.add_argument("--window-frames", type=int, default=128)
     parser.add_argument("--overlap-frames", type=int, default=64)
     parser.add_argument("--stereo-interval-seconds", type=float, default=1.0)
+    parser.add_argument("--visual-cauchy-scale", type=float, default=2.0)
+    parser.add_argument(
+        "--anchor-translation-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--anchor-rotation-weight", type=float, default=0.01)
     parser.add_argument("--max-loop-windows", type=int, default=8)
     parser.add_argument("--min-loop-overlap", type=float, default=0.03)
     return parser.parse_args()
@@ -153,6 +158,12 @@ def main():
         str(output_dir),
         "--window-anchor-weight",
         "0.25",
+        "--visual-cauchy-scale",
+        str(args.visual_cauchy_scale),
+        "--anchor-translation-weight",
+        str(args.anchor_translation_weight),
+        "--anchor-rotation-weight",
+        str(args.anchor_rotation_weight),
         "--baseline-weight",
         "100",
         "--imu-rotation-weight",
@@ -263,6 +274,9 @@ def main():
         "window_frames": args.window_frames,
         "overlap_frames": args.overlap_frames,
         "stereo_interval_seconds": args.stereo_interval_seconds,
+        "visual_cauchy_scale": args.visual_cauchy_scale,
+        "anchor_translation_weight": args.anchor_translation_weight,
+        "anchor_rotation_weight": args.anchor_rotation_weight,
         "loop_candidates": loop_count,
         "timings_seconds": timings,
     }

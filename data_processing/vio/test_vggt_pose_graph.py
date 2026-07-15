@@ -182,6 +182,40 @@ def test_full_rate_pose_interpolation_preserves_keyframes():
         full_centers[:, 1], 0.01 * full_frames ** 2, atol=1e-10)
 
 
+def test_pose_interpolation_uses_observed_frame_times():
+    frame_idx = np.asarray([0, 2, 4], np.int64)
+    target_frames = np.arange(5)
+    target_times = np.asarray([0.0, 0.04, 0.11, 0.15, 0.30])
+    key_times = target_times[frame_idx]
+    poses = np.zeros((3, 7), np.float64)
+    poses[:, 0] = 1.0
+    poses[:, 4] = -key_times
+
+    _, full_poses = graph.interpolate_poses(
+        frame_idx,
+        poses,
+        target_frame_idx=target_frames,
+        frame_times=key_times,
+        target_frame_times=target_times,
+    )
+
+    np.testing.assert_allclose(full_poses[:, 4], -target_times, atol=1e-10)
+
+
+def test_repaired_frame_times_preserve_gaps_and_repair_reset():
+    frames = np.arange(5)
+    raw_time_us = np.asarray([1000, 26000, 100, 50100, 75100])
+    times = graph.repaired_frame_times(frames, raw_time_us)
+
+    # Positive observed intervals are 25, 50, and 25 ms; the reset interval
+    # is replaced by their 25 ms median.
+    np.testing.assert_allclose(times, [0.0, 0.025, 0.050, 0.100, 0.125])
+    np.testing.assert_allclose(
+        graph.frame_times_at(frames, times, [0, 2, 4]),
+        [0.0, 0.050, 0.125],
+    )
+
+
 def test_composed_stereo_poses_preserve_calibrated_baseline():
     angles = np.deg2rad([0.0, 30.0, 75.0])
     left = np.zeros((len(angles), 7), np.float64)
@@ -245,13 +279,15 @@ def test_stereo_window_scales_and_pose_graph():
     args = SimpleNamespace(
         visual_translation_weight=10.0,
         visual_rotation_weight=10.0,
+        visual_cauchy_scale=2.0,
         window_anchor_weight=1.0,
         baseline_weight=100.0,
         imu_rotation_weight=10.0,
         gravity_weight=1.0,
         gravity_accel_sigma_g=0.05,
         constant_velocity_weight=0.0,
-        anchor_weight=1000.0,
+        anchor_translation_weight=1.0,
+        anchor_rotation_weight=0.01,
         linear_solver="dense_cholesky",
         iterations=8,
     )

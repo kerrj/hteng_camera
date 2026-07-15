@@ -1,58 +1,222 @@
-# data_processing/hands
+# Stereo hand pipeline
 
-Pipeline for extracting **hand poses** from the stereo fisheye recordings
-(e.g. `../long-test1/`). Head/camera pose is a separate pipeline — see
-`../vio/`.
+This pipeline estimates metric MANO hand poses from synchronized left/right
+fisheye videos. **Run VIO before this pipeline.** Hand fitting requires the
+completed camera trajectory so acceleration smoothing can operate on hand
+motion in the world frame rather than mixing hand and head motion. It has two
+hand stages:
 
-Code is authored on the laptop and synced to the GPU box (`chungus`) via git;
-inference runs there in the **`eyeball211`** conda env.
+1. WiLoR inference on rectified virtual-pinhole crops.
+2. Robust stereo MANO fitting, outlier rejection, VIO-world temporal smoothing,
+   and interpolation of short enclosed gaps.
 
-## Hand pose — WiLoR
+Commands below run from the repository root on `sphynx`. Generate the
+full-rate trajectory first by following
+[`data_processing/vio/README.md`](../vio/README.md); the hand optimizer will
+consume that trajectory in stage 2.
 
-We use [WiLoR-mini](https://github.com/warmshao/WiLoR-mini), a slimmed,
-pip-installable wrapper around [WiLoR](https://github.com/rolpotamias/WiLoR)
-(Potamias et al.). It auto-downloads its weights + MANO model from HuggingFace
-and exposes a one-call `predict()` API. Per detected hand it returns:
+## Inputs
 
-| key (`out["wilor_preds"]`) | shape | meaning |
-|---|---|---|
-| `pred_keypoints_2d` | (1, 21, 2) | 2D joints in **input-image** pixels |
-| `pred_keypoints_3d` | (1, 21, 3) | 3D joints, hand-root frame, metres |
-| `pred_vertices`     | (1, 778, 3) | MANO mesh verts, hand-root frame |
-| `global_orient`     | (1, 1, 3)  | MANO global orient (axis-angle) |
-| `hand_pose`         | (1, 15, 3) | MANO articulation (axis-angle) |
-| `betas`             | (1, 10)    | MANO shape |
-| `pred_cam_t_full`   | (1, 3)     | hand translation in the full-image pinhole camera |
-| `scaled_focal_length` | scalar   | focal (px) of that assumed pinhole camera |
+A recording directory must contain:
 
-Plus `out["is_right"]` (1.0 = right hand) and `out["hand_bbox"]` (x1,y1,x2,y2).
+```text
+left.mp4
+right.mp4
+calib_<left-serial>.json
+calib_<right-serial>.json
+stereo_<left-serial>_<right-serial>.json
+derived/trajectory_<name>.npz
+```
 
-**Important:** WiLoR assumes a **pinhole** camera. Our footage is wide-angle
-fisheye, so `pred_keypoints_2d` / `pred_cam_t_full` are only approximate near
-the periphery. Two ways to use it well:
-  - keypoints land fine on the raw fisheye for *detection* and rough pose;
-  - for precise localization, render an undistorted **pinhole crop** toward the
-    hand (`src/hteng_camera/calibration.py::Intrinsics.undistort_maps`) and run
-    WiLoR there — TBD, see `wilor_hands.py --pinhole` (planned).
+Outputs are written to `<recording>/derived/` by default.
 
-## Environment setup (one-time, on chungus)
+## One-time setup
 
-See `install_wilor.sh`. The `eyeball211` env is bleeding-edge (py3.13, numpy
-2.4, torch 2.11+cu130), so the stock WiLoR pins don't apply. We install
-`--no-deps` and add only what's actually missing.
+Start from a CUDA PyTorch environment with mutually compatible `torch`,
+`torchvision`, and `torchcodec` builds. Install the pinned WiLoR package without
+its restrictive dependency metadata:
 
-Packages added to `eyeball211` for this:
-  - `wilor_mini` (git, --no-deps)
-  - `roma`, `yacs`, `smplx==0.1.28`, `ultralytics` (--no-deps)
-  - `dill` (auto-installed by ultralytics to load the YOLO detector)
+```bash
+python -m pip install --no-deps \
+  "git+https://github.com/warmshao/WiLoR-mini.git@ebec42f"
+```
 
-`chumpy` is **not** installed at runtime. It is only needed once to convert the
-chumpy-pickled `MANO_RIGHT.pkl` into plain numpy — see `mano_dechumpy.py`.
-After that conversion nothing imports chumpy (verified: pipeline loads with
-chumpy uninstalled).
+Install any missing runtime libraries separately so pip does not enforce
+WiLoR's `torch<=2.5` or `ultralytics==8.1.34` pins:
 
-## Files
+```bash
+python -m pip install \
+  "smplx==0.1.28" timm einops ultralytics opencv-python \
+  huggingface-hub scikit-image roma yacs
+```
 
-- `install_wilor.sh`  — reproducible env setup on chungus
-- `mano_dechumpy.py`  — one-time MANO `.pkl` de-chumpy conversion
-- `wilor_hands.py`    — run WiLoR over a video → per-frame hand poses (JSON) + optional viz
+WiLoR's upstream MANO pickle contains obsolete chumpy objects. Install chumpy
+only for the conversion, then prepare the model cache:
+
+```bash
+python -m pip install --no-deps --no-build-isolation chumpy
+python data_processing/hands/prepare_wilor_models.py
+```
+
+Removing chumpy afterward is optional. The hand runtime never imports it after
+conversion:
+
+```bash
+python -m pip uninstall chumpy
+```
+
+Models default to `~/.cache/hteng_camera/wilor`. Set `WILOR_MODEL_DIR` or pass
+`--model-dir` to both preparation and inference to use another location.
+Preparation is idempotent, preserves the original MANO pickle as
+`MANO_RIGHT.pkl.chumpy.bak`, does not overwrite existing assets unless
+`--force-download` is passed, and prints actionable download/conversion errors.
+
+Export that converted model into the compact bundle used by JAX:
+
+```bash
+python data_processing/hands/export_mano_jax.py --out /tmp/mano_jax.npz
+```
+
+The exporter reports whether the model is missing, still contains chumpy, or
+has an incompatible schema. It uses the same model cache.
+
+The optimizer runs in a separate JAX environment. It does not require WiLoR or
+its Torch dependencies.
+
+## Run the pipeline
+
+After VIO has completed, set the recording and its full-rate trajectory:
+
+```bash
+REC=long-test2
+TRAJ="$REC/derived/trajectory_vggt_omega_fullrun_20260714.npz"
+```
+
+### 1. Extract stereo WiLoR observations
+
+```bash
+python data_processing/hands/wilor_hands_pinhole.py \
+  "$REC/left.mp4" "$REC/right.mp4" \
+  --calib-dir "$REC"
+```
+
+This writes `$REC/derived/hands.jsonl`. Each frame contains matched left/right
+keypoints, MANO initialization, and the two virtual-camera transforms.
+
+For a quick inference smoke test, add `--max-frames 300`.
+
+### 2. Fit each hand track
+
+```bash
+conda activate jaxgpu
+
+python data_processing/hands/stereo_optimize.py \
+  --calib-dir "$REC" --trajectory "$TRAJ" --hand left
+
+python data_processing/hands/stereo_optimize.py \
+  --calib-dir "$REC" --trajectory "$TRAJ" --hand right
+```
+
+These commands write:
+
+```text
+$REC/derived/hands3d_left.jsonl
+$REC/derived/hands3d_right.jsonl
+```
+
+The optimizer first fits every candidate frame independently. It rejects
+non-finite geometry, invalid depth, joints behind either camera, high stereo
+reprojection error, and high epipolar disagreement. A second joint solve adds
+minimum-acceleration smoothing only across consecutive accepted observations.
+It uses the observed per-frame camera times stored by VIO, including real
+capture gaps, rather than assuming uniform spacing. Root translation and global
+wrist rotation are smoothed in the VIO world frame; internal finger rotations
+remain parent-relative. Finally, enclosed gaps up to five frames are
+interpolated at their observed frame times. Leading, trailing, and longer gaps
+remain absent.
+
+Useful controls:
+
+```text
+--frame-min / --frame-max   Process a range for debugging
+--interp-max-gap N          Maximum enclosed gap to fill; 0 disables
+--min-depth / --max-depth   Accepted root-depth range (default maximum 1.5 m)
+--max-reproj-px             Maximum phase-1 mean reprojection error
+--max-epipolar-px           Maximum median left/right vertical disagreement
+```
+
+Interpolated rows have `"interpolated": true` and a two-element
+`"source_frames"` field. Measured rows include phase-1 quality metrics. The
+first JSONL row is file-level metadata and records thresholds and counts.
+
+### 3. Export training data
+
+After both hand tracks finish, consolidate the trajectory, hands, timing, and
+calibration into the canonical frame-aligned training file:
+
+```bash
+python data_processing/export_training_h5.py "$REC" \
+  --trajectory "$TRAJ"
+```
+
+This writes `$REC/derived/training.h5`; the left and right MP4s remain separate
+for direct video decoding. See
+[`data_processing/TRAINING_FORMAT.md`](../TRAINING_FORMAT.md) for the complete
+versioned schema, coordinate conventions, validity masks, and efficient loading
+guidance.
+
+## Visualize with VIO
+
+Use `data_processing/visualize_data.py` to place hand meshes in the VIO world:
+
+```bash
+python data_processing/visualize_data.py "$REC" \
+  --trajectory "$REC/derived/trajectory_vggt_omega_fullrun_20260714.npz" \
+  --hands-left "$REC/derived/hands3d_left.jsonl" \
+  --hands-right "$REC/derived/hands3d_right.jsonl" \
+  --mano /tmp/mano_jax.npz \
+  --color-mode depth \
+  --trail-stride 10 \
+  --port 8133
+```
+
+Use the appropriate trajectory filename for the recording. When running
+remotely, forward the port from the laptop:
+
+```bash
+ssh -N -L 8133:localhost:8133 sphynx
+```
+
+Then open `http://localhost:8133`.
+
+## Validation
+
+Syntax and focused filtering tests:
+
+```bash
+python -m py_compile \
+  data_processing/hands/stereo_optimize.py \
+  data_processing/hands/export_mano_jax.py \
+  data_processing/export_training_h5.py
+
+python data_processing/hands/test_stereo_filtering.py
+
+python data_processing/hands/test_projection_math.py "$REC"
+
+python data_processing/test_training_h5.py
+```
+
+## File inventory
+
+- `wilor_hands_pinhole.py`: stereo detection and rectified WiLoR inference.
+- `wilor_runtime.py`: shared WiLoR model, detector, and post-processing helpers.
+- `stereo_optimize.py`: robust two-stage metric hand fitting.
+- `mano_jax.py`: differentiable MANO implementation used by jaxls.
+- `export_mano_jax.py`: reproducible MANO-to-NPZ export.
+- `prepare_wilor_models.py` and `mano_dechumpy.py`: model download and one-time
+  MANO conversion.
+- `test_projection_math.py`: verifies stored virtual-camera geometry.
+- `test_stereo_filtering.py`: focused filtering, temporal topology, quaternion,
+  and VIO-transform tests.
+- `../visualize_data.py`: VIO trajectory, camera, landmark, and hand viewer.
+- `../export_training_h5.py`: final versioned training-data exporter.

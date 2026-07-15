@@ -95,9 +95,8 @@ Everything lands in one folder (the positional argument):
       right.mp4                      right camera
       sync_log.csv                   per-frame t_left/t_right/skew (µs)
       imu_log.csv                    raw accel/gyro/mag samples (only if --imu-port given)
-      markers.csv                    demo segment boundaries from the viser GUI
-                                     (unless --no-viser); same perf_counter clock
-                                     as imu_log.csv
+      audio.mka                      AirPods PCM with absolute AVFoundation PTS
+                                     (unless unavailable or --no-audio)
       recording.json                 manifest: fps, exposure, per-camera ROI,
                                      IMU config + clock-alignment offset
                                      (with the intrinsics offset note)
@@ -115,6 +114,7 @@ Usage
   python record_ego.py --duration 10 --fps 60 --exposure-ms 12 fast/
   python record_ego.py --encoder x265 --transfer linear master/
   python record_ego.py --imu-port /dev/cu.usbserial-1440 take01/     # + raw IMU log
+  python record_ego.py --audio-device "AirPods Pro" take01/          # pin by name
 """
 
 import argparse
@@ -124,6 +124,7 @@ import json
 import os
 import platform
 import queue
+import re
 import shutil
 import signal
 import subprocess
@@ -132,7 +133,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -250,6 +251,126 @@ def _preflight_ffmpeg(encoder: str) -> None:
             f"{encoder}).\n        {hint}\n"
             f"        Check with: ffmpeg -encoders | grep {codec}"
         )
+
+
+# ---------------------------------------------------------------------------
+# AirPods audio capture (macOS AVFoundation -> timestamp-preserving MKA)
+# ---------------------------------------------------------------------------
+
+def _avfoundation_audio_devices() -> list[tuple[int, str]]:
+    """Return current AVFoundation audio devices as ``(index, name)`` pairs."""
+    if platform.system() != "Darwin":
+        return []
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner",
+            "-f", "avfoundation",
+            "-list_devices", "true",
+            "-i", "",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    devices: list[tuple[int, str]] = []
+    in_audio = False
+    for line in proc.stderr.splitlines():
+        if "AVFoundation audio devices:" in line:
+            in_audio = True
+            continue
+        if not in_audio:
+            continue
+        match = re.search(r"\[(\d+)\]\s+(.+)$", line)
+        if match:
+            devices.append((int(match.group(1)), match.group(2)))
+    return devices
+
+
+def _resolve_airpods_device(requested: Optional[str]) -> str:
+    """Resolve a selector once, then return the stable device name."""
+    devices = _avfoundation_audio_devices()
+    if requested is None:
+        matches = [name for _index, name in devices
+                   if "airpods" in name.casefold()]
+    elif requested.isdigit():
+        matches = [name for index, name in devices
+                   if index == int(requested)]
+    else:
+        exact = [name for _index, name in devices
+                 if name.casefold() == requested.casefold()]
+        matches = exact or [
+            name for _index, name in devices
+            if requested.casefold() in name.casefold()
+        ]
+    if len(matches) != 1:
+        available = ", ".join(name for _index, name in devices) or "none"
+        target = "connected AirPods" if requested is None else repr(requested)
+        raise RuntimeError(
+            f"expected exactly one audio device matching {target}; "
+            f"available: {available}"
+        )
+    device = matches[0]
+    if "airpods" not in device.casefold():
+        raise RuntimeError(
+            f"refusing non-AirPods audio device {device!r}; "
+            "connect/select AirPods instead"
+        )
+    return device
+
+
+def _start_audio_capture(device: str, output: Path,
+                         sample_rate: int = 16000) -> Optional[subprocess.Popen]:
+    """Start direct-to-disk PCM audio and wait until its MKA header exists."""
+    output.unlink(missing_ok=True)
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-nostdin", "-loglevel", "warning",
+        "-copyts",
+        "-thread_queue_size", "128",
+        "-f", "avfoundation",
+        "-i", f":{device}",
+        "-map", "0:a:0",
+        "-vn", "-ac", "1", "-ar", str(sample_rate),
+        "-c:a", "pcm_s16le",
+        "-avoid_negative_ts", "disabled",
+        "-cluster_time_limit", "1000",
+        "-flush_packets", "1",
+        "-f", "matroska",
+        str(output),
+    ]
+    # Keep terminal Ctrl+C in the parent. The parent sends exactly one SIGINT
+    # during ordered teardown so ffmpeg can finalize the Matroska trailer.
+    proc = subprocess.Popen(cmd, start_new_session=True)
+    deadline = time.perf_counter() + 10.0
+    while proc.poll() is None and time.perf_counter() < deadline:
+        if output.exists() and output.stat().st_size > 0:
+            return proc
+        time.sleep(0.02)
+    if proc.poll() is None:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        print("[warn] AirPods audio did not become ready within 10 seconds.")
+    else:
+        print(f"[warn] AirPods audio ffmpeg exited during startup "
+              f"(code {proc.returncode}).")
+    output.unlink(missing_ok=True)
+    return None
+
+
+def _stop_audio_capture(proc: subprocess.Popen, timeout: float = 10.0) -> int:
+    """Gracefully finalize an audio MKA, killing only if ffmpeg is stuck."""
+    if proc.poll() is None:
+        try:
+            proc.send_signal(signal.SIGINT)
+        except ProcessLookupError:
+            pass
+    try:
+        return proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return proc.wait()
 
 
 # ---------------------------------------------------------------------------
@@ -411,189 +532,6 @@ class _ImuCsvWriter:
     def close(self) -> None:
         with self._lock:
             self._file.close()
-
-
-# ---------------------------------------------------------------------------
-# Segment markers (viser phone GUI) — coarse hands-free "demo live / idle"
-# boundaries stamped onto the SAME perf_counter clock as the IMU and the
-# camera-reset anchor, so a marker aligns to both streams the same way an IMU
-# sample does (see the "IMU synchronization" section of the module docstring).
-# ---------------------------------------------------------------------------
-
-class _MarkerCsvWriter:
-    """Thread-safe CSV of segment boundaries, written straight from viser's GUI
-    callback threads. Markers are human-paced (a tap every few seconds at most),
-    so a lock-guarded direct write is plenty — same reasoning as _ImuCsvWriter.
-
-    ``host_time_us`` is an ABSOLUTE ``perf_counter()`` microsecond reading, the
-    identical clock imu_log.csv uses, so a marker lines up against IMU samples
-    directly and against camera frames via ``cam_reset_perf_counter_us +
-    t_left_us`` (see the module docstring). ``live`` is the recording-boundary
-    state IN EFFECT AFTER this marker (1 inside a demo, 0 idle) — a plain
-    ``mark`` carries the current state unchanged, so the column alone segments
-    the timeline without pairing start/stop rows.
-    """
-
-    _COLUMNS = ["marker", "host_time_us", "label", "live"]
-
-    def __init__(self, path: Path) -> None:
-        self._lock = threading.Lock()
-        self._file = open(path, "w", newline="")
-        self._writer = csv.writer(self._file)
-        self._writer.writerow(self._COLUMNS)
-        self._count = 0
-
-    def write(self, label: str, live: bool) -> int:
-        """Append one marker at the current perf_counter instant. Returns the
-        marker index. Flushed immediately so a mid-run crash keeps every mark."""
-        with self._lock:
-            idx = self._count
-            self._writer.writerow(
-                [idx, int(time.perf_counter() * 1e6), label, int(live)])
-            self._file.flush()
-            self._count += 1
-            return idx
-
-    @property
-    def count(self) -> int:
-        with self._lock:
-            return self._count
-
-    def close(self) -> None:
-        with self._lock:
-            self._file.close()
-
-
-class _MarkerPanel:
-    """A viser GUI, served on the LAN, for marking coarse demo segments from a
-    phone while the laptop is closed and headless.
-
-    The whole browser window is a solid colour that reflects the segment state:
-    GREEN inside a marked-live demo, RED when idle. This is deliberate — there
-    is no camera preview to show (ffmpeg owns the streams), and a full-window
-    colour is legible at arm's length with hands full, which a small button
-    label is not. Every tap also fires a ``say`` confirmation.
-
-    "Live" here is a LABEL on the timeline, not a capture gate: the cameras and
-    IMU record continuously the whole time. Start/Stop only write demo_start /
-    demo_stop markers (and flip the colour); nothing about the encode path
-    changes. Precise per-episode boundaries are a separate, later concern.
-
-    Optional and self-contained: if viser isn't installed, :func:`build`
-    returns None and the recording proceeds without it — an add-on GUI must
-    never break a capture, same policy as the IMU.
-    """
-
-    # Tiny solid-colour planes; viser scales the background to fill the window.
-    _GREEN = np.full((8, 8, 3), (16, 150, 64), dtype=np.uint8)
-    _RED = np.full((8, 8, 3), (170, 32, 32), dtype=np.uint8)
-
-    def __init__(self, server, writer: "_MarkerCsvWriter") -> None:
-        self._server = server
-        self._writer = writer
-        self.share_url: Optional[str] = None   # set by build() once the share URL resolves
-        self._lock = threading.Lock()
-        self._live = False
-        self._t0 = time.perf_counter()      # for the elapsed-time readout
-
-        with server.gui.add_folder("Recording segment"):
-            self._state_text = server.gui.add_text(
-                "State", initial_value="IDLE", disabled=True)
-            self._start_btn = server.gui.add_button(
-                "Start demo", icon=viser.Icon.PLAYER_RECORD, color="green")
-            self._stop_btn = server.gui.add_button(
-                "Stop demo", icon=viser.Icon.PLAYER_STOP, color="red",
-                disabled=True)
-            self._mark_btn = server.gui.add_button(
-                "Mark point", icon=viser.Icon.FLAG,
-                hint="Drop a one-off marker without changing the live/idle state.")
-            self._info_text = server.gui.add_text(
-                "Markers", initial_value="0 written", disabled=True)
-
-        self._start_btn.on_click(lambda _e: self._set_live(True))
-        self._stop_btn.on_click(lambda _e: self._set_live(False))
-        self._mark_btn.on_click(lambda _e: self._mark())
-        self._refresh()
-
-    @classmethod
-    def build(cls, writer: "_MarkerCsvWriter", host: str, port: int,
-              share: bool = True):
-        """Construct the viser server + panel, or return None if viser is
-        missing / the server can't bind. Never raises into the caller.
-
-        Always requests a public tunnel URL from viser's external share
-        server so a phone off the laptop's network can reach the GUI. It
-        blocks a few seconds on first connect and depends on that third-party
-        server; a failure degrades to the LAN URL only."""
-        try:
-            import viser  # noqa: F401  (module-level name used by the class)
-            globals().setdefault("viser", viser)
-        except ImportError:
-            print("[warn] viser not installed — no marker GUI. "
-                  "Install with `pip install viser` (or pass --no-viser).")
-            return None
-        try:
-            server = viser.ViserServer(host=host, port=port, verbose=False)
-        except Exception as e:
-            print(f"[warn] could not start viser server on {host}:{port}: {e}. "
-                  "Recording without the marker GUI.")
-            return None
-        panel = cls(server, writer)
-        if share:
-            try:
-                print("[info] marker GUI: requesting public share URL "
-                      "(may take a few seconds)…")
-                url = server.request_share_url(verbose=False)
-                panel.share_url = url or None
-                if not url:
-                    print("[warn] marker GUI: share URL request failed — "
-                          "LAN URL only.")
-            except Exception as e:
-                print(f"[warn] marker GUI: share URL request errored ({e}) — "
-                      "LAN URL only.")
-        return panel
-
-    def _set_live(self, live: bool) -> None:
-        """Start/Stop handler: flip state, stamp a boundary marker, reflect it."""
-        with self._lock:
-            if live == self._live:
-                return                       # ignore a double-tap of the same side
-            self._live = live
-        label = "demo_start" if live else "demo_stop"
-        self._writer.write(label, live)
-        _speak("demo started" if live else "demo stopped")
-        self._refresh()
-
-    def _mark(self) -> None:
-        """One-off marker; carries the current live state unchanged."""
-        with self._lock:
-            live = self._live
-        self._writer.write("mark", live)
-        _speak("marked")
-        self._refresh()
-
-    def _refresh(self) -> None:
-        """Push state to the buttons, the text fields, and the window colour."""
-        with self._lock:
-            live = self._live
-        self._server.scene.set_background_image(
-            self._GREEN if live else self._RED, format="jpeg")
-        self._state_text.value = "● LIVE" if live else "IDLE"
-        self._start_btn.disabled = live
-        self._stop_btn.disabled = not live
-        self._info_text.value = f"{self._writer.count} written"
-
-    def close(self) -> None:
-        """Stop the server. If a demo was left open, close the segment cleanly
-        so the log never ends mid-demo."""
-        with self._lock:
-            dangling = self._live
-        if dangling:
-            self._writer.write("demo_stop", False)
-        try:
-            self._server.stop()
-        except Exception:
-            pass
 
 
 def _capture_master(cam: HTCamera, box: _MasterQueue, stop: threading.Event) -> None:
@@ -843,7 +781,7 @@ def _side_meta(cam: HTCamera, serial: str, full_wh: tuple[int, int],
 
 
 def _write_manifest(out_dir: Path, args, encoder: str, left: dict, right: dict,
-                     imu_info: dict, rate_info: dict) -> None:
+                     imu_info: dict, audio_info: dict, rate_info: dict) -> None:
     """Write recording.json describing how the videos were captured, including
     the per-camera ROI needed to adjust the copied full-frame intrinsics.
 
@@ -857,7 +795,8 @@ def _write_manifest(out_dir: Path, args, encoder: str, left: dict, right: dict,
     ``imu_info`` is ``{"enabled": False}`` if no IMU was requested/succeeded,
     or the fully-populated dict built in ``main()`` if it did — it reflects
     ACTUAL outcome, not just whether --imu-port was passed, so a manifest
-    never claims IMU logging succeeded when it silently didn't.
+    never claims IMU logging succeeded when it silently didn't. ``audio_info``
+    follows the same actual-outcome convention for AirPods capture.
     """
     manifest = {
         "format": "hteng-camera-stereo-recording/1",
@@ -894,36 +833,16 @@ def _write_manifest(out_dir: Path, args, encoder: str, left: dict, right: dict,
             "right": "right.mp4",
             "sync_log": "sync_log.csv",
             "imu_log": "imu_log.csv" if imu_info.get("enabled") else None,
-            "markers": "markers.csv" if not args.no_viser else None,
+            "audio": "audio.mka" if audio_info.get("enabled") else None,
             "stereo_transform":
                 f"stereo_{left['serial']}_{right['serial']}.json",
         },
-        "markers": (
-            {"enabled": False}
-            if args.no_viser else {
-                "enabled": True,
-                "file": "markers.csv",
-                "gui": "viser",
-                "host": args.viser_host,
-                "port": args.viser_port,
-                "note": (
-                    "markers.csv columns: marker, host_time_us, label, live. "
-                    "host_time_us is an ABSOLUTE time.perf_counter() reading in "
-                    "microseconds -- the SAME clock as imu_log.csv, so a marker "
-                    "aligns to IMU samples directly and to a camera frame via "
-                    "cam_reset_perf_counter_us + t_left_us (see clock_alignment). "
-                    "label is demo_start / demo_stop / mark; live (0/1) is the "
-                    "segment state in effect after the row, so the column alone "
-                    "segments the timeline. Markers annotate only -- they do NOT "
-                    "gate capture; video/IMU record continuously throughout."
-                ),
-            }
-        ),
         "left": _side_meta(left["cam"], left["serial"], left["full"],
                            left["exp"], left["gain"]),
         "right": _side_meta(right["cam"], right["serial"], right["full"],
                             right["exp"], right["gain"]),
         "imu": imu_info,
+        "audio": audio_info,
         "intrinsics_note": (
             "calib_<serial>.json intrinsics are FULL-SENSOR. For this recording's "
             "ROI, shift the principal point: cx_roi = cx_full - roi.x_offset, "
@@ -1098,12 +1017,17 @@ class _KeepAwake:
         self._lid_set = False                    # did WE flip disablesleep -> 1?
         self._prev_handlers: dict = {}           # SIGTERM/SIGHUP handlers we replaced
         self._ka_stop: Optional[threading.Event] = None  # sudo keep-alive control
+        self._cleanup_callbacks: list[Callable[[], None]] = []
         self._released = False
 
     def engage(self) -> None:
         if not self.enabled:
             if platform.system() != "Darwin":
                 print("[info] keep-awake: not macOS — relying on the OS / your wrapper.")
+            # The object also owns ordered SIGTERM/SIGHUP cleanup callbacks.
+            # Install those guards even when sleep prevention was disabled.
+            atexit.register(self.release)
+            self._install_signal_restore()
             return
         # Layer 1 — idle sleep, tied to our pid so it dies with us even on a crash.
         try:
@@ -1134,6 +1058,13 @@ class _KeepAwake:
         # dies via -w, but pmset can't be restored on a -9.)
         atexit.register(self.release)
         self._install_signal_restore()
+
+    def add_cleanup(self, callback: Callable[[], None]) -> None:
+        """Run ``callback`` once on normal exit, SIGTERM, or SIGHUP."""
+        if self._released:
+            callback()
+            return
+        self._cleanup_callbacks.append(callback)
 
     def _install_signal_restore(self) -> None:
         for sig in (signal.SIGTERM, signal.SIGHUP):
@@ -1178,6 +1109,12 @@ class _KeepAwake:
         if self._released:
             return
         self._released = True
+        for callback in reversed(self._cleanup_callbacks):
+            try:
+                callback()
+            except Exception as e:
+                print(f"[warn] exit cleanup failed: {e}")
+        self._cleanup_callbacks.clear()
         if self._ka_stop is not None:
             self._ka_stop.set()                  # stop refreshing sudo creds
         # Restore lid behaviour first — it's the change that persists till reboot.
@@ -1373,22 +1310,16 @@ def main() -> None:
              "stop sampling the magnetometer -- mx/my/mz log as 0.0.",
     )
     ap.add_argument(
-        "--no-viser", action="store_true",
-        help="Disable the viser marker GUI. By default a small web GUI is "
-             "served so you can open it on a phone and tap Start/Stop demo to "
-             "mark coarse recording segments into markers.csv (hands-free-ish "
-             "while the lid is shut). The window fills GREEN while a demo is "
-             "marked live, RED when idle. Markers don't gate capture — the "
-             "cameras/IMU record continuously regardless.",
+        "--no-audio", action="store_true",
+        help="Disable AirPods microphone recording. By default, exactly one "
+             "connected AVFoundation audio device whose name contains "
+             "'AirPods' is autodetected and recorded to audio.mka.",
     )
     ap.add_argument(
-        "--viser-host", default="0.0.0.0",
-        help="Interface the viser GUI binds to. 0.0.0.0 (default) lets a phone "
-             "on the same network/hotspot reach it at http://<laptop-ip>:port.",
-    )
-    ap.add_argument(
-        "--viser-port", type=int, default=8080,
-        help="Port for the viser marker GUI.",
+        "--audio-device", default=None,
+        help="AirPods AVFoundation device name, unique name substring, or "
+             "current index. The selector is resolved to a name before capture "
+             "and non-AirPods devices are rejected.",
     )
     args = ap.parse_args()
 
@@ -1401,6 +1332,19 @@ def main() -> None:
 
     encoder = _resolve_encoder(args.encoder)
     _preflight_ffmpeg(encoder)
+
+    audio_device: Optional[str] = None
+    if not args.no_audio:
+        if platform.system() != "Darwin":
+            print("[info] AirPods audio is macOS-only; recording without audio.")
+        else:
+            try:
+                audio_device = _resolve_airpods_device(args.audio_device)
+                print(f"[info] selected AirPods input: {audio_device}")
+            except RuntimeError as e:
+                sys.exit(f"[error] AirPods audio unavailable: {e}\n"
+                         "        Connect exactly one AirPods input, select it "
+                         "with --audio-device, or pass --no-audio.")
 
     # Long exposure caps the sensor's native rate (it can't deliver frames faster
     # than it integrates). The event-driven loop never duplicates — it just emits
@@ -1456,6 +1400,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_left = str(out_dir / "left.mp4")
     out_right = str(out_dir / "right.mp4")
+    out_audio = out_dir / "audio.mka"
 
     # Keep the laptop awake (incl. lid closed) for the whole run. Engage here —
     # past all the arg/camera validation, so a trivial error never triggers the
@@ -1548,6 +1493,31 @@ def main() -> None:
           f"-> output ~{effective_hz:.2f} fps"
           + (f" (asked {args.fps})" if args.fps else " (all frames)"))
 
+    # Start Bluetooth/CoreAudio before resetting the camera clocks so device
+    # negotiation cannot perturb active capture. MKA packet PTS remain on the
+    # absolute AVFoundation host clock, so this short audio pre-roll is harmless.
+    audio_proc: Optional[subprocess.Popen] = None
+    if audio_device is not None:
+        audio_proc = _start_audio_capture(audio_device, out_audio)
+        if audio_proc is None:
+            for cam in (cam_left, cam_right):
+                cam.close()
+            if imu is not None:
+                imu.close()
+            if imu_csv is not None:
+                imu_csv.close()
+            awake.release()
+            sys.exit("[error] AirPods input was selected but audio capture "
+                     "failed to start. Reconnect it or pass --no-audio.")
+        else:
+            print(f"[info] AirPods audio recording -> {out_audio}")
+            # Later setup still has several fallible operations. Ensure an
+            # exception or early sys.exit finalizes the MKA instead of leaving
+            # the audio ffmpeg running after the parent exits.
+            atexit.register(_stop_audio_capture, audio_proc)
+            awake.add_cleanup(
+                lambda proc=audio_proc: _stop_audio_capture(proc, timeout=5.0))
+
     # Shared hardware time base for the pair (soft sync; see module docstring).
     cam_left.reset_timestamp()
     cam_right.reset_timestamp()
@@ -1638,6 +1608,27 @@ def main() -> None:
         }
     else:
         imu_info = {"enabled": False}
+    audio_info = (
+        {
+            "enabled": True,
+            "file": "audio.mka",
+            "device": audio_device,
+            "backend": "avfoundation",
+            "codec": "pcm_s16le",
+            "sample_rate_hz": 16000,
+            "channels": 1,
+            "clock_alignment": (
+                "Every Matroska audio packet PTS is an ABSOLUTE AVFoundation "
+                "host timestamp on the same macOS monotonic clock as Python "
+                "time.perf_counter(). PTS are retained with -copyts and "
+                "-avoid_negative_ts disabled at 1 ms Matroska precision. "
+                "Do not remux the original if absolute timestamps are needed; "
+                "many tools rebase media to zero. Transcript-relative time t "
+                "maps to host time as audio stream start_time + t."
+            ),
+        }
+        if audio_proc is not None else {"enabled": False}
+    )
     _write_manifest(
         out_dir, args, encoder,
         {"cam": cam_left, "serial": serial_left, "full": full_left,
@@ -1645,6 +1636,7 @@ def main() -> None:
         {"cam": cam_right, "serial": serial_right, "full": full_right,
          "exp": exp_right, "gain": gain_right},
         imu_info,
+        audio_info,
         {"native_hz": round(native_hz, 3), "stride": stride,
          "effective_hz": round(effective_hz, 3)},
     )
@@ -1692,28 +1684,6 @@ def main() -> None:
     _speak("recording")
     _start_announcer(stop)
 
-    # ── Marker GUI (viser, optional) ──────────────────────────────────────────
-    # A phone-friendly web GUI for stamping coarse "demo live / idle" segment
-    # boundaries into markers.csv on the shared perf_counter clock. Started here,
-    # after capture is up, so the GUI only ever appears once frames are flowing.
-    # Fully optional and non-fatal (same policy as the IMU): if viser is missing
-    # or the port is taken, we warn and record without it.
-    marker_csv: Optional[_MarkerCsvWriter] = None
-    marker_panel: Optional[_MarkerPanel] = None
-    if not args.no_viser:
-        marker_csv = _MarkerCsvWriter(out_dir / "markers.csv")
-        marker_panel = _MarkerPanel.build(
-            marker_csv, args.viser_host, args.viser_port, share=True)
-        if marker_panel is None:
-            marker_csv.close()               # GUI failed to start — no writer needed
-            marker_csv = None
-        else:
-            print(f"[info] marker GUI on http://{args.viser_host}:{args.viser_port} "
-                  "(open it on your phone; tap Start/Stop demo — GREEN=live, RED=idle).")
-            if marker_panel.share_url:
-                print(f"[info] marker GUI share URL: {marker_panel.share_url} "
-                      "(works off the laptop's network).")
-
     # ── Wait for duration / Ctrl+C ───────────────────────────────────────────
     # Handle SIGINT ourselves so Ctrl+C tears down in the SAME order as the
     # duration path: set `stop`, let the capture/encode threads exit, THEN close
@@ -1736,6 +1706,7 @@ def main() -> None:
     prev_sigint = signal.signal(signal.SIGINT, _on_sigint)
 
     stopped_intentionally = False
+    audio_failed_reported = False
     try:
         print("[info] Recording… press Ctrl+C to stop.")
         t_end = None if args.duration is None else time.perf_counter() + args.duration
@@ -1753,6 +1724,11 @@ def main() -> None:
                 print("[warn] an ffmpeg exited early — stopping.")
                 _speak("error")
                 break
+            if (audio_proc is not None and audio_proc.poll() is not None
+                    and not audio_failed_reported):
+                audio_failed_reported = True
+                print(f"[warn] audio ffmpeg exited early with code "
+                      f"{audio_proc.returncode}; camera recording continues.")
             time.sleep(0.1)
     finally:
         signal.signal(signal.SIGINT, prev_sigint)      # restore for teardown
@@ -1760,6 +1736,13 @@ def main() -> None:
     # ── Tear down ─────────────────────────────────────────────────────────────
     print("[info] Stopping…")
     stop.set()
+    # Audio runs in its own process session, so terminal Ctrl+C reaches only the
+    # parent. Send exactly one deliberate SIGINT for a valid Matroska trailer.
+    if audio_proc is not None and audio_proc.poll() is None:
+        try:
+            audio_proc.send_signal(signal.SIGINT)
+        except ProcessLookupError:
+            pass
     for t in cap_threads:
         t.join(timeout=5)
     enc_thread.join(timeout=10)
@@ -1772,10 +1755,11 @@ def main() -> None:
             print("[warn] ffmpeg didn't exit in time — killing it.")
             proc.kill()
             rets.append(proc.wait())
-    if marker_panel is not None:
-        marker_panel.close()            # closes any open segment, stops the server
-    if marker_csv is not None:
-        marker_csv.close()
+    audio_ret = None
+    if audio_proc is not None:
+        if audio_proc.poll() is None:
+            print("[info] waiting for audio ffmpeg to finalize...")
+        audio_ret = _stop_audio_capture(audio_proc)
     cam_left.close()
     cam_right.close()
     if imu is not None:
@@ -1794,6 +1778,13 @@ def main() -> None:
         print(f"[info] Sync log → {sync_csv}")
         if imu_info.get("enabled"):
             print(f"[info] IMU log → {out_dir / 'imu_log.csv'}")
+        if audio_info.get("enabled"):
+            if (not audio_failed_reported
+                    and audio_ret in (0, 255, -signal.SIGINT)):
+                print(f"[info] AirPods audio → {out_audio}")
+            else:
+                print(f"[warn] audio ffmpeg exited with code {audio_ret}; "
+                      f"{out_audio} may be incomplete.")
         _report_sync(sync_csv)
         if box_left.dropped:
             print(f"[warn] dropped {box_left.dropped} master frames at the encoder "

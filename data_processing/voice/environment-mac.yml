@@ -1,0 +1,9 @@
+name: hteng-voice
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - mlx==0.32.0
+      - mlx-whisper==0.4.3
