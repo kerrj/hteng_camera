@@ -17,7 +17,7 @@ import open3d as o3d
 import trimesh
 import viser
 
-from ffs_tsdf_segment import quat_to_R  # same pose convention
+from ffs_tsdf_segment import quat_to_R, R_to_quat  # same pose convention
 
 
 def main():
@@ -96,10 +96,32 @@ def main():
             colors=np.zeros((1, 3), np.uint8),
             point_size=args.dynamic_point_size, point_shape="rounded")
 
+    # head path: camera centers over the segment (early=blue -> late=red),
+    # plus a frustum glyph at the current frame showing the gaze direction
+    path_frames = [vf for vf in range(s0, e0) if vf in pose_of]
+    centers = np.array([-(quat_to_R(poses[pose_of[vf]][:4]).T
+                          @ poses[pose_of[vf]][4:]) for vf in path_frames])
+    segs = np.stack([centers[:-1], centers[1:]], axis=1).astype(np.float32)
+    tgrad = np.linspace(0, 1, len(segs))[:, None]
+    seg_col = np.stack([(np.concatenate([60 + 195 * tgrad, 80 + 0 * tgrad,
+                                         255 - 195 * tgrad], 1))] * 2, axis=1)
+    path_h = server.scene.add_line_segments(
+        "/head/path", points=segs, colors=seg_col.astype(np.uint8),
+        line_width=3.0)
+    frus_h = server.scene.add_camera_frustum(
+        "/head/cam", fov=np.radians(70), aspect=4 / 3, scale=0.1,
+        line_width=2.5, color=(255, 200, 40))
+
     g_frame = server.gui.add_slider("frame", s0, e0 - 1, 1, s0)
     g_play = server.gui.add_checkbox("play", True)
     g_mano = server.gui.add_checkbox("MANO hands", True)
     g_dyn = server.gui.add_checkbox("residual points", dyn is not None)
+    g_path = server.gui.add_checkbox("head path", True)
+
+    def on_path_toggle(_):
+        path_h.visible = g_path.value
+        frus_h.visible = g_path.value
+    g_path.on_update(on_path_toggle)
     # NO shared lock: holding one across viser setters deadlocks against viser's
     # internal update lock (ABBA). Single-writer instead: the play loop is the
     # only caller of show() while playing; the scrub callback only acts paused.
@@ -110,6 +132,9 @@ def main():
             return
         R = quat_to_R(poses[i, :4])
         c = -(R.T @ poses[i, 4:])
+        if g_path.value:
+            frus_h.wxyz = R_to_quat(R.T)     # cam->world; viser looks +z
+            frus_h.position = c
         for side in ("left", "right"):
             V = hands[side][0].get(int(vf))
             h = hand_h[side]
