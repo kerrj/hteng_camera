@@ -224,8 +224,24 @@ a blurry frame. THEN phase 2 (temporal) / phase 3 (mono fill).
   10.3mm. Chain the passes: pass-2 takes pass-1's
   `_trajectory_refined.npz` as `--trajectory`, dynamic residual takes
   pass-2's. Dynamic pts 167M → 146M (fewer misalignment residuals).
-  Motion-phase VIO error is real: smooth ~1.5-2.5cm corrections (some
-  beyond the 3cm gate -> integrated at VIO pose; raising the gate is
-  untested). Open3D gotchas: create_from_depth_image(with_normals) +
-  non-identity extrinsic = CUDA device-mismatch bug (lift in cam frame,
-  conjugate); multi_scale_icp needs o3d.utility.DoubleVector args.
+  Motion-phase VIO error is real: smooth ~1.5-2.5cm corrections. Open3D
+  gotchas: create_from_depth_image(with_normals) + non-identity
+  extrinsic = CUDA device-mismatch bug (lift in cam frame, conjugate);
+  multi_scale_icp needs o3d.utility.DoubleVector args.
+- 2026-07-15: **perf + color + rollout session.** (1) Profile first:
+  numpy splat was 78% of the TSDF loop, GPU 2% -- now a torch scatter
+  (`splat_zbuffer_torch`), full pass ~2 min not ~15. Do NOT dlpack
+  zero-copy torch->o3d (stream race vs torch's caching allocator).
+  (2) COLOR: stored colors are sRGB but Filament AND three.js treat
+  vertex colors as linear -> every view was double-gamma washed; viewer
+  linearizes at serve time (--gamma 2.2). `ffs_recolor_mesh.py`
+  re-colors verts from ~90 sharpest frames (occlusion-checked).
+  (3) `--refine-gate-t 0.045` beats 3cm on C (motion corrections are
+  real); weight-threshold 2.0 adds crud, rejected. (4) VBG limits:
+  swept volumes (kitchen, walking) need `--block-count 300000`, and
+  CUDA extract faults above ~87k active blocks (int32 overflow; 93k
+  crashed, 43k fine) -- script CPU-extracts >80k blocks, but the CPU
+  path segfaults on huge grids too; the real fix is coarser voxels for
+  swept regimes: A/C 3mm, D 4mm, walking 5mm. Winning config per
+  segment in `out/lt2_seg{Ahi2,Cg2,Dhi2,5shi2}_*`; zsh does NOT
+  word-split $VARS -- spell out multi-token args in launch commands.
