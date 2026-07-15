@@ -65,7 +65,7 @@ def main():
                     help="reads <prefix>_tsdf_mesh.ply + _segment.json, "
                          "writes <prefix>_dynamic.npz")
     ap.add_argument("--range-dir", default="data_processing/out/lt2_video")
-    ap.add_argument("--trajectory", default="long-test2/derived/trajectory.npz")
+    ap.add_argument("--trajectory", default="long-test2/derived/trajectory_vggt_omega_fullrun_20260714.npz")
     ap.add_argument("--tau", type=float, default=0.03,
                     help="min metres in front of static to count as dynamic")
     ap.add_argument("--near-orphan", type=float, default=1.0,

@@ -165,7 +165,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--range-dir", default="data_processing/out/lt2_video")
-    ap.add_argument("--trajectory", default="long-test2/derived/trajectory.npz")
+    ap.add_argument("--trajectory", default="long-test2/derived/trajectory_vggt_omega_fullrun_20260714.npz")
     ap.add_argument("--imu", default="long-test2/derived/imu_relative.npz")
     ap.add_argument("--hands-dir", default="data_processing/out/lt2_hands")
     ap.add_argument("--start", type=int, default=None, help="override auto-pick")

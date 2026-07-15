@@ -24,7 +24,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prefix", default="data_processing/out/lt2_seg")
     ap.add_argument("--hands-dir", default="data_processing/out/lt2_hands")
-    ap.add_argument("--trajectory", default="long-test2/derived/trajectory.npz")
+    ap.add_argument("--trajectory", default="long-test2/derived/trajectory_vggt_omega_fullrun_20260714.npz")
     ap.add_argument("--port", type=int, default=8091)
     ap.add_argument("--share", action="store_true")
     ap.add_argument("--fps", type=float, default=None,
