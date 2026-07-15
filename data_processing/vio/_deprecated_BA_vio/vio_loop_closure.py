@@ -139,8 +139,8 @@ def render_montage(recording, accepted, store, args):
         fr_b = frames[eb].get(fb)
         if fr_a is None or fr_b is None:
             continue
-        kp_a = store.get(ea, fa)[0]
-        kp_b = store.get(eb, fb)[0]
+        kp_a = store.get_kp(ea, fa)
+        kp_b = store.get_kp(eb, fb)
         h, w = fr_a.shape[:2]
         canvas = np.hstack([fr_a.copy(), fr_b.copy()])
         for ka, kb in zip(idx_a, idx_b):
@@ -222,9 +222,6 @@ def main():
     # records (pair_type="temporal", true gap) straight into loop_matches.jsonl.
     accum = []
     MP.collect_temporal_pairs(store, eligible, cams, args, accum)
-    # gate_temporal_all writes record DICTS -> use the same async JSONL writer as
-    # vio_match_pairs (a plain file's .write() rejects dicts). jkerr updated the
-    # matcher's writer but not this caller.
     with MP.AsyncJsonlWriter(out_path) as out_f:
         MP.gate_temporal_all(accum, theta_tol, args, out_f)
     print(f"wrote {out_path}")

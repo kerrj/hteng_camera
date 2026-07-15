@@ -153,8 +153,8 @@ def integrate_gyro_window(t_a, t_b, i_ts, gyro):
 
 def frame_gravity(t, i_ts, accel, half_window_us, max_dev_g):
     """Mean accel (IMU frame) over samples within `half_window_us` of `t`,
-    normalized to unit "up", plus a [0,1] confidence weight from how close
-    the window's mean |accel| is to 1g. Returns (up_imu (3,), weight)."""
+    normalized to unit "up", plus its norm and a legacy [0,1] confidence
+    weight. Returns (up_imu (3,), accel_norm_g, weight)."""
     lo = bisect.bisect_left(i_ts, t - half_window_us)
     hi = bisect.bisect_right(i_ts, t + half_window_us)
     if hi <= lo:
@@ -167,7 +167,7 @@ def frame_gravity(t, i_ts, accel, half_window_us, max_dev_g):
     up_imu = mean_accel / max(mag, 1e-9)
     dev = abs(mag - 1.0)
     weight = max(0.0, 1.0 - dev / max_dev_g)
-    return up_imu, weight
+    return up_imu, mag, weight
 
 
 def main():
@@ -204,15 +204,22 @@ def main():
     half_window_us = args.gravity_half_window_ms * 1000.0
     n = len(frame_idx)
     gravity_cam = np.zeros((n, 3), dtype=np.float64)
+    gravity_accel_norm_g = np.zeros(n, dtype=np.float64)
     gravity_weight = np.zeros(n, dtype=np.float64)
     for k in range(n):
-        up_imu, w = frame_gravity(frame_time_us[k], i_ts, accel, half_window_us,
-                                   args.gravity_max_accel_dev)
+        up_imu, accel_norm_g, w = frame_gravity(
+            frame_time_us[k],
+            i_ts,
+            accel,
+            half_window_us,
+            args.gravity_max_accel_dev,
+        )
         # gravity_cam stores the DOWN direction (toward Earth) -- frame_gravity
         # returns "up" (see its docstring on the accel sign convention), so
         # flip here to match this field's name/what downstream consumers
         # (vio_visualize_imu_prior.py, the BA gravity prior) both expect.
         gravity_cam[k] = -(R_CI @ up_imu)
+        gravity_accel_norm_g[k] = accel_norm_g
         gravity_weight[k] = w if frame_valid[k] else 0.0
 
     rel_quat = np.zeros((n - 1, 4), dtype=np.float64)
@@ -256,7 +263,9 @@ def main():
     np.savez(out_path,
               frame_idx=frame_idx, frame_time_us=frame_time_us, frame_valid=frame_valid,
               rel_quat=rel_quat, rel_valid=rel_valid,
-              gravity_cam=gravity_cam, gravity_weight=gravity_weight)
+              gravity_cam=gravity_cam,
+              gravity_accel_norm_g=gravity_accel_norm_g,
+              gravity_weight=gravity_weight)
     print(f"wrote {out_path}")
 
 

@@ -178,6 +178,10 @@ def parse_args():
                          "pairs had plenty -- it's the SURVIVING inlier count that "
                          "exposes the degenerate fit.")
     p.add_argument("--epipolar-px-thresh", type=float, default=3.0)
+    p.add_argument("--gaps", type=int, nargs="+", default=None,
+                    help="explicit temporal gap list (e.g. --gaps 1 30 60), "
+                         "overriding the dense/mid/far/longest schedule flags -- "
+                         "for lite/sparse matching experiments")
     p.add_argument("--dense-max", type=int, default=20)
     p.add_argument("--mid-max", type=int, default=30)
     p.add_argument("--mid-stride", type=int, default=2)
@@ -647,9 +651,10 @@ def main():
     features_path = args.features or os.path.join(args.recording, "derived", "features.h5")
     out_path = args.out or os.path.join(args.recording, "derived", "matches.jsonl")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    gaps = build_temporal_gaps(args.dense_max, args.mid_max, args.mid_stride,
+    gaps = (sorted(set(args.gaps)) if args.gaps else
+            build_temporal_gaps(args.dense_max, args.mid_max, args.mid_stride,
                                 args.far_max, args.far_stride,
-                                args.longest_max, args.longest_stride)
+                                args.longest_max, args.longest_stride))
     print(f"temporal gaps: {gaps}")
 
     store = FeatureStore(features_path, args.device)

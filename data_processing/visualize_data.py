@@ -10,7 +10,8 @@ Landmarks colored by their actual video pixel at first observation
 World is gravity-aligned (+z up), so viser's up-direction is +z. Static
 trail frustums are drawn thin so the bright current-frame frustums pop.
 
-Video thumbnail decoded via torchcodec (fast random seek for scrubbing).
+Video thumbnails are decoded by torchcodec on CUDA when available, then
+downsampled on-device with torchvision before being sent to viser.
 
 All products default into `<recording>/derived/` (trajectory.npz, hands3d_*.jsonl),
 next to the raw left.mp4/stereo_*.json inputs in the recording root -- so a bare
@@ -69,26 +70,84 @@ def depth_to_color(z, lo, hi):
     return np.stack([r, g, b], axis=1)
 
 
-def make_frame_loader(video_path, thumb_w):
-    """torchcodec-backed random-access frame loader -- much faster than cv2's
-    CAP_PROP_POS_FRAMES seek for the scrubber's random-access pattern."""
-    import cv2
+def make_frame_loader(video_path, thumb_w, requested_device="auto"):
+    """Build a cached thumbnail loader and return it with the video's FPS.
+
+    torchcodec handles random access and codec buffering. On CUDA, the decoded
+    frame stays on the GPU through the resize; only the small thumbnail crosses
+    to host memory for viser.
+    """
+    import torch
+    from torchvision.transforms.v2 import functional as tvf
     from torchcodec.decoders import VideoDecoder
 
-    dec = VideoDecoder(video_path, device="cpu")
+    if requested_device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = requested_device
+    if device == "cuda" and not torch.cuda.is_available():
+        print("[warn] CUDA video decode requested but CUDA is unavailable; using CPU")
+        device = "cpu"
+
+    def new_decoder(decoder_device):
+        return VideoDecoder(video_path, device=decoder_device)
+
+    try:
+        dec = new_decoder(device)
+    except RuntimeError as exc:
+        if device != "cuda":
+            raise
+        print(f"[warn] CUDA video decoder unavailable ({exc}); using CPU")
+        device = "cpu"
+        dec = new_decoder(device)
+
+    fps = float(getattr(dec.metadata, "average_fps", 0.0) or 30.0)
+    num_frames = getattr(dec.metadata, "num_frames", None)
+    print(f"video thumbnails: torchcodec decode + torchvision resize on {device} "
+          f"({thumb_w}px wide, {fps:g} fps)")
     lock = threading.Lock()  # torchcodec decoders are not thread-safe; the
     # play loop and the scrub callback run on different threads.
+    gpu_dec = dec if device == "cuda" else None
+    cpu_dec = dec if device == "cpu" else None
 
-    @functools.lru_cache(maxsize=512)
-    def _decode(fr):
+    @functools.lru_cache(maxsize=128)
+    def _decode(fr, random_access):
+        nonlocal gpu_dec, cpu_dec
+        if num_frames is not None:
+            fr = min(max(fr, 0), int(num_frames) - 1)
         with lock:
-            f = dec.get_frames_in_range(start=fr, stop=fr + 1).data[0]  # (3,H,W)
-        img = f.permute(1, 2, 0).numpy().astype(np.uint8)
-        h, w = img.shape[:2]
-        tw = thumb_w
-        return cv2.resize(img, (tw, int(h * tw / w)), interpolation=cv2.INTER_AREA)
+            # Rapid nonlocal seeks can poison the NVDEC/FFmpeg decoder state.
+            # Keep those seeks on an independent CPU decoder; playback remains
+            # on the undisturbed CUDA decoder.
+            use_cpu = random_access or device == "cpu"
+            if use_cpu and cpu_dec is None:
+                cpu_dec = new_decoder("cpu")
+            if not use_cpu and gpu_dec is None:
+                gpu_dec = new_decoder("cuda")
+            active_dec = cpu_dec if use_cpu else gpu_dec
+            try:
+                f = active_dec.get_frames_in_range(
+                    start=fr, stop=fr + 1).data[0]
+            except RuntimeError as exc:
+                if use_cpu:
+                    cpu_dec = new_decoder("cpu")
+                    f = cpu_dec.get_frames_in_range(
+                        start=fr, stop=fr + 1).data[0]
+                else:
+                    print(f"[warn] CUDA seek failed; using CPU for frame {fr}: {exc}")
+                    gpu_dec = None
+                    if cpu_dec is None:
+                        cpu_dec = new_decoder("cpu")
+                    f = cpu_dec.get_frames_in_range(
+                        start=fr, stop=fr + 1).data[0]
+            _, h, w = f.shape
+            th = max(1, round(h * thumb_w / w))
+            thumb = tvf.resize(f, [th, thumb_w], antialias=True)
+            img = thumb.permute(1, 2, 0).contiguous().cpu().numpy()
+        return img.astype(np.uint8, copy=False)
 
-    return lambda fr: _decode(int(fr))
+    return (lambda fr, random_access=False:
+            _decode(int(fr), bool(random_access))), fps
 
 
 def load_hand_track(path):
@@ -125,6 +184,11 @@ def main():
     ap.add_argument("recording")
     ap.add_argument("--trajectory", default=None,
                      help="default: <recording>/derived/trajectory.npz")
+    ap.add_argument(
+        "--loop-candidates",
+        default=None,
+        help="optional JSONL loop candidates to overlay as paired frustums",
+    )
     ap.add_argument("--video", default=None, help="default: <recording>/left.mp4")
     ap.add_argument("--video-right", default=None,
                      help="default: <recording>/right.mp4 -- only needed for "
@@ -135,6 +199,8 @@ def main():
                           "video frame/eye/px of its first observation (needs "
                           "trajectory.npz's point_first_* fields, written by "
                           "vio_bundle_adjust.py). depth: percentile colormap.")
+    ap.add_argument("--no-color", action="store_true",
+                    help="skip video decoding and render landmarks in one color")
     ap.add_argument("--hands-left", default=None,
                      help="left-hand stereo3d jsonl (hands/stereo_optimize.py "
                           "output; default: <recording>/derived/hands3d_left.jsonl "
@@ -143,20 +209,33 @@ def main():
                      help="right-hand stereo3d jsonl (default: "
                           "<recording>/derived/hands3d_right.jsonl if present)")
     ap.add_argument("--mano", default="/tmp/mano_jax.npz")
-    ap.add_argument("--thumb-w", type=int, default=480)
+    ap.add_argument("--thumb-w", type=int, default=320,
+                    help="thumbnail width sent to viser (default: 320)")
+    ap.add_argument("--video-device", choices=("auto", "cuda", "cpu"),
+                    default="auto",
+                    help="torchcodec decode device; auto uses CUDA when available")
+    ap.add_argument("--playback-fps", type=float, default=40.0,
+                    help="video timeline rate (default: 40)")
     ap.add_argument("--point-size", type=float, default=0.005)
     ap.add_argument("--frustum-scale", type=float, default=0.03)
     ap.add_argument("--trail-line-width", type=float, default=0.5,
                      help="static trail frustums drawn thin so the bright "
                           "current-frame frustums pop")
+    ap.add_argument("--trail-path-width", type=float, default=2.5,
+                    help="width of the connected camera path")
     ap.add_argument("--current-line-width", type=float, default=3.0)
+    ap.add_argument("--camera-eyes", choices=("left", "both"), default="both",
+                    help="camera frustums to render")
+    ap.add_argument("--trail-stride", type=int, default=1,
+                    help="render one static trail frustum every N poses")
     ap.add_argument("--port", type=int, default=8081)
     ap.add_argument("--share", action="store_true",
-                     help="request a public viser share-tunnel URL (no SSH forward needed)")
-    ap.add_argument("--trail-stride", type=int, default=50,
-                     help="draw a trail frustum every Nth frame (the full path is a "
-                          "polyline); avoids 2*n_frames frustum objects choking the browser")
+                    help="request a public viser share-tunnel URL")
     args = ap.parse_args()
+    if args.trail_stride < 1:
+        ap.error("--trail-stride must be at least 1")
+    if args.playback_fps <= 0:
+        ap.error("--playback-fps must be positive")
 
     derived = os.path.join(args.recording, "derived")
     traj_path = args.trajectory or os.path.join(derived, "trajectory.npz")
@@ -217,11 +296,22 @@ def main():
 
     left_frame = None
     if os.path.exists(video_path):
-        left_frame = make_frame_loader(video_path, args.thumb_w)
+        left_frame, detected_video_fps = make_frame_loader(
+            video_path, args.thumb_w, args.video_device)
+        if abs(detected_video_fps - args.playback_fps) > 0.01:
+            print(f"playback: {args.playback_fps:g} fps "
+                  f"(container reports {detected_video_fps:g} fps)")
     else:
         print(f"[warn] no video at {video_path} -- running without thumbnail panel")
 
-    if args.color_mode == "pixel" and "point_first_frame" in d:
+    if len(points) == 0:
+        point_colors = np.empty((0, 3), np.float32)
+        print("trajectory has no landmarks; showing cameras and hands only")
+    elif args.no_color:
+        point_colors = np.tile(
+            np.array([[0.62, 0.68, 0.72]], np.float32), (len(points), 1))
+        print(f"{len(points)} landmarks shown without video colors")
+    elif args.color_mode == "pixel" and "point_first_frame" in d:
         # Sample each landmark's color from the full-res frame at its exact
         # pixel. Landmarks sorted by frame, decoded SEQUENTIALLY -- random
         # per-landmark seeks were still running after 20+ min on ~20k
@@ -287,35 +377,114 @@ def main():
 
     server = viser.ViserServer(port=args.port)
     if args.share:
-        share_url = server.request_share_url()
-        print(f"SHARE URL: {share_url}", flush=True)
+        print(f"SHARE URL: {server.request_share_url()}", flush=True)
     server.scene.world_axes.visible = False
     server.scene.set_up_direction("+z")  # stage-5 world is gravity-aligned
 
-    pc = server.scene.add_point_cloud(
-        "/landmarks", points=points[keep_points], colors=point_colors[keep_points],
-        point_size=args.point_size, point_shape="circle")
+    if keep_points.any():
+        server.scene.add_point_cloud(
+            "/landmarks", points=points[keep_points],
+            colors=point_colors[keep_points],
+            point_size=args.point_size, point_shape="circle")
 
-    # Full trajectory as ONE polyline through the left-cam centers — NOT a
-    # frustum per frame (2*n_frames frustum objects tanks the browser at
-    # multi-minute scale; jkerr's original was sized for ~900 frames). Sparse
-    # trail frustums (every --trail-stride) give orientation cues along the path.
-    seg = np.stack([cam_pos_world[:-1], cam_pos_world[1:]], axis=1)   # (n-1,2,3)
-    server.scene.add_line_segments("/trail/path", seg.astype(np.float32),
-                                   colors=(150, 100, 30), line_width=1.5)
-    for i in range(0, n_frames, max(1, args.trail_stride)):
+    trail_segments = np.stack(
+        [cam_pos_world[:-1], cam_pos_world[1:]], axis=1).astype(np.float32)
+    server.scene.add_line_segments(
+        "/trail/path",
+        points=trail_segments,
+        line_width=args.trail_path_width,
+        colors=(255, 176, 32),
+    )
+    if args.loop_candidates:
+        frame_to_slot = {
+            int(frame): index for index, frame in enumerate(frame_idx)}
+        palette = [
+            (255, 77, 109),
+            (0, 201, 167),
+            (89, 161, 255),
+            (255, 190, 64),
+            (190, 110, 255),
+            (0, 190, 230),
+            (255, 118, 72),
+            (120, 220, 90),
+        ]
+        with open(args.loop_candidates) as f:
+            loop_candidates = [
+                json.loads(line) for line in f if line.strip()]
+        loop_images = {}
+        for candidate_index, candidate in enumerate(loop_candidates):
+            slots = []
+            for key in ("frame_a", "frame_b"):
+                candidate_frame = int(candidate[key])
+                if candidate_frame in frame_to_slot:
+                    slots.append(frame_to_slot[candidate_frame])
+                else:
+                    slots.append(int(np.argmin(
+                        np.abs(frame_idx - candidate_frame))))
+            slot_a, slot_b = slots
+            color = palette[candidate_index % len(palette)]
+            server.scene.add_line_segments(
+                f"/loops/{candidate_index:02d}/chord",
+                points=np.asarray([[
+                    cam_pos_world[slot_a],
+                    cam_pos_world[slot_b],
+                ]], np.float32),
+                line_width=4.0,
+                colors=color,
+            )
+            for endpoint, slot in (("a", slot_a), ("b", slot_b)):
+                video_frame = int(frame_idx[slot])
+                if video_frame not in loop_images and left_frame is not None:
+                    try:
+                        loop_images[video_frame] = left_frame(
+                            video_frame, random_access=True)
+                    except (RuntimeError, IndexError) as exc:
+                        print(
+                            f"[warn] loop thumbnail unavailable for frame "
+                            f"{video_frame}: {exc}")
+                        loop_images[video_frame] = None
+                server.scene.add_camera_frustum(
+                    f"/loops/{candidate_index:02d}/{endpoint}",
+                    fov=1.4,
+                    aspect=1.2,
+                    scale=args.frustum_scale * 2.5,
+                    line_width=3.0,
+                    color=np.asarray(color, np.float32) / 255.0,
+                    image=loop_images.get(video_frame),
+                    format="jpeg",
+                    jpeg_quality=85,
+                    wxyz=cam_quat_world[slot],
+                    position=cam_pos_world[slot],
+                )
+        print(
+            f"{len(loop_candidates)} loop candidates overlaid from "
+            f"{args.loop_candidates}")
+
+    # Static frustums show the trajectory shape; bright current frustums update
+    # at full rate even when the trail is subsampled.
+    for i in range(0, n_frames, args.trail_stride):
         server.scene.add_camera_frustum(
-            f"/trail/cam_l_{i}", fov=1.4, aspect=1.2, scale=args.frustum_scale * 0.5,
+            f"/trail/cam_l_{i}", fov=1.4, aspect=1.2, scale=args.frustum_scale * 0.6,
             line_width=args.trail_line_width,
             color=(0.6, 0.4, 0.1), wxyz=cam_quat_world[i], position=cam_pos_world[i])
+        if args.camera_eyes == "both":
+            server.scene.add_camera_frustum(
+                f"/trail/cam_r_{i}", fov=1.4, aspect=1.2,
+                scale=args.frustum_scale * 0.6,
+                line_width=args.trail_line_width,
+                color=(0.1, 0.4, 0.5), wxyz=cam_quat_world_r[i],
+                position=cam_pos_world_r[i])
     current_frustum_l = server.scene.add_camera_frustum(
         "/current_left", fov=1.4, aspect=1.2, scale=args.frustum_scale,
         line_width=args.current_line_width,
         color=(1.0, 0.6, 0.0), wxyz=cam_quat_world[0], position=cam_pos_world[0])
-    current_frustum_r = server.scene.add_camera_frustum(
-        "/current_right", fov=1.4, aspect=1.2, scale=args.frustum_scale,
-        line_width=args.current_line_width,
-        color=(0.0, 0.8, 1.0), wxyz=cam_quat_world_r[0], position=cam_pos_world_r[0])
+    current_frustum_r = None
+    if args.camera_eyes == "both":
+        current_frustum_r = server.scene.add_camera_frustum(
+            "/current_right", fov=1.4, aspect=1.2, scale=args.frustum_scale,
+            line_width=args.current_line_width,
+            color=(0.0, 0.8, 1.0), wxyz=cam_quat_world_r[0],
+            position=cam_pos_world_r[0])
 
     n_v = int(np.asarray(faces).max()) + 1 if faces is not None else 0
     mesh_h = {name: server.scene.add_mesh_simple(
@@ -335,7 +504,16 @@ def main():
         with _update_lock:
             fr = int(gui_frame.value)
             vframe = int(frame_idx[fr])
-            img = left_frame(vframe) if left_frame is not None else None
+            img = None
+            if left_frame is not None:
+                try:
+                    user_scrub = (
+                        _ is not None and getattr(_, "client_id", None) is not None)
+                    img = left_frame(vframe, random_access=user_scrub)
+                except (RuntimeError, IndexError) as exc:
+                    # Keep the previous thumbnail. A bad video seek must not
+                    # take down trajectory/hand scrubbing or the play loop.
+                    print(f"[warn] thumbnail unavailable for frame {vframe}: {exc}")
             lines = [
                 f"pose slot {fr} (video frame {vframe})",
                 f"  cam position (world): {cam_pos_world[fr]}",
@@ -351,8 +529,9 @@ def main():
             with server.atomic():
                 current_frustum_l.wxyz = cam_quat_world[fr]
                 current_frustum_l.position = cam_pos_world[fr]
-                current_frustum_r.wxyz = cam_quat_world_r[fr]
-                current_frustum_r.position = cam_pos_world_r[fr]
+                if current_frustum_r is not None:
+                    current_frustum_r.wxyz = cam_quat_world_r[fr]
+                    current_frustum_r.position = cam_pos_world_r[fr]
                 for name in hand_tracks:
                     if name in hand_verts:
                         mesh_h[name].vertices = hand_verts[name]
@@ -369,11 +548,39 @@ def main():
     print(f"viser running on port {args.port} -- forward it: "
           f"ssh -L {args.port}:localhost:{args.port} <host>")
 
+    play_started_at = None
+    play_started_slot = fmin
+    last_play_slot = None
     while True:
-        if gui_play.value:
-            nxt = int(gui_frame.value) + 1
-            gui_frame.value = fmin if nxt > fmax else nxt
-        time.sleep(1.0 / 30.0)
+        if not gui_play.value:
+            play_started_at = None
+            last_play_slot = None
+            time.sleep(0.01)
+            continue
+
+        current_slot = int(gui_frame.value)
+        if (play_started_at is None
+                or (last_play_slot is not None and current_slot != last_play_slot)):
+            # Start/rebase playback here, including when the user scrubs while
+            # play remains enabled.
+            play_started_at = time.monotonic()
+            play_started_slot = current_slot
+
+        elapsed = time.monotonic() - play_started_at
+        target_video_frame = (
+            float(frame_idx[play_started_slot]) + elapsed * args.playback_fps)
+        if target_video_frame > float(frame_idx[fmax]):
+            play_started_at = time.monotonic()
+            play_started_slot = fmin
+            target_slot = fmin
+        else:
+            target_slot = int(np.searchsorted(
+                frame_idx, target_video_frame, side="right") - 1)
+        target_slot = max(fmin, target_slot)
+        if target_slot != current_slot:
+            gui_frame.value = target_slot
+        last_play_slot = target_slot
+        time.sleep(0.005)
 
 
 if __name__ == "__main__":

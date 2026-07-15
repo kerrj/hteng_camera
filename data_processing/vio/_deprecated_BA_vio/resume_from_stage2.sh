@@ -4,11 +4,11 @@
 set -e
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate jaxgpu
-cd ~/hteng_camera/data_processing/vio
+cd ~/hteng_camera/data_processing/vio/_deprecated_BA_vio
 export CUDA_VISIBLE_DEVICES=2
 
-REC=../../long-test1
-OUT=out/long-test1
+REC=../../../long-test1
+OUT=../out/long-test1
 
 echo "=== STAGE 2: match pairs ($(date)) ==="
 python vio_match_pairs.py "$REC" --features "$OUT/features.h5" --out "$OUT/matches.jsonl"
