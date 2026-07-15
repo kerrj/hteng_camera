@@ -258,3 +258,18 @@ a blurry frame. THEN phase 2 (temporal) / phase 3 (mono fill).
   upstream support; ICP recovers the local slop. NOTE: VGGT world
   frame has a different yaw gauge than the old trajectory.npz --
   never mix trajectories within one segment build chain.
+- 2026-07-15 (later): **user vetoed 15Hz VGGT builds -- oversmoothed.**
+  Root cause: 15Hz keyframes + spline interpolation lose head tremor;
+  true local error is ~27mm median (open-gate ICP measured it; the
+  4.5cm gate had been silently REJECTING most corrections -> frames
+  integrated at bad poses -> TSDF blur). Ladder on segment C pass-1
+  ICP |t| median: BA 9.9mm < VGGT@40Hz 19mm (`--target-fps 45` ->
+  step 1.0, no interpolation; 30min on 3 GPUs) < VGGT@15Hz 27mm.
+  VGGT translation noise between tiny 40Hz baselines keeps it above
+  BA. For TSDF work on long-test2 use the BA trajectory.npz.
+- 2026-07-15 (later): **FULL FoundationStereo depth is the decisive
+  quality win** (`--model-family full`, ViT-L 23-51-11, 32 iters,
+  ~10.7s/frame at native tiles): chair/floor nearly hole-free, far
+  fewer floaters (`out/lt2_segC_final_bakeoff.png`, bottom row).
+  Winning recipe: BA trajectory + full-FS depth + 1280px/3mm + ICP
+  gate 4.5 + recolor. Depth stacks: `out/lt2_video_fsfull*`.
