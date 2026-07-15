@@ -61,7 +61,7 @@ def ffs_batch(model, tiles_l, tiles_r, dev, chunk=0):
         for i in range(0, len(a), k):
             outs.append(model.forward(a[i:i + k], b[i:i + k],
                                       iters=model.args.valid_iters,
-                                      test_mode=True, optimize_build_volume="pytorch1"))
+                                      test_mode=True, **M.FORWARD_EXTRA))
     return padder.unpad(torch.cat(outs).float())             # (T,1,H,W) or (T,H,W)
 
 
@@ -94,7 +94,7 @@ def worker(args):
     Kl, Dl, Kr, Dr, Rs, ts, b_hat, baseline = M.load_calib(
         args.calib_dir, args.left_serial, args.right_serial, dev)
     model = M.load_ffs(args.weights, dev, valid_iters=args.iters,
-                       max_disp=args.max_disp)
+                       max_disp=args.max_disp, family=args.model_family)
     fx, H, dirs, Rv_ls, Rv_rs = build_geom(b_hat, Rs, args.tile_w, args.hfov, args.vfov, dev)
 
     to_t = lambda b: torch.tensor(cv2.cvtColor(b, cv2.COLOR_BGR2RGB),
@@ -172,6 +172,7 @@ def launcher(args):
                "--hfov", str(args.hfov), "--vfov", str(args.vfov),
                "--scale", str(args.scale), "--iters", str(args.iters),
                "--max-disp", str(args.max_disp), "--tile-chunk", str(args.tile_chunk),
+               "--model-family", args.model_family,
                "--min-disp", str(args.min_disp), "--max-depth", str(args.max_depth)]
         if args.video_right:
             cmd += ["--video-right", args.video_right]
@@ -207,6 +208,10 @@ def main():
     ap.add_argument("--tile-chunk", type=int, default=0,
                     help="tiles per FFS forward (0 = all); use 1-2 for "
                          "native-res tiles to stay under cuDNN size limits")
+    ap.add_argument("--model-family", choices=("fast", "full"), default="fast",
+                    help="fast = distilled Fast-FoundationStereo; full = "
+                         "original ViT-L FoundationStereo (stronger on thin/"
+                         "textureless/shiny, ~10x slower)")
     ap.add_argument("--min-disp", type=float, default=1.0)
     ap.add_argument("--max-depth", type=float, default=20.0)
     args = ap.parse_args()

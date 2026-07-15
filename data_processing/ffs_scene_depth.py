@@ -41,8 +41,13 @@ import fisheye_pinhole as FP
 
 FFS_ROOT = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                         "third_party", "Fast-FoundationStereo")
+FS_ROOT = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                       "third_party", "FoundationStereo")
 DEFAULT_WEIGHTS = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                                "weights", "20-26-39", "model_best_bp2_serialize.pth")
+
+# set by load_ffs: extra forward() kwargs differ between model families
+FORWARD_EXTRA = {"optimize_build_volume": "pytorch1"}
 
 
 # --------------------------------------------------------------------------- #
@@ -60,11 +65,34 @@ def load_calib(calib_dir, ls, rs, device):
     return Kl, Dl, Kr, Dr, Rs, ts, b_hat, baseline
 
 
-def load_ffs(weights, device, valid_iters=8, max_disp=192):
+def load_ffs(weights, device, valid_iters=8, max_disp=192, family="fast"):
+    """family='fast': distilled Fast-FoundationStereo (serialized module).
+    family='full': original ViT-L FoundationStereo (cfg.yaml + state dict) --
+    much stronger on thin/textureless/shiny surfaces; ~10x slower. The two
+    repos both ship packages named `core`/`Utils`, so exactly ONE root goes
+    on sys.path per process."""
+    global InputPadder, AMP_DTYPE, FORWARD_EXTRA
+    if family == "full":
+        sys.path.insert(0, FS_ROOT)
+        from omegaconf import OmegaConf
+        from core.utils.utils import InputPadder
+        from core.foundation_stereo import FoundationStereo
+        AMP_DTYPE = torch.bfloat16
+        FORWARD_EXTRA = {}
+        cfg = OmegaConf.load(os.path.join(os.path.dirname(weights), "cfg.yaml"))
+        if "vit_size" not in cfg:
+            cfg["vit_size"] = "vitl"
+        cfg.valid_iters = valid_iters
+        cfg.max_disp = max_disp
+        model = FoundationStereo(cfg)
+        ckpt = torch.load(weights, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        model.args = cfg
+        return model.to(device).eval()
     sys.path.insert(0, FFS_ROOT)
-    global InputPadder, AMP_DTYPE
     from core.utils.utils import InputPadder
     from Utils import AMP_DTYPE
+    FORWARD_EXTRA = {"optimize_build_volume": "pytorch1"}
     model = torch.load(weights, map_location="cpu", weights_only=False)
     model.args.valid_iters = valid_iters
     model.args.max_disp = max_disp
@@ -130,7 +158,7 @@ def ffs_disparity(model, tileL, tileR, device):
     a, b = padder.pad(a, b)
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=True, dtype=AMP_DTYPE):
         disp = model.forward(a, b, iters=model.args.valid_iters,
-                             test_mode=True, optimize_build_volume="pytorch1")
+                             test_mode=True, **FORWARD_EXTRA)
     disp = padder.unpad(disp.float()).cpu().numpy().reshape(H, W)
     return disp
 
