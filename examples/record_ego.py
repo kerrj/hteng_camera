@@ -146,10 +146,22 @@ from hteng_camera.imu import ImuSample, YbImu
 # ---------------------------------------------------------------------------
 
 def _speak(msg: str) -> None:
-    """Fire-and-forget TTS via macOS `say`. No-op on other platforms."""
+    """Fire-and-forget TTS via macOS `say`. No-op on other platforms.
+
+    The leading ``[[slnc 1000]]`` (an Apple speech-synthesis embedded command,
+    a second of silence) is for Bluetooth output: while the AirPods mic is
+    held by the recording, macOS keeps them on the HFP/SCO telephony profile,
+    and (re)opening that output route eats the first fraction of a second of
+    audio — without the pad, short phrases get clipped or lost entirely.
+    """
     if platform.system() == "Darwin":
-        subprocess.Popen(["say", msg],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # start_new_session: detach from our process group so the announcement
+        # finishes even if the group is signalled right after (second Ctrl+C,
+        # wrapper-shell teardown) or this process exits — otherwise the final
+        # "saved"/"failed" line, still inside its silence pad, dies with us.
+        subprocess.Popen(["say", f"[[slnc 1000]] {msg}"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
 
 
 def _elapsed_str(seconds: float) -> str:
@@ -415,7 +427,17 @@ def _ffmpeg_cmd(encoder: str, w: int, h: int, fps: int, quality: int,
         "-color_primaries", "bt709",
         "-color_trc", _TRANSFER_TRC[transfer],
         "-color_range", "pc",
-        "-movflags", "+faststart",
+        # Fragmented MP4: a moof/mdat pair lands on disk every keyframe (~0.3 s
+        # with videotoolbox), so a crash/power loss mid-recording loses only the
+        # in-flight fragment instead of the whole file (a plain MP4 without its
+        # end-of-file moov is unreadable). NOT +faststart: its finalization pass
+        # rewrites the entire file, which for an hour-long take outlives the
+        # teardown wait and gets killed mid-rewrite, corrupting the output.
+        # Trade-off: no nb_frames in the container (readers estimate it from
+        # duration x fps, which is exact here since pipe input gives every frame
+        # an exact 1/fps PTS) and slightly slower seeking. ffmpeg/OpenCV/
+        # torchcodec all decode fragmented MP4 via libavformat.
+        "-movflags", "+frag_keyframe+empty_moov",
         output,
     ]
 
@@ -508,10 +530,19 @@ class _ImuCsvWriter:
 
     def __init__(self, path: Path) -> None:
         self._lock = threading.Lock()
-        self._file = open(path, "w", newline="")
+        # buffering=1 (line buffered): each row reaches the OS as written, so a
+        # hard kill/power loss can't strand seconds of samples in the process
+        # buffer — the CSVs stay as crash-durable as the fragmented MP4s.
+        self._file = open(path, "w", newline="", buffering=1)
         self._writer = csv.writer(self._file)
         self._writer.writerow(self._COLUMNS)
         self._count = 0
+        # Heartbeat for the main loop's watchdog. Updated from YbImu's receive
+        # thread on every sample, so it goes quiet on ANY failure upstream of
+        # here: serial unplug (read raises, receive thread dies), a wedged
+        # port (reads return nothing), or this writer itself raising (full
+        # disk). Single float store under the GIL — no lock needed to read.
+        self.last_sample_t = time.perf_counter()
 
     def on_sample(self, sample: ImuSample) -> None:
         """Callback for ``YbImu.start(on_raw_sample=...)``. Writes
@@ -520,6 +551,7 @@ class _ImuCsvWriter:
         "IMU synchronization" section for how this lines up with
         ``sync_log.csv``'s camera timestamps via the recorded
         ``cam_reset_perf_counter_us`` offset."""
+        self.last_sample_t = time.perf_counter()
         with self._lock:
             self._writer.writerow([
                 self._count, int(sample.host_time_s * 1e6),
@@ -534,23 +566,82 @@ class _ImuCsvWriter:
             self._file.close()
 
 
-def _capture_master(cam: HTCamera, box: _MasterQueue, stop: threading.Event) -> None:
+class _CaptureHealth:
+    """Shared liveness/failure state between the capture+encode threads and the
+    main loop's watchdog.
+
+    Two failure modes need catching on a long unattended run, and neither stops
+    the process on its own: a capture thread DYING (grab_bayer12 can raise on a
+    bad packed-frame size or an exhausted control-channel retry) and a capture
+    thread SPINNING on a camera that stopped delivering (USB drop makes every
+    grab time out and return None). Both otherwise record silence for the rest
+    of the session while the elapsed-time announcer keeps sounding healthy —
+    worse than crashing. ``beat`` timestamps each delivered frame per side;
+    ``fail`` records the first fatal error. Plain dict/attr writes under the
+    GIL — no lock needed for these single-word updates.
+    """
+
+    def __init__(self) -> None:
+        now = time.perf_counter()
+        self._last = {"left": now, "right": now}
+        self.error: Optional[str] = None
+
+    def beat(self, side: str) -> None:
+        self._last[side] = time.perf_counter()
+
+    def fail(self, msg: str) -> None:
+        if self.error is None:      # first failure wins; later ones are fallout
+            self.error = msg
+
+    def stalled(self, timeout_s: float) -> list[str]:
+        """Sides that haven't delivered a frame within ``timeout_s``."""
+        now = time.perf_counter()
+        return [s for s in ("left", "right") if now - self._last[s] > timeout_s]
+
+
+def _pre_reset(ts_us: int, reset_perf_us: int) -> bool:
+    """True for a frame captured BEFORE reset_timestamp() ran, still sitting in
+    the SDK's buffer when streaming (re)started: its timestamp is on the
+    camera's old clock (typically hundreds of seconds), so it must not enter
+    the pairing/sync path — it pollutes the first sync_log rows with ±100 s
+    "skews" and pairs garbage frames. A genuine post-reset frame's timestamp
+    can't exceed the time elapsed since the reset instant; allow 1 s of margin
+    for camera-crystal drift (~100 ppm ⇒ well under 1 s even over hours)."""
+    elapsed_us = time.perf_counter() * 1e6 - reset_perf_us
+    return ts_us > elapsed_us + 1e6
+
+
+def _capture_master(cam: HTCamera, box: _MasterQueue, stop: threading.Event,
+                    health: _CaptureHealth, reset_perf_us: int) -> None:
     """Grab left (master) Bayer planes and enqueue every one in arrival order."""
-    while not stop.is_set():
-        bayer, info = cam.grab_bayer12()
-        if bayer is None:
-            continue
-        box.put(info["time"], bayer)
+    try:
+        while not stop.is_set():
+            bayer, info = cam.grab_bayer12()
+            if bayer is None:
+                continue
+            health.beat("left")           # the camera is alive either way
+            if _pre_reset(info["time"], reset_perf_us):
+                continue
+            box.put(info["time"], bayer)
+    except Exception as e:
+        health.fail(f"left camera capture thread crashed: {e!r}")
 
 
-def _capture_slave(cam: HTCamera, ring: _Ring, stop: threading.Event) -> None:
+def _capture_slave(cam: HTCamera, ring: _Ring, stop: threading.Event,
+                   health: _CaptureHealth, reset_perf_us: int) -> None:
     """Grab right (slave) Bayer planes into the ring so the encoder can pick the
     one nearest each master timestamp."""
-    while not stop.is_set():
-        bayer, info = cam.grab_bayer12()
-        if bayer is None:
-            continue
-        ring.put(info["time"], bayer)
+    try:
+        while not stop.is_set():
+            bayer, info = cam.grab_bayer12()
+            if bayer is None:
+                continue
+            health.beat("right")          # the camera is alive either way
+            if _pre_reset(info["time"], reset_perf_us):
+                continue
+            ring.put(info["time"], bayer)
+    except Exception as e:
+        health.fail(f"right camera capture thread crashed: {e!r}")
 
 
 def _measure_native_hz(cam: HTCamera, n: int = 30) -> Optional[float]:
@@ -595,6 +686,7 @@ def _encode_loop_stereo(
     stride: int,
     transfer: str,
     sync_csv: Path,
+    health: _CaptureHealth,
     ae: Optional[dict] = None,
 ) -> None:
     """Emit one encoded pair per (stride-th) LEFT frame the sensor delivers,
@@ -637,59 +729,69 @@ def _encode_loop_stereo(
     frame_idx = 0        # emitted pairs (== output frame count)
     master_seen = 0      # master frames pulled since streaming began (for stride)
 
-    with open(sync_csv, "w", newline="") as f:
-        log = csv.writer(f)
-        log.writerow(["frame", "t_left_us", "t_right_us", "skew_us", "fresh"])
+    try:
+        # buffering=1: flush each row to the OS so a hard kill can't strand the
+        # sync log's tail while the fragmented MP4s keep their frames.
+        with open(sync_csv, "w", newline="", buffering=1) as f:
+            log = csv.writer(f)
+            log.writerow(["frame", "t_left_us", "t_right_us", "skew_us", "fresh"])
 
-        while not stop.is_set():
-            ref = left["box"].take(timeout=0.5)
-            if ref is None:
-                continue                         # no frame yet; re-check stop
-            t_left, bayer_left = ref
+            while not stop.is_set():
+                ref = left["box"].take(timeout=0.5)
+                if ref is None:
+                    continue                     # no frame yet; re-check stop
+                t_left, bayer_left = ref
 
-            match = right["ring"].nearest(t_left)
-            if match is None:
-                continue                         # right not warmed up; pre-roll
-            t_right, bayer_right = match
+                match = right["ring"].nearest(t_left)
+                if match is None:
+                    continue                     # right not warmed up; pre-roll
+                t_right, bayer_right = match
 
-            # Integer decimation on the uniform master stream. master_seen only
-            # advances once the right side is live, so warmup frames don't shift
-            # the stride phase.
-            keep = (master_seen % stride == 0)
-            master_seen += 1
-            if not keep:
-                continue
+                # Integer decimation on the uniform master stream. master_seen
+                # only advances once the right side is live, so warmup frames
+                # don't shift the stride phase.
+                keep = (master_seen % stride == 0)
+                master_seen += 1
+                if not keep:
+                    continue
 
-            # Software AE: meter the master's raw Bayer, apply the same
-            # exposure/gain to both cameras (flash-free, anti-flicker on).
-            if ae is not None:
-                ctrl = ae["ctrl"]
-                new_exp, new_gain, _ = ctrl.update(
-                    bayer_left, ae["exp"], ae["gain"])
-                try:
-                    ae["exp"], ae["gain"] = ctrl.apply(
-                        ae["cams"], new_exp, new_gain, ae["exp"], ae["gain"])
-                except Exception:
-                    pass                         # a wedged control write must not
+                # Software AE: meter the master's raw Bayer, apply the same
+                # exposure/gain to both cameras (flash-free, anti-flicker on).
+                if ae is not None:
+                    ctrl = ae["ctrl"]
+                    new_exp, new_gain, _ = ctrl.update(
+                        bayer_left, ae["exp"], ae["gain"])
+                    try:
+                        ae["exp"], ae["gain"] = ctrl.apply(
+                            ae["cams"], new_exp, new_gain, ae["exp"], ae["gain"])
+                    except Exception:
+                        pass                     # a wedged control write must not
                                                  # stall the encode/sync loop
 
-            out_left = _encode(bayer_left, left["cv_code"], transfer, left["wb"])
-            out_right = _encode(bayer_right, right["cv_code"], transfer, right["wb"])
-            log.writerow([frame_idx, t_left, t_right, t_right - t_left, 1])
+                out_left = _encode(bayer_left, left["cv_code"], transfer, left["wb"])
+                out_right = _encode(bayer_right, right["cv_code"], transfer, right["wb"])
+                log.writerow([frame_idx, t_left, t_right, t_right - t_left, 1])
 
+                try:
+                    left["proc"].stdin.write(out_left.view(np.uint8))
+                    right["proc"].stdin.write(out_right.view(np.uint8))
+                except (BrokenPipeError, OSError):
+                    stop.set()                   # a dead pipe stops the pair
+                    break
+                frame_idx += 1
+    except Exception as e:
+        health.fail(f"encode thread crashed: {e!r}")
+        raise
+    finally:
+        # ALWAYS close the pipes — ffmpeg finalizes its output on stdin EOF.
+        # Skipping this on a crash (e.g. sync-CSV write failing on a full disk)
+        # would leave both encoders waiting until teardown kills them with the
+        # files unfinalized.
+        for s in (left, right):
             try:
-                left["proc"].stdin.write(out_left.view(np.uint8))
-                right["proc"].stdin.write(out_right.view(np.uint8))
-            except (BrokenPipeError, OSError):
-                stop.set()                       # a dead pipe stops the pair
-                break
-            frame_idx += 1
-
-    for s in (left, right):
-        try:
-            s["proc"].stdin.close()
-        except OSError:
-            pass
+                s["proc"].stdin.close()
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1283,6 +1385,15 @@ def main() -> None:
              "8 is plenty at the sensor's native rate.",
     )
     ap.add_argument(
+        "--watchdog-sec", type=float, default=5.0,
+        help="Abort the recording (loudly, with a spoken alert) if either "
+             "camera — or the IMU, when logging one — delivers nothing for "
+             "this many seconds: a USB/serial stall or disconnect otherwise "
+             "records nothing for the rest of the session while sounding "
+             "healthy. All streams are finalized before exiting, so data up "
+             "to the failure is kept. 0 disables the watchdog.",
+    )
+    ap.add_argument(
         "--no-keep-awake", action="store_true",
         help="Don't keep the Mac awake. By default the recording blocks idle "
              "sleep (caffeinate) AND lid-close sleep (pmset disablesleep, needs "
@@ -1327,6 +1438,8 @@ def main() -> None:
         sys.exit("[error] --sync-buffer must be >= 1.")
     if not 0.0 < args.roi_height <= 1.0:
         sys.exit("[error] --roi-height must be in (0, 1].")
+    if args.watchdog_sec < 0:
+        sys.exit("[error] --watchdog-sec must be >= 0 (0 disables).")
     if not 10 <= args.imu_rate <= 100:
         sys.exit("[error] --imu-rate must be in [10, 100] (firmware hard-caps at 100 anyway).")
 
@@ -1398,6 +1511,12 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    free_gb = shutil.disk_usage(out_dir).free / 1e9
+    if free_gb < 100:
+        print(f"[warn] only {free_gb:.0f} GB free on the recording disk — a "
+              "long stereo take can use tens of GB, and a full disk aborts "
+              "the recording mid-run.")
+        _speak("low disk space warning")
     out_left = str(out_dir / "left.mp4")
     out_right = str(out_dir / "right.mp4")
     out_audio = out_dir / "audio.mka"
@@ -1658,6 +1777,7 @@ def main() -> None:
 
     # ── Producers (left FIFO / right ring) + one shared encode thread ────────
     stop = threading.Event()
+    health = _CaptureHealth()
     box_left = _MasterQueue(args.sync_buffer)
     ring_right = _Ring(args.sync_buffer)
 
@@ -1668,20 +1788,28 @@ def main() -> None:
     sync_csv = out_dir / "sync_log.csv"
 
     cap_threads = [
-        threading.Thread(target=_capture_master, args=(cam_left, box_left, stop),
+        threading.Thread(target=_capture_master,
+                         args=(cam_left, box_left, stop, health,
+                               cam_reset_perf_counter_us),
                          daemon=True, name="hteng-capture-left"),
-        threading.Thread(target=_capture_slave, args=(cam_right, ring_right, stop),
+        threading.Thread(target=_capture_slave,
+                         args=(cam_right, ring_right, stop, health,
+                               cam_reset_perf_counter_us),
                          daemon=True, name="hteng-capture-right"),
     ]
     enc_thread = threading.Thread(
         target=_encode_loop_stereo,
-        args=(left, right, stop, stride, args.transfer, sync_csv, ae),
+        args=(left, right, stop, stride, args.transfer, sync_csv, health, ae),
         name="hteng-encode",
     )
     for t in cap_threads:
         t.start()
     enc_thread.start()
-    _speak("recording")
+    # A longer phrase on purpose: this fires moments after the audio ffmpeg
+    # claims the AirPods mic, while the Bluetooth SCO route is still settling —
+    # even with _speak's silence pad the first syllables can get clipped, and a
+    # one-word message can vanish entirely.
+    _speak("recording is now started")
     _start_announcer(stop)
 
     # ── Wait for duration / Ctrl+C ───────────────────────────────────────────
@@ -1707,6 +1835,8 @@ def main() -> None:
 
     stopped_intentionally = False
     audio_failed_reported = False
+    failure: Optional[str] = None
+    failure_speech = "camera failure, stopping the recording"
     try:
         print("[info] Recording… press Ctrl+C to stop.")
         t_end = None if args.duration is None else time.perf_counter() + args.duration
@@ -1720,9 +1850,38 @@ def main() -> None:
                 stopped_intentionally = True
                 _speak("done")
                 break
+            # Watchdog: a dead/crashed capture thread or a camera that stopped
+            # delivering frames would otherwise record nothing for the rest of
+            # an unattended session while sounding healthy. Abort loudly; the
+            # normal teardown below still finalizes every stream, so data up to
+            # the failure is preserved (fragmented MP4 needs no trailer).
+            if health.error is not None:
+                failure = health.error
+                break
+            if args.watchdog_sec > 0:
+                stalled = health.stalled(args.watchdog_sec)
+                if stalled:
+                    failure = (
+                        f"no frames from the {' or '.join(stalled)} camera for "
+                        f"{args.watchdog_sec:.0f} s (USB stall/disconnect?)")
+                    break
+                # IMU watchdog (only when IMU logging is on): samples arrive at
+                # >=10 Hz, so a multi-second silence means the serial link
+                # dropped or the receive thread died — either would otherwise
+                # log nothing for the rest of the session. A take without its
+                # IMU tail is useless for the VIO solve, so stop everything
+                # (finalized, loudly) rather than record on without it.
+                if (imu_csv is not None
+                        and time.perf_counter() - imu_csv.last_sample_t
+                            > args.watchdog_sec):
+                    failure = (
+                        f"no IMU samples for {args.watchdog_sec:.0f} s "
+                        f"(serial stall/disconnect on {imu.port}?)")
+                    failure_speech = "I M U failure, stopping the recording"
+                    break
             if proc_left.poll() is not None or proc_right.poll() is not None:
-                print("[warn] an ffmpeg exited early — stopping.")
-                _speak("error")
+                failure = "a video ffmpeg process exited early"
+                failure_speech = "encoder failure, stopping the recording"
                 break
             if (audio_proc is not None and audio_proc.poll() is not None
                     and not audio_failed_reported):
@@ -1730,6 +1889,13 @@ def main() -> None:
                 print(f"[warn] audio ffmpeg exited early with code "
                       f"{audio_proc.returncode}; camera recording continues.")
             time.sleep(0.1)
+        # The encode thread exiting on its own (loop condition) is also a
+        # failure if it crashed rather than being stopped.
+        if failure is None and health.error is not None:
+            failure = health.error
+        if failure is not None:
+            print(f"[error] {failure} — stopping and finalizing all streams.")
+            _speak(failure_speech)
     finally:
         signal.signal(signal.SIGINT, prev_sigint)      # restore for teardown
 
@@ -1791,10 +1957,21 @@ def main() -> None:
                   "(couldn't keep the sensor's pace) — they show as larger dt gaps "
                   "in sync_log, not silent decimation. Lower --fps / resolution or "
                   "raise --sync-buffer if this is high.")
-        _speak("saved")
+        if failure is None:
+            _speak("saved")
     else:
         print(f"[warn] ffmpeg exited with codes {rets} — output may be incomplete.")
-        _speak("save failed")
+        if failure is None:
+            _speak("save failed")
+
+    # A watchdog/thread failure is a crash, not a clean stop: everything above
+    # was still finalized (data up to the failure is on disk), but say so
+    # unmissably and exit nonzero so wrappers/scripts see it.
+    if failure is not None:
+        print(f"[error] RECORDING ABORTED: {failure}")
+        print("[error] Streams were finalized — data up to the failure is on disk.")
+        _speak("recording failed, check the terminal")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
