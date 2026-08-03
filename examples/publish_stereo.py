@@ -1,14 +1,14 @@
 """Publish a calibrated HTENG stereo pair as one self-describing ZMQ packet.
 
-The publisher owns camera discovery, timestamp reset/mapping, frame pairing,
-software auto-exposure, color conversion, and rig metadata. Consumers only need
-to decode ``eyeball-stereo-pair/1`` from ``ipc:///tmp/stereo_pair``.
+The publisher owns camera discovery, timestamp reset/mapping, startup phase
+alignment, frame pairing, software auto-exposure, color conversion, and rig
+metadata. Consumers only need to decode ``eyeball-stereo-pair/1`` from
+``ipc:///tmp/stereo_pair``.
 """
 
 from __future__ import annotations
 
 import argparse
-from collections import deque
 import json
 import math
 from pathlib import Path
@@ -33,10 +33,12 @@ from eye.transport import transport_classes
 
 
 PAIR_TOPIC = "ipc:///tmp/stereo_pair"
-RECORD_TOPIC = "ipc:///tmp/stereo_pair_record"
 STREAM_FORMAT = "eyeball-stereo-pair/1"
 RIG_FORMAT = "eyeball-stereo-rig/2"
 _MAGIC = b"ESTPAIR1"
+# Only bounds how long a queue read blocks so the loop can notice SIGINT — a
+# pair publishes the moment both sides have delivered, never on a timer.
+_STOP_POLL_S = 0.5
 _PREFIX = struct.Struct("<8sIQQ")
 _MJ_TO_CV = np.diag([1.0, -1.0, -1.0])
 _HEAD_FROM_CANONICAL_MJ = np.array(
@@ -276,28 +278,184 @@ def _reset_anchor(camera: HTCamera) -> float:
     return (before + after) / 2.0
 
 
-def _play_together(cameras: tuple[HTCamera, HTCamera]) -> None:
-    barrier = threading.Barrier(len(cameras) + 1)
-    errors = []
+def _stamp_stream(
+    camera: HTCamera,
+    anchor: float,
+    count: int,
+    output: list,
+    errors: list,
+) -> None:
+    try:
+        while len(output) < count:
+            bayer, info = camera.grab_bayer12(timeout_ms=500)
+            if bayer is None:
+                continue
+            stamp = anchor + int(info["time"]) * 1e-6
+            # Discard SDK-buffered frames from before reset_timestamp().
+            if stamp > time.perf_counter() + 1.0:
+                continue
+            output.append(stamp)
+    except Exception as exc:
+        errors.append(exc)
 
-    def play(camera: HTCamera) -> None:
-        try:
-            barrier.wait()
-            camera.play()
-        except Exception as exc:
-            errors.append(exc)
 
+def _measure_skew(
+    left: HTCamera,
+    right: HTCamera,
+    left_anchor: float,
+    right_anchor: float,
+    frames: int = 8,
+) -> tuple[float, float]:
+    """Return ``(skew_s, period_s)`` for the pair on the shared time base.
+
+    ``skew_s`` is how far the right sensor's exposures sit from the left's,
+    wrapped into ±period/2. Repeatable to a few tens of microseconds — the
+    hardware counters are quantised at 100 µs and do not drift apart.
+    """
+    left_stamps: list[float] = []
+    right_stamps: list[float] = []
+    errors: list = []
     threads = [
-        threading.Thread(target=play, args=(camera,), daemon=True)
-        for camera in cameras
+        threading.Thread(
+            target=_stamp_stream,
+            args=(camera, anchor, frames, stamps, errors),
+            daemon=True,
+        )
+        for camera, anchor, stamps in (
+            (left, left_anchor, left_stamps),
+            (right, right_anchor, right_stamps),
+        )
     ]
     for thread in threads:
         thread.start()
-    barrier.wait()
     for thread in threads:
-        thread.join()
+        thread.join(timeout=5.0)
     if errors:
-        raise RuntimeError(f"parallel camera start failed: {errors[0]}")
+        raise RuntimeError(f"skew measurement failed: {errors[0]}")
+    if len(left_stamps) < 3 or len(right_stamps) < 3:
+        raise RuntimeError("skew measurement did not see enough frames")
+    period = float(np.median(np.diff(left_stamps)))
+    right_arr = np.asarray(right_stamps)
+    deltas = []
+    for stamp in left_stamps:
+        offsets = right_arr - stamp
+        deltas.append(offsets[np.argmin(np.abs(offsets))])
+    # Nearest-neighbour deltas alias across ±period/2, so average them on the
+    # circle instead of linearly.
+    phase = np.angle(
+        np.mean(np.exp(2j * np.pi * np.asarray(deltas) / period))
+    )
+    return float(phase * period / (2.0 * math.pi)), period
+
+
+def _align_phase(
+    left: HTCamera,
+    right: HTCamera,
+    exposure_ms: float,
+    gain: float,
+    tolerance_s: float,
+    max_attempts: int,
+) -> tuple[HTCamera, float, float, float, float]:
+    """Bring the two free-running sensors within ``tolerance_s`` of each other.
+
+    Each sensor free-runs at an arbitrary phase, and nothing short of a full
+    re-open moves it: pause/play, ``reset_timestamp`` and ROI/frame-speed
+    bounces all leave the offset exactly where it was (the last two only snap
+    it onto a coarse grid, never near zero). A re-open lands the right sensor
+    on a fresh phase — measured on this rig it steps a few ms around the frame
+    period each time — so measure and re-open until the phase falls inside the
+    tolerance. Once aligned the offset holds: it moved by 0.012 ms over five
+    minutes of bench measurement, so this only has to run at startup.
+
+    Returns ``(right, left_anchor, right_anchor, skew_s, period_s)``.
+    """
+    left_anchor = _reset_anchor(left)
+    right_anchor = _reset_anchor(right)
+    serial = right.serial
+    started = time.perf_counter()
+    print(
+        f"[stereo] phase-aligning sensors to within "
+        f"{tolerance_s * 1e3:.2f} ms (re-opening {serial} until the random "
+        "phase lands in range)"
+    )
+    try:
+        for attempt in range(1, max_attempts + 1):
+            skew, period = _measure_skew(
+                left, right, left_anchor, right_anchor
+            )
+            elapsed = time.perf_counter() - started
+            if abs(skew) <= tolerance_s:
+                print(
+                    f"[stereo] sensors aligned to {skew * 1e3:+.3f} ms "
+                    f"(period {period * 1e3:.2f} ms) after {attempt} "
+                    f"attempt(s), {elapsed:.1f} s"
+                )
+                return right, left_anchor, right_anchor, skew, period
+            expected = period / (2.0 * tolerance_s)
+            print(
+                f"[stereo] align attempt {attempt}/{max_attempts} "
+                f"({elapsed:.1f} s, ~{expected:.0f} expected): skew "
+                f"{skew * 1e3:+.3f} ms exceeds {tolerance_s * 1e3:.2f} ms; "
+                f"re-opening {serial}"
+            )
+            right.close()
+            right = _open_camera(serial, exposure_ms, gain)
+            right_anchor = _reset_anchor(right)
+    except BaseException:
+        # main() still holds the handle we were given; only a replacement it
+        # has never seen needs closing here.
+        right.close()
+        raise
+    right.close()
+    raise RuntimeError(
+        f"could not align the sensors within {tolerance_s * 1e3:.3f} ms in "
+        f"{max_attempts} attempts; raise --align-tolerance-ms or "
+        "--align-max-attempts"
+    )
+
+
+def _report_profile(samples: list) -> None:
+    """Print median/p95 for each publish-loop stage, in milliseconds."""
+    names = (
+        "capture->paired",
+        "auto-exposure",
+        "encode",
+        "send",
+        "POST-CAPTURE",
+        "TOTAL capture->wire",
+    )
+    columns = list(zip(*samples))
+    print(f"[profile] {len(samples)} pairs")
+    for name, column in zip(names, columns):
+        ordered = sorted(column)
+        median = ordered[len(ordered) // 2]
+        p95 = ordered[int(len(ordered) * 0.95)]
+        print(
+            f"[profile]   {name:<22} med {median * 1e3:7.2f}  "
+            f"p95 {p95 * 1e3:7.2f} ms"
+        )
+
+
+def _next_pair(
+    left_queue: _DropOldestQueue,
+    right_queue: _DropOldestQueue,
+    match_window: float,
+    timeout: float,
+):
+    """Pop one frame from each side, dropping whichever side is behind until
+    the two land within ``match_window``.
+
+    With the sensors phase-aligned at startup this is a straight pop from each
+    queue; the drop loop only runs after a frame goes missing.
+    """
+    left_frame = left_queue.get(timeout=timeout)
+    right_frame = right_queue.get(timeout=timeout)
+    while abs(right_frame[1] - left_frame[1]) > match_window:
+        if left_frame[1] < right_frame[1]:
+            left_frame = left_queue.get(timeout=timeout)
+        else:
+            right_frame = right_queue.get(timeout=timeout)
+    return left_frame, right_frame
 
 
 def _capture(
@@ -307,6 +465,15 @@ def _capture(
     stop: threading.Event,
     errors: list,
 ) -> None:
+    """Grab, demosaic and tonemap one camera, and queue the finished RGB.
+
+    Doing the pixel work here rather than in the publish loop is what keeps it
+    off the critical path: each camera has a full frame period of slack, so its
+    conversion overlaps the *other* camera's USB transfer and its own next
+    exposure. The publish loop then only has to pair, encode and send.
+    """
+    cv_code = camera._cv_code
+    wb_gains = camera.wb_gains
     try:
         while not stop.is_set():
             bayer, info = camera.grab_bayer12(timeout_ms=500)
@@ -317,7 +484,13 @@ def _capture(
             # Discard SDK-buffered frames from before reset_timestamp().
             if capture_perf > time.perf_counter() + 1.0:
                 continue
-            output.put((hardware_us, capture_perf, bayer))
+            rgb = convert.tonemap_linear(
+                convert.demosaic(bayer, cv_code),
+                curve="bt709",
+                out_dtype=np.uint8,
+                wb_gains=wb_gains,
+            )
+            output.put((hardware_us, capture_perf, bayer, rgb))
     except Exception as exc:
         errors.append(exc)
         stop.set()
@@ -352,13 +525,27 @@ def main() -> None:
     parser.add_argument("--ae-exp-max", type=float, default=17.0)
     parser.add_argument("--ae-gain-max", type=float, default=4.0)
     parser.add_argument("--ae-flicker-hz", type=float, default=60.0)
-    parser.add_argument("--pair-wait-ms", type=float, default=30.0)
+    # Each re-open costs ~1.3 s and lands on a fresh phase, so the startup
+    # cost is roughly (period / 2 / tolerance) attempts: ~4 s at 5 ms, ~27 s
+    # at 1 ms.
+    parser.add_argument("--align-tolerance-ms", type=float, default=5.0)
+    parser.add_argument("--align-max-attempts", type=int, default=60)
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="print publish-loop stage timings every 100 pairs",
+    )
+    # The library default is 4, which leaves this 8-core box idle: the two
+    # conversions run concurrently in the capture threads, and 8 measured
+    # ~2.3 ms/pair faster end to end. Past 8 it flattens out.
+    parser.add_argument("--threads", type=int, default=8)
     parser.add_argument(
         "--transport",
         choices=("iceoryx2", "zmq"),
         default="iceoryx2",
     )
     args = parser.parse_args()
+    convert.set_num_threads(args.threads)
 
     present = {camera["serial"] for camera in list_cameras()}
     stereo, stereo_path = _find_stereo_calibration(present)
@@ -379,11 +566,27 @@ def main() -> None:
     left = right = None
     stop = threading.Event()
     Publisher, _ = transport_classes(args.transport)
-    policy_publisher = record_publisher = None
+    policy_publisher = None
     errors = []
     try:
         left = _open_camera(stereo.serial_left, args.exposure_ms, args.gain)
         right = _open_camera(stereo.serial_right, args.exposure_ms, args.gain)
+        # Phase-align before anything else binds to the right camera object:
+        # alignment re-opens it, which invalidates the previous handle.
+        (
+            right,
+            left_anchor,
+            right_anchor,
+            aligned_skew,
+            period,
+        ) = _align_phase(
+            left,
+            right,
+            args.exposure_ms,
+            args.gain,
+            args.align_tolerance_ms * 1e-3,
+            args.align_max_attempts,
+        )
         rig, calibration_hash = _build_rig(
             stereo,
             left,
@@ -411,16 +614,8 @@ def main() -> None:
         exposure, gain = args.exposure_ms, args.gain
         ae.apply(right, exposure, gain, exposure, gain)
 
-        # Opening and warming the cameras sequentially leaves their free-running
-        # exposure cycles at an arbitrary phase. Restart them together before
-        # anchoring their counters so nearest-time pairs are also close in phase.
-        left.pause()
-        right.pause()
-        _play_together((left, right))
-        left_anchor = _reset_anchor(left)
-        right_anchor = _reset_anchor(right)
         left_queue = _DropOldestQueue(4)
-        right_queue = _DropOldestQueue(8)
+        right_queue = _DropOldestQueue(4)
         threads = [
             threading.Thread(
                 target=_capture,
@@ -442,19 +637,12 @@ def main() -> None:
             max_buffer_size=30,
             max_message_size=32 * 1024 * 1024,
         )
-        if args.transport == "zmq":
-            record_publisher = Publisher(
-                RECORD_TOPIC,
-                conflate=False,
-                max_buffer_size=30,
-                max_message_size=32 * 1024 * 1024,
-            )
         stream_id = str(uuid.uuid4())
         sequence = 0
-        right_buffer = deque(maxlen=8)
-        right_intervals = deque(maxlen=16)
-        last_right_perf = None
-        pairing_primed = False
+        profile = [] if args.profile else None
+        match_window = period / 2.0
+        drift_limit = max(args.align_tolerance_ms * 1e-3 * 4.0, 2e-3)
+        last_drift_warning = 0.0
 
         def handle_signal(_signum, _frame):
             stop.set()
@@ -464,67 +652,30 @@ def main() -> None:
 
         while not stop.is_set():
             try:
-                left_hw, left_perf, left_bayer = left_queue.get(timeout=0.5)
+                left_frame, right_frame = _next_pair(
+                    left_queue, right_queue, match_window, _STOP_POLL_S
+                )
             except queue.Empty:
                 continue
-            deadline = time.perf_counter() + args.pair_wait_ms * 1e-3
-            while True:
-                if right_buffer:
-                    latest_gap = left_perf - right_buffer[-1][1]
-                    period = (
-                        float(np.median(right_intervals))
-                        if right_intervals else None
+            left_hw, left_perf, left_bayer, left_rgb = left_frame
+            right_hw, right_perf, _right_bayer, right_rgb = right_frame
+            skew = right_perf - left_perf
+            if abs(skew) > drift_limit:
+                now = time.perf_counter()
+                if now - last_drift_warning > 5.0:
+                    last_drift_warning = now
+                    print(
+                        f"[stereo] sensor skew {skew * 1e3:+.3f} ms has drifted "
+                        f"past {drift_limit * 1e3:.3f} ms (aligned at "
+                        f"{aligned_skew * 1e3:+.3f} ms); restart to re-align"
                     )
-                    if latest_gap <= 0:
-                        break
-                    if period is not None and latest_gap < period / 2.0:
-                        break
-                remaining = deadline - time.perf_counter()
-                if remaining <= 0:
-                    break
-                try:
-                    frame = right_queue.get(timeout=remaining)
-                    right_perf = frame[1]
-                    if last_right_perf is not None:
-                        interval = right_perf - last_right_perf
-                        if 0.0 < interval < 0.2:
-                            right_intervals.append(interval)
-                    last_right_perf = right_perf
-                    right_buffer.append(frame)
-                except queue.Empty:
-                    break
-            if not right_buffer:
-                continue
-            # The first left frame can precede every buffered right frame. Keep
-            # those right frames and start with the next left frame so nearest
-            # matching can choose either side of its timestamp instead of
-            # locking the whole stream to the later phase.
-            if not pairing_primed:
-                pairing_primed = True
-                continue
-            right_frame = min(
-                right_buffer, key=lambda frame: abs(frame[1] - left_perf)
-            )
-            right_hw, right_perf, right_bayer = right_frame
-            while right_buffer and right_buffer[0][1] <= right_perf:
-                right_buffer.popleft()
 
+            t_popped = time.perf_counter()
             new_exp, new_gain, _ = ae.update(left_bayer, exposure, gain)
             exposure, gain = ae.apply(
                 (left, right), new_exp, new_gain, exposure, gain
             )
-            left_rgb = convert.tonemap_linear(
-                convert.demosaic(left_bayer, left._cv_code),
-                curve="bt709",
-                out_dtype=np.uint8,
-                wb_gains=left.wb_gains,
-            )
-            right_rgb = convert.tonemap_linear(
-                convert.demosaic(right_bayer, right._cv_code),
-                curve="bt709",
-                out_dtype=np.uint8,
-                wb_gains=right.wb_gains,
-            )
+            t_ae = time.perf_counter()
             pair_perf = (left_perf + right_perf) / 2.0
             metadata = {
                 "stream_id": stream_id,
@@ -535,7 +686,7 @@ def main() -> None:
                 "right_capture_perf_s": right_perf,
                 "left_hardware_timestamp_us": left_hw,
                 "right_hardware_timestamp_us": right_hw,
-                "sensor_skew_s": right_perf - left_perf,
+                "sensor_skew_s": skew,
                 "publish_perf_s": time.perf_counter(),
                 "exposure_ms": exposure,
                 "gain_x": gain,
@@ -543,10 +694,25 @@ def main() -> None:
                 "rig": rig,
             }
             packet = _encode_pair(metadata, left_rgb, right_rgb)
+            t_encoded = time.perf_counter()
             policy_publisher.send_bytes(packet)
-            if record_publisher is not None:
-                record_publisher.send_bytes(packet)
             sequence += 1
+
+            if profile is not None:
+                t_sent = time.perf_counter()
+                profile.append(
+                    (
+                        t_popped - pair_perf,   # sensor stamp -> paired in hand
+                        t_ae - t_popped,        # auto-exposure
+                        t_encoded - t_ae,       # encode/copy
+                        t_sent - t_encoded,     # send
+                        t_sent - t_popped,      # post-capture critical path
+                        t_sent - pair_perf,     # total, capture -> on wire
+                    )
+                )
+                if len(profile) >= 100:
+                    _report_profile(profile)
+                    profile.clear()
 
         for thread in threads:
             thread.join(timeout=2.0)
@@ -554,9 +720,8 @@ def main() -> None:
             raise RuntimeError(f"capture thread failed: {errors[0]}")
     finally:
         stop.set()
-        for publisher in (policy_publisher, record_publisher):
-            if publisher is not None:
-                publisher.close()
+        if policy_publisher is not None:
+            policy_publisher.close()
         for camera in (left, right):
             if camera is not None:
                 camera.close()
