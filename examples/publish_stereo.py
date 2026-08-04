@@ -470,6 +470,7 @@ def _align_phase(
     max_attempts: int,
     capture_bits: int,
     vertical_trim: float,
+    horizontal_trim: float,
 ) -> tuple[HTCamera, float, float, float, float]:
     """Bring the two free-running sensors within ``tolerance_s`` of each other.
 
@@ -524,6 +525,7 @@ def _align_phase(
                 gain,
                 capture_bits,
                 vertical_trim,
+                horizontal_trim,
             )
             right_anchor = _reset_anchor(right)
     except BaseException:
@@ -651,22 +653,28 @@ def _open_camera(
     gain: float,
     capture_bits: int = 12,
     vertical_trim: float = 0.0,
+    horizontal_trim: float = 0.0,
 ) -> HTCamera:
     camera = HTCamera(serial=serial, demosaic_quality="ea")
     camera.set_frame_speed(enums.FRAME_SPEED_HIGH)
     resolution = camera.current_resolution()
     full_width = int(resolution.iWidthFOV)
     full_height = int(resolution.iHeightFOV)
-    trim = int(round(full_height * vertical_trim)) & ~1
-    height = full_height - 2 * trim
+    trim_x = int(round(full_width * horizontal_trim)) & ~1
+    trim_y = int(round(full_height * vertical_trim)) & ~1
+    width = full_width - 2 * trim_x
+    height = full_height - 2 * trim_y
+    if width < 2:
+        camera.close()
+        raise ValueError("--horizontal-trim removes the entire sensor image")
     if height < 2:
         camera.close()
         raise ValueError("--vertical-trim removes the entire sensor image")
     camera.set_roi(
-        full_width,
+        width,
         height,
-        0,
-        trim,
+        trim_x,
+        trim_y,
     )
     if capture_bits == 8:
         _select_bayer8(camera)
@@ -710,6 +718,13 @@ def main() -> None:
         metavar="FRACTION",
         help="fraction cropped from each of the sensor's top and bottom edges",
     )
+    parser.add_argument(
+        "--horizontal-trim",
+        type=float,
+        default=0.10,
+        metavar="FRACTION",
+        help="fraction cropped from each of the sensor's left and right edges",
+    )
     # Each re-open costs ~1.3 s and lands on a fresh phase, so the startup
     # cost is roughly (period / 2 / tolerance) attempts: ~4 s at 5 ms, ~27 s
     # at 1 ms.
@@ -738,6 +753,8 @@ def main() -> None:
     args = parser.parse_args()
     if not 0.0 <= args.vertical_trim < 0.5:
         parser.error("--vertical-trim must be in [0, 0.5)")
+    if not 0.0 <= args.horizontal_trim < 0.5:
+        parser.error("--horizontal-trim must be in [0, 0.5)")
     convert.set_num_threads(args.threads)
 
     present = {camera["serial"] for camera in list_cameras()}
@@ -768,6 +785,7 @@ def main() -> None:
             args.gain,
             args.capture_bits,
             args.vertical_trim,
+            args.horizontal_trim,
         )
         right = _open_camera(
             stereo.serial_right,
@@ -775,6 +793,7 @@ def main() -> None:
             args.gain,
             args.capture_bits,
             args.vertical_trim,
+            args.horizontal_trim,
         )
         # Phase-align before anything else binds to the right camera object:
         # alignment re-opens it, which invalidates the previous handle.
@@ -793,6 +812,7 @@ def main() -> None:
             args.align_max_attempts,
             args.capture_bits,
             args.vertical_trim,
+            args.horizontal_trim,
         )
         rig, calibration_hash = _build_rig(
             stereo,
