@@ -328,12 +328,6 @@ def _build_rig(
             "serial": cam.serial,
             "width": width,
             "height": height,
-            "sensor_roi": {
-                "x": roi_x,
-                "y": roi_y,
-                "full_width": full_width,
-                "full_height": full_height,
-            },
             "model": intr.model,
             "K": K.tolist(),
             "dist": intr.dist.tolist(),
@@ -813,8 +807,7 @@ def main() -> None:
         print(
             f"[stereo] capture {args.capture_bits}-bit; "
             f"ROI {left_projection['width']}x{left_projection['height']}"
-            f"+{left_projection['sensor_roi']['x']}"
-            f"+{left_projection['sensor_roi']['y']}; "
+            f"; "
             f"principal points "
             f"L=({left_projection['K'][0][2]:.3f}, "
             f"{left_projection['K'][1][2]:.3f}) "
