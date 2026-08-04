@@ -9,6 +9,7 @@ metadata. Consumers only need to decode ``eyeball-stereo-pair/1`` from
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import math
 from pathlib import Path
@@ -18,10 +19,12 @@ import struct
 import threading
 import time
 import uuid
+from ctypes import POINTER, byref, c_ubyte
 
 import cv2
 import numpy as np
 from hteng_camera import (
+    _sdk,
     AutoExposure,
     HTCamera,
     calibration,
@@ -29,6 +32,7 @@ from hteng_camera import (
     enums,
     list_cameras,
 )
+from hteng_camera._sdk import tSdkFrameHead
 from eye.transport import transport_classes
 
 
@@ -45,6 +49,12 @@ _HEAD_FROM_CANONICAL_MJ = np.array(
     [[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
     dtype=np.float64,
 )
+_BAYER8_TILE_BY_ORDINAL = {
+    0x08: "GR",
+    0x09: "RG",
+    0x0A: "GB",
+    0x0B: "BG",
+}
 
 
 def _encode_pair(metadata: dict, left: np.ndarray, right: np.ndarray) -> bytes:
@@ -63,6 +73,89 @@ def _encode_pair(metadata: dict, left: np.ndarray, right: np.ndarray) -> bytes:
             right_view,
         )
     )
+
+
+def _select_bayer8(camera: HTCamera) -> None:
+    media = next(
+        (item for item in camera.media_types() if item["bits"] == 8),
+        None,
+    )
+    if media is None:
+        raise RuntimeError(f"{camera.serial}: no 8-bit Bayer media type")
+    tile = _BAYER8_TILE_BY_ORDINAL.get(media["code"] & 0xFF)
+    if tile is None:
+        raise RuntimeError(
+            f"{camera.serial}: unsupported 8-bit media {media['code']:#010x}"
+        )
+    cv_pattern = {"GR": "GB", "RG": "BG", "GB": "GR", "BG": "RG"}[tile]
+    camera.pause()
+    camera._ctrl(
+        lambda: _sdk.CameraSetMediaType(camera.h, media["index"]),
+        "CameraSetMediaType",
+    )
+    camera._media_index = media["index"]
+    camera._media_code = media["code"]
+    camera._cv_code = getattr(cv2, f"COLOR_Bayer{cv_pattern}2RGB_EA")
+
+
+def _grab_bayer(
+    camera: HTCamera,
+    capture_bits: int,
+    timeout_ms: int,
+    priority: int = enums.GET_NEWEST,
+):
+    if capture_bits == 12:
+        return camera.grab_bayer12(
+            timeout_ms=timeout_ms, priority=priority
+        )
+
+    camera.play()
+    head = tSdkFrameHead()
+    raw_ptr = POINTER(c_ubyte)()
+    status = _sdk.CameraGetImageBufferPriority(
+        camera.h,
+        byref(head),
+        byref(raw_ptr),
+        timeout_ms,
+        priority,
+    )
+    if status != 0:
+        return None, {}
+    try:
+        size = int(head.iWidth) * int(head.iHeight)
+        if int(head.uBytes) != size:
+            raise RuntimeError(
+                f"expected 8-bit Bayer (1 B/px), got "
+                f"{int(head.uBytes) / size:.2f} B/px"
+            )
+        bayer = np.frombuffer(
+            (c_ubyte * size).from_address(
+                ctypes.addressof(raw_ptr.contents)
+            ),
+            dtype=np.uint8,
+            count=size,
+        ).reshape(int(head.iHeight), int(head.iWidth)).copy()
+        info = {"time": int(head.uiTimeStamp) * 100}
+    finally:
+        _sdk.CameraReleaseImageBuffer(camera.h, raw_ptr)
+    return bayer, info
+
+
+def _bt709_lut8(wb_gains) -> np.ndarray:
+    gains = (1.0, 1.0, 1.0) if wb_gains is None else wb_gains
+    linear = (
+        np.arange(256, dtype=np.float32)[:, None]
+        * np.asarray(gains, dtype=np.float32)[None, :]
+        / 255.0
+    )
+    encoded = np.where(
+        linear < 0.018,
+        4.5 * linear,
+        1.099 * np.power(linear, 0.45) - 0.099,
+    )
+    return np.clip(encoded * 255.0 + 0.5, 0, 255).astype(
+        np.uint8
+    ).reshape(256, 1, 3)
 
 
 def _skew(vector: np.ndarray) -> np.ndarray:
@@ -215,17 +308,34 @@ def _build_rig(
         resolution = cam.current_resolution()
         width = int(resolution.iWidthFOV)
         height = int(resolution.iHeightFOV)
-        if (width, height) != tuple(intr.image_size):
+        roi_x = int(resolution.iHOffsetFOV)
+        roi_y = int(resolution.iVOffsetFOV)
+        full_width, full_height = map(int, intr.image_size)
+        if (
+            roi_x < 0
+            or roi_y < 0
+            or roi_x + width > full_width
+            or roi_y + height > full_height
+        ):
             raise RuntimeError(
-                f"{cam.serial}: full ROI {width}x{height} does not match "
-                f"intrinsics {intr.image_size}; refusing an implicit rescale"
+                f"{cam.serial}: ROI {width}x{height}+{roi_x}+{roi_y} falls "
+                f"outside calibrated sensor {full_width}x{full_height}"
             )
+        K = np.asarray(intr.K, dtype=np.float64).copy()
+        K[0, 2] -= roi_x
+        K[1, 2] -= roi_y
         return {
             "serial": cam.serial,
             "width": width,
             "height": height,
+            "sensor_roi": {
+                "x": roi_x,
+                "y": roi_y,
+                "full_width": full_width,
+                "full_height": full_height,
+            },
             "model": intr.model,
-            "K": intr.K.tolist(),
+            "K": K.tolist(),
             "dist": intr.dist.tolist(),
             "fov_deg": 180.0,
             "encoding": "rgb8",
@@ -284,10 +394,11 @@ def _stamp_stream(
     count: int,
     output: list,
     errors: list,
+    capture_bits: int,
 ) -> None:
     try:
         while len(output) < count:
-            bayer, info = camera.grab_bayer12(timeout_ms=500)
+            bayer, info = _grab_bayer(camera, capture_bits, timeout_ms=500)
             if bayer is None:
                 continue
             stamp = anchor + int(info["time"]) * 1e-6
@@ -304,6 +415,7 @@ def _measure_skew(
     right: HTCamera,
     left_anchor: float,
     right_anchor: float,
+    capture_bits: int,
     frames: int = 8,
 ) -> tuple[float, float]:
     """Return ``(skew_s, period_s)`` for the pair on the shared time base.
@@ -318,7 +430,14 @@ def _measure_skew(
     threads = [
         threading.Thread(
             target=_stamp_stream,
-            args=(camera, anchor, frames, stamps, errors),
+            args=(
+                camera,
+                anchor,
+                frames,
+                stamps,
+                errors,
+                capture_bits,
+            ),
             daemon=True,
         )
         for camera, anchor, stamps in (
@@ -355,6 +474,8 @@ def _align_phase(
     gain: float,
     tolerance_s: float,
     max_attempts: int,
+    capture_bits: int,
+    vertical_trim: float,
 ) -> tuple[HTCamera, float, float, float, float]:
     """Bring the two free-running sensors within ``tolerance_s`` of each other.
 
@@ -381,7 +502,11 @@ def _align_phase(
     try:
         for attempt in range(1, max_attempts + 1):
             skew, period = _measure_skew(
-                left, right, left_anchor, right_anchor
+                left,
+                right,
+                left_anchor,
+                right_anchor,
+                capture_bits,
             )
             elapsed = time.perf_counter() - started
             if abs(skew) <= tolerance_s:
@@ -399,7 +524,13 @@ def _align_phase(
                 f"re-opening {serial}"
             )
             right.close()
-            right = _open_camera(serial, exposure_ms, gain)
+            right = _open_camera(
+                serial,
+                exposure_ms,
+                gain,
+                capture_bits,
+                vertical_trim,
+            )
             right_anchor = _reset_anchor(right)
     except BaseException:
         # main() still holds the handle we were given; only a replacement it
@@ -417,7 +548,9 @@ def _align_phase(
 def _report_profile(samples: list) -> None:
     """Print median/p95 for each publish-loop stage, in milliseconds."""
     names = (
-        "capture->paired",
+        "capture->SDK return",
+        "pixel conversion",
+        "conversion->paired",
         "auto-exposure",
         "encode",
         "send",
@@ -464,6 +597,8 @@ def _capture(
     output: _DropOldestQueue,
     stop: threading.Event,
     errors: list,
+    priority: int,
+    capture_bits: int,
 ) -> None:
     """Grab, demosaic and tonemap one camera, and queue the finished RGB.
 
@@ -474,40 +609,82 @@ def _capture(
     """
     cv_code = camera._cv_code
     wb_gains = camera.wb_gains
+    lut8 = _bt709_lut8(wb_gains) if capture_bits == 8 else None
     try:
         while not stop.is_set():
-            bayer, info = camera.grab_bayer12(timeout_ms=500)
+            bayer, info = _grab_bayer(
+                camera,
+                capture_bits,
+                timeout_ms=500,
+                priority=priority,
+            )
             if bayer is None:
                 continue
+            grabbed_perf = time.perf_counter()
             hardware_us = int(info["time"])
             capture_perf = anchor + hardware_us * 1e-6
             # Discard SDK-buffered frames from before reset_timestamp().
             if capture_perf > time.perf_counter() + 1.0:
                 continue
-            rgb = convert.tonemap_linear(
-                convert.demosaic(bayer, cv_code),
-                curve="bt709",
-                out_dtype=np.uint8,
-                wb_gains=wb_gains,
+            linear = convert.demosaic(bayer, cv_code)
+            if capture_bits == 8:
+                rgb = cv2.LUT(linear, lut8)
+            else:
+                rgb = convert.tonemap_linear(
+                    linear,
+                    curve="bt709",
+                    out_dtype=np.uint8,
+                    wb_gains=wb_gains,
+                )
+            output.put(
+                (
+                    hardware_us,
+                    capture_perf,
+                    grabbed_perf,
+                    time.perf_counter(),
+                    bayer,
+                    rgb,
+                )
             )
-            output.put((hardware_us, capture_perf, bayer, rgb))
     except Exception as exc:
         errors.append(exc)
         stop.set()
 
 
-def _open_camera(serial: str, exposure_ms: float, gain: float) -> HTCamera:
+def _open_camera(
+    serial: str,
+    exposure_ms: float,
+    gain: float,
+    capture_bits: int = 12,
+    vertical_trim: float = 0.0,
+) -> HTCamera:
     camera = HTCamera(serial=serial, demosaic_quality="ea")
     camera.set_frame_speed(enums.FRAME_SPEED_HIGH)
     resolution = camera.current_resolution()
+    full_width = int(resolution.iWidthFOV)
+    full_height = int(resolution.iHeightFOV)
+    trim = int(round(full_height * vertical_trim)) & ~1
+    height = full_height - 2 * trim
+    if height < 2:
+        camera.close()
+        raise ValueError("--vertical-trim removes the entire sensor image")
     camera.set_roi(
-        int(resolution.iWidthFOV), int(resolution.iHeightFOV), 0, 0
+        full_width,
+        height,
+        0,
+        trim,
     )
+    if capture_bits == 8:
+        _select_bayer8(camera)
     camera.set_ae(False)
     camera.set_exposure_ms(exposure_ms)
     camera.set_analog_gain(gain)
     for _ in range(3):
-        frame, _ = camera.grab_bayer12(timeout_ms=2000)
+        frame, _ = _grab_bayer(
+            camera,
+            capture_bits,
+            timeout_ms=2000,
+        )
         if frame is not None:
             return camera
     camera.close()
@@ -525,6 +702,20 @@ def main() -> None:
     parser.add_argument("--ae-exp-max", type=float, default=17.0)
     parser.add_argument("--ae-gain-max", type=float, default=4.0)
     parser.add_argument("--ae-flicker-hz", type=float, default=60.0)
+    parser.add_argument(
+        "--capture-bits",
+        type=int,
+        choices=(8, 12),
+        default=8,
+        help="raw Bayer transport depth; 8 substantially reduces USB latency",
+    )
+    parser.add_argument(
+        "--vertical-trim",
+        type=float,
+        default=0.10,
+        metavar="FRACTION",
+        help="fraction cropped from each of the sensor's top and bottom edges",
+    )
     # Each re-open costs ~1.3 s and lands on a fresh phase, so the startup
     # cost is roughly (period / 2 / tolerance) attempts: ~4 s at 5 ms, ~27 s
     # at 1 ms.
@@ -540,11 +731,19 @@ def main() -> None:
     # ~2.3 ms/pair faster end to end. Past 8 it flattens out.
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument(
+        "--grab-priority",
+        choices=("newest", "next"),
+        default="newest",
+        help="SDK frame-buffer policy (next may reduce latency on some cameras)",
+    )
+    parser.add_argument(
         "--transport",
         choices=("iceoryx2", "zmq"),
         default="iceoryx2",
     )
     args = parser.parse_args()
+    if not 0.0 <= args.vertical_trim < 0.5:
+        parser.error("--vertical-trim must be in [0, 0.5)")
     convert.set_num_threads(args.threads)
 
     present = {camera["serial"] for camera in list_cameras()}
@@ -569,8 +768,20 @@ def main() -> None:
     policy_publisher = None
     errors = []
     try:
-        left = _open_camera(stereo.serial_left, args.exposure_ms, args.gain)
-        right = _open_camera(stereo.serial_right, args.exposure_ms, args.gain)
+        left = _open_camera(
+            stereo.serial_left,
+            args.exposure_ms,
+            args.gain,
+            args.capture_bits,
+            args.vertical_trim,
+        )
+        right = _open_camera(
+            stereo.serial_right,
+            args.exposure_ms,
+            args.gain,
+            args.capture_bits,
+            args.vertical_trim,
+        )
         # Phase-align before anything else binds to the right camera object:
         # alignment re-opens it, which invalidates the previous handle.
         (
@@ -586,6 +797,8 @@ def main() -> None:
             args.gain,
             args.align_tolerance_ms * 1e-3,
             args.align_max_attempts,
+            args.capture_bits,
+            args.vertical_trim,
         )
         rig, calibration_hash = _build_rig(
             stereo,
@@ -595,6 +808,19 @@ def main() -> None:
             head_from_stereo_midpoint,
         )
         rig["base_from_head_explicit"] = pose_explicit
+        left_projection = rig["left"]
+        right_projection = rig["right"]
+        print(
+            f"[stereo] capture {args.capture_bits}-bit; "
+            f"ROI {left_projection['width']}x{left_projection['height']}"
+            f"+{left_projection['sensor_roi']['x']}"
+            f"+{left_projection['sensor_roi']['y']}; "
+            f"principal points "
+            f"L=({left_projection['K'][0][2]:.3f}, "
+            f"{left_projection['K'][1][2]:.3f}) "
+            f"R=({right_projection['K'][0][2]:.3f}, "
+            f"{right_projection['K'][1][2]:.3f})"
+        )
         import hashlib
         calibration_hash = hashlib.sha256(
             json.dumps(
@@ -610,21 +836,42 @@ def main() -> None:
             exp_max=args.ae_exp_max,
             target=args.ae_target,
             flicker_hz=args.ae_flicker_hz,
+            max_val=255.0 if args.capture_bits == 8 else 4095.0,
         )
         exposure, gain = args.exposure_ms, args.gain
         ae.apply(right, exposure, gain, exposure, gain)
 
         left_queue = _DropOldestQueue(4)
         right_queue = _DropOldestQueue(4)
+        grab_priority = {
+            "newest": enums.GET_NEWEST,
+            "next": enums.GET_NEXT,
+        }[args.grab_priority]
         threads = [
             threading.Thread(
                 target=_capture,
-                args=(left, left_anchor, left_queue, stop, errors),
+                args=(
+                    left,
+                    left_anchor,
+                    left_queue,
+                    stop,
+                    errors,
+                    grab_priority,
+                    args.capture_bits,
+                ),
                 daemon=True,
             ),
             threading.Thread(
                 target=_capture,
-                args=(right, right_anchor, right_queue, stop, errors),
+                args=(
+                    right,
+                    right_anchor,
+                    right_queue,
+                    stop,
+                    errors,
+                    grab_priority,
+                    args.capture_bits,
+                ),
                 daemon=True,
             ),
         ]
@@ -657,8 +904,22 @@ def main() -> None:
                 )
             except queue.Empty:
                 continue
-            left_hw, left_perf, left_bayer, left_rgb = left_frame
-            right_hw, right_perf, _right_bayer, right_rgb = right_frame
+            (
+                left_hw,
+                left_perf,
+                left_grabbed,
+                left_converted,
+                left_bayer,
+                left_rgb,
+            ) = left_frame
+            (
+                right_hw,
+                right_perf,
+                right_grabbed,
+                right_converted,
+                _right_bayer,
+                right_rgb,
+            ) = right_frame
             skew = right_perf - left_perf
             if abs(skew) > drift_limit:
                 now = time.perf_counter()
@@ -702,7 +963,11 @@ def main() -> None:
                 t_sent = time.perf_counter()
                 profile.append(
                     (
-                        t_popped - pair_perf,   # sensor stamp -> paired in hand
+                        max(left_grabbed - left_perf,
+                            right_grabbed - right_perf),
+                        max(left_converted - left_grabbed,
+                            right_converted - right_grabbed),
+                        t_popped - max(left_converted, right_converted),
                         t_ae - t_popped,        # auto-exposure
                         t_encoded - t_ae,       # encode/copy
                         t_sent - t_encoded,     # send
