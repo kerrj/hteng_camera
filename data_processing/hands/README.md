@@ -105,6 +105,32 @@ keypoints, MANO initialization, and the two virtual-camera transforms.
 
 For a quick inference smoke test, add `--max-frames 300`.
 
+The YOLO hand detector is TorchInductor-compiled by default
+(`fullgraph=True, dynamic=False`, ~1.27x on detection, ~30 s warmup); pass
+`--no-compile` to force eager. On one A6000 over 3200 frames of `long-test2`
+this moves the whole stage from 12.7 to 13.3 fps with byte-identical
+detections. The gain is small because decoding, not inference, dominates:
+
+| stage | share of wall time |
+|---|---|
+| stereo H.265 decode | ~49% |
+| YOLO detection | ~17% |
+| verged crop rendering + postprocess | ~23% |
+| WiLoR ViT | ~11% |
+
+The WiLoR ViT is deliberately left eager. It measured 1.00-1.01x under every
+compile mode tried (static and dynamic, `default` and `reduce-overhead`) because
+it is already compute-bound on fp16 SDPA and GEMM kernels. It also cannot reach
+`fullgraph=True` at all: `smplx.lbs.batch_rigid_transform` indexes a Python
+list with a tensor and `roma.rotmat_to_unitquat` calls a dynamic-shape
+operator, giving 18 graph breaks inside third-party code.
+
+Compiling the detector requires patching the bound `forward` instead of
+replacing `hand_detector.model`, since ultralytics calls `len()` on the model
+and an `OptimizedModule` wrapper does not support it. `reduce-overhead` is not
+usable here: its CUDA Graphs reuse output buffers, and `detect_gpu` is called
+once per eye while the first eye's boxes are still live.
+
 ### 2. Fit each hand track
 
 ```bash

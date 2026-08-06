@@ -11,7 +11,7 @@ def default_model_dir():
         "WILOR_MODEL_DIR", "~/.cache/hteng_camera/wilor"))
 
 
-def build_pipeline(fp32, model_dir=None):
+def build_pipeline(fp32, model_dir=None, compile_detector=True):
     from wilor_mini.pipelines.wilor_hand_pose3d_estimation_pipeline import (
         WiLorHandPose3dEstimationPipeline)
 
@@ -25,7 +25,26 @@ def build_pipeline(fp32, model_dir=None):
         wilor_pretrained_dir=os.path.abspath(
             os.path.expanduser(model_dir or default_model_dir())),
     )
+    if compile_detector and device.type == "cuda":
+        compile_detector_forward(pipeline.hand_detector)
     return pipeline, device, dtype
+
+
+def compile_detector_forward(detector):
+    """TorchInductor-compile the YOLO detector, worth ~1.27x on its forward.
+
+    Patch the bound ``forward`` rather than replacing ``detector.model``:
+    ultralytics calls ``len()`` on the model, which an ``OptimizedModule``
+    wrapper does not support. ``detect_gpu`` always pads to one fixed square
+    size, so ``dynamic=False`` holds for every batch shape it sees.
+
+    Mode is deliberately ``"default"``: ``reduce-overhead`` wraps the forward
+    in CUDA Graphs, whose output buffers are overwritten by the next call,
+    while ``detect_gpu`` still holds the previous eye's result.
+    """
+    model = detector.model
+    model.forward = torch.compile(
+        model.forward, mode="default", fullgraph=True, dynamic=False)
 
 
 def detect_gpu(detector, frames_gpu, conf, imgsz=640):

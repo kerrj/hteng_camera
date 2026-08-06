@@ -24,13 +24,13 @@ Examples (on sphynx):
 """
 
 import argparse
-import concurrent.futures
 import json
 import math
+import multiprocessing
 import os
 import queue
-import threading
 import time
+import traceback
 from pathlib import Path
 
 import cv2
@@ -764,10 +764,188 @@ def prune_stale_loop_cache(windows_dir, specs):
     return removed
 
 
-def infer(args):
+def _build_model(torch, VGGTOmega, args, device, compile_enabled):
+    model = VGGTOmega()
+    state = torch.load(
+        args.checkpoint, map_location="cpu", weights_only=True)
+    model.load_state_dict(state)
+    del state
+    # Tracking only consumes pose_enc. Loop verification keeps the dense
+    # head to reject candidate regions without geometric overlap.
+    if not args.verify_loop_overlap:
+        model.dense_head = None
+    model = model.eval().to(device)
+    if compile_enabled:
+        # Compile the aggregator, not the whole model: it holds ~all of the
+        # FLOPs and takes a single fixed-shape tensor, so it captures under
+        # fullgraph=True. VGGTOmega.forward itself cannot -- it returns a
+        # list of per-layer tensors with None in the uncached slots, which
+        # Dynamo rejects ("torch.* op returned non-Tensor").
+        # Mode is "default", not "reduce-overhead": the aggregator is
+        # compute-bound at these sizes, so CUDA Graphs measured no faster
+        # (1.541s vs 1.546s at 32x512).
+        model.aggregator = torch.compile(
+            model.aggregator,
+            mode="default",
+            fullgraph=True,
+            dynamic=False,
+        )
+    return model
+
+
+def _infer_worker(device_str, args, manifest, n_specs, windows_dir,
+                  compile_enabled, task_queue, result_queue):
+    """One-per-GPU inference worker, run in its own spawned process.
+
+    Workers are processes, not threads: TorchDynamo compilation is not
+    thread-safe (concurrent tracing races, Inductor subprocess-pool
+    deadlocks, cuBLAS init captured into CUDA graphs), so per-process
+    compiler state is the only arrangement that lets all GPUs warm up
+    concurrently. Nothing CUDA crosses the process boundary -- each worker
+    decodes, infers, and writes its own NPZ files; only JSON-able specs and
+    float timings pass through the queues.
+    """
     import torch
     from vggt_omega.models import VGGTOmega
     from vggt_omega.utils.pose_enc import encoding_to_camera
+
+    device = torch.device(device_str)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    torch.set_float32_matmul_precision("high")
+    windows_dir = Path(windows_dir)
+
+    try:
+        model = _build_model(torch, VGGTOmega, args, device, compile_enabled)
+        video_loader = DirectStereoVideoLoader(
+            manifest, device, args.decode_batch_size)
+
+        while True:
+            task = task_queue.get()
+            if task is None:
+                break
+            index, spec = task
+            out_path = windows_dir / f"{spec['name']}.npz"
+            reject_path = windows_dir / f"{spec['name']}.rejected.json"
+            out_path.unlink(missing_ok=True)
+            reject_path.unlink(missing_ok=True)
+            image_frame_idx, image_eye, image_segment = (
+                make_window_image_inputs(
+                    spec, manifest, args.stereo_interval_seconds))
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            decode_start = time.time()
+            images = video_loader.load(
+                image_frame_idx, image_eye, args.resolution)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            decode_elapsed = time.time() - decode_start
+            repeat_timings = []
+            repeat_peak_memory = []
+            predictions = None
+            for _ in range(args.benchmark_repeats):
+                if predictions is not None:
+                    del predictions
+                if device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(device)
+                    torch.cuda.synchronize(device)
+                t0 = time.time()
+                with torch.inference_mode():
+                    predictions = model(images)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                    peak_memory = torch.cuda.max_memory_allocated(device)
+                else:
+                    peak_memory = 0
+                repeat_timings.append(time.time() - t0)
+                repeat_peak_memory.append(peak_memory)
+            elapsed = repeat_timings[-1]
+            extrinsics, intrinsics = encoding_to_camera(
+                predictions["pose_enc"],
+                predictions["images"].shape[-2:],
+            )
+            overlap_score = np.nan
+            overlap_directional = (np.nan, np.nan)
+            if args.verify_loop_overlap and spec["kind"] == "loop":
+                overlap_score, overlap_directional = loop_depth_overlap(
+                    predictions,
+                    extrinsics,
+                    intrinsics,
+                    image_eye,
+                    image_segment,
+                    args,
+                )
+                print(
+                    f"[{index + 1}/{n_specs}] "
+                    f"{spec['name']} overlap {overlap_score:.3f} "
+                    f"({overlap_directional[0]:.3f}, "
+                    f"{overlap_directional[1]:.3f})",
+                    flush=True)
+                if overlap_score < args.min_loop_overlap:
+                    with open(reject_path, "w") as f:
+                        json.dump({
+                            "name": spec["name"],
+                            "kind": spec["kind"],
+                            "frame_idx": [
+                                int(item["frame"])
+                                for item in spec["frames"]
+                            ],
+                            "overlap_score": overlap_score,
+                            "overlap_directional": overlap_directional,
+                            "threshold": args.min_loop_overlap,
+                        }, f, indent=2)
+                    continue
+            frame_idx = np.asarray(
+                [item["frame"] for item in spec["frames"]], np.int64)
+            np.savez_compressed(
+                out_path,
+                format=np.asarray(FORMAT_TAG),
+                kind=np.asarray(spec["kind"]),
+                frame_idx=frame_idx,
+                image_frame_idx=image_frame_idx,
+                image_eye=image_eye,
+                image_segment=image_segment,
+                segment=np.asarray(spec["segments"], np.int8),
+                extrinsics=extrinsics[0].float().cpu().numpy(),
+                intrinsics=intrinsics[0].float().cpu().numpy(),
+                loop_overlap_score=np.asarray(overlap_score),
+                loop_overlap_directional=np.asarray(
+                    overlap_directional),
+                inference_seconds=np.asarray(elapsed),
+                decode_remap_seconds=np.asarray(decode_elapsed),
+                benchmark_inference_seconds=np.asarray(repeat_timings),
+                peak_memory_bytes=np.asarray(repeat_peak_memory[-1]),
+                benchmark_peak_memory_bytes=np.asarray(
+                    repeat_peak_memory),
+                inference_device=np.asarray(device_str),
+            )
+            result_queue.put(("window", elapsed, decode_elapsed))
+            print(
+                f"[{index + 1}/{n_specs}] {out_path.name} on "
+                f"{device_str}: {len(image_frame_idx)} images in "
+                f"{decode_elapsed:.2f}s decode/remap + "
+                f"{elapsed:.2f}s inference, "
+                f"{repeat_peak_memory[-1] / 2**30:.2f} GiB"
+                + (
+                    " (all repeats: "
+                    + ", ".join(
+                        f"{value:.2f}s"
+                        for value in repeat_timings)
+                    + ")"
+                    if len(repeat_timings) > 1 else ""
+                ),
+                flush=True)
+    except Exception:
+        # Report through the queue and exit cleanly: a nonzero exit code is
+        # reserved for deaths that never reached this handler (segfault, OOM
+        # kill), which the parent detects by polling exit codes.
+        result_queue.put(("error", device_str, traceback.format_exc()))
+        return
+    result_queue.put(("done", device_str))
+
+
+def infer(args):
+    import torch
 
     recording = os.path.abspath(args.recording)
     out_dir = Path(args.out_dir or os.path.join(
@@ -782,31 +960,18 @@ def infer(args):
     if args.checkpoint is None:
         raise ValueError("--checkpoint is required for inference")
     torch.set_float32_matmul_precision("high")
-    if args.compile:
-        if args.verify_loop_overlap:
-            raise ValueError(
-                "--compile is unsupported with --verify-loop-overlap")
-        if not str(args.device).startswith("cuda"):
-            raise ValueError("--compile currently requires a CUDA device")
+    # Compiling the aggregator is a strict win (~1.35x, ~12s warmup), so it is
+    # on unless explicitly disabled or the device cannot support it.
+    compile_enabled = not args.no_compile
+    if compile_enabled and not str(args.device).startswith("cuda"):
+        print("compile requires a CUDA device; running eager")
+        compile_enabled = False
 
     specs = make_window_specs(manifest, args)
     if args.loop_matches is not None:
         for path in prune_stale_loop_cache(windows_dir, specs):
             print(f"removed stale {path.name}")
     devices = inference_devices(torch, args.device, args.num_devices)
-    effective_compile_mode = args.compile_mode
-    if args.compile and len(devices) > 1:
-        thread_safe_modes = {
-            "reduce-overhead": "default",
-            "max-autotune": "max-autotune-no-cudagraphs",
-        }
-        effective_compile_mode = thread_safe_modes.get(
-            args.compile_mode, args.compile_mode)
-        if effective_compile_mode != args.compile_mode:
-            print(
-                f"compile mode {args.compile_mode!r} uses thread-local CUDA "
-                f"Graphs; using {effective_compile_mode!r} for "
-                f"{len(devices)} GPU workers")
     print(
         f"inference workers: {', '.join(str(device) for device in devices)}")
     pending = []
@@ -821,163 +986,73 @@ def infer(args):
                 print(f"[{index + 1}/{len(specs)}] stale {out_path.name}")
             pending.append((index, spec))
 
-    tasks = queue.Queue()
-    for task in pending:
-        tasks.put(task)
     timings = []
     decode_timings = []
-    results_lock = threading.Lock()
-    print_lock = threading.Lock()
 
-    def worker(device):
-        if device.type == "cuda":
-            torch.cuda.set_device(device)
-        model = VGGTOmega()
-        state = torch.load(
-            args.checkpoint, map_location="cpu", weights_only=True)
-        model.load_state_dict(state)
-        del state
-        # Tracking only consumes pose_enc. Loop verification keeps the dense
-        # head to reject candidate regions without geometric overlap.
-        if not args.verify_loop_overlap:
-            model.dense_head = None
-        model = model.eval().to(device)
-        if args.compile:
-            model = torch.compile(
-                model, mode=effective_compile_mode, fullgraph=False)
-        video_loader = DirectStereoVideoLoader(
-            manifest, device, args.decode_batch_size)
-
-        while True:
-            try:
-                index, spec = tasks.get_nowait()
-            except queue.Empty:
-                break
-            try:
-                out_path = windows_dir / f"{spec['name']}.npz"
-                reject_path = windows_dir / f"{spec['name']}.rejected.json"
-                out_path.unlink(missing_ok=True)
-                reject_path.unlink(missing_ok=True)
-                image_frame_idx, image_eye, image_segment = (
-                    make_window_image_inputs(
-                        spec, manifest, args.stereo_interval_seconds))
-                if device.type == "cuda":
-                    torch.cuda.synchronize(device)
-                decode_start = time.time()
-                images = video_loader.load(
-                    image_frame_idx, image_eye, args.resolution)
-                if device.type == "cuda":
-                    torch.cuda.synchronize(device)
-                decode_elapsed = time.time() - decode_start
-                repeat_timings = []
-                repeat_peak_memory = []
-                predictions = None
-                for _ in range(args.benchmark_repeats):
-                    if predictions is not None:
-                        del predictions
-                    if device.type == "cuda":
-                        torch.cuda.reset_peak_memory_stats(device)
-                        torch.cuda.synchronize(device)
-                    t0 = time.time()
-                    with torch.inference_mode():
-                        predictions = model(images)
-                    if device.type == "cuda":
-                        torch.cuda.synchronize(device)
-                        peak_memory = torch.cuda.max_memory_allocated(device)
-                    else:
-                        peak_memory = 0
-                    repeat_timings.append(time.time() - t0)
-                    repeat_peak_memory.append(peak_memory)
-                elapsed = repeat_timings[-1]
-                extrinsics, intrinsics = encoding_to_camera(
-                    predictions["pose_enc"],
-                    predictions["images"].shape[-2:],
-                )
-                overlap_score = np.nan
-                overlap_directional = (np.nan, np.nan)
-                if args.verify_loop_overlap and spec["kind"] == "loop":
-                    overlap_score, overlap_directional = loop_depth_overlap(
-                        predictions,
-                        extrinsics,
-                        intrinsics,
-                        image_eye,
-                        image_segment,
-                        args,
-                    )
-                    with print_lock:
-                        print(
-                            f"[{index + 1}/{len(specs)}] "
-                            f"{spec['name']} overlap {overlap_score:.3f} "
-                            f"({overlap_directional[0]:.3f}, "
-                            f"{overlap_directional[1]:.3f})")
-                    if overlap_score < args.min_loop_overlap:
-                        with open(reject_path, "w") as f:
-                            json.dump({
-                                "name": spec["name"],
-                                "kind": spec["kind"],
-                                "frame_idx": [
-                                    int(item["frame"])
-                                    for item in spec["frames"]
-                                ],
-                                "overlap_score": overlap_score,
-                                "overlap_directional": overlap_directional,
-                                "threshold": args.min_loop_overlap,
-                            }, f, indent=2)
-                        continue
-                frame_idx = np.asarray(
-                    [item["frame"] for item in spec["frames"]], np.int64)
-                np.savez_compressed(
-                    out_path,
-                    format=np.asarray(FORMAT_TAG),
-                    kind=np.asarray(spec["kind"]),
-                    frame_idx=frame_idx,
-                    image_frame_idx=image_frame_idx,
-                    image_eye=image_eye,
-                    image_segment=image_segment,
-                    segment=np.asarray(spec["segments"], np.int8),
-                    extrinsics=extrinsics[0].float().cpu().numpy(),
-                    intrinsics=intrinsics[0].float().cpu().numpy(),
-                    loop_overlap_score=np.asarray(overlap_score),
-                    loop_overlap_directional=np.asarray(
-                        overlap_directional),
-                    inference_seconds=np.asarray(elapsed),
-                    decode_remap_seconds=np.asarray(decode_elapsed),
-                    benchmark_inference_seconds=np.asarray(repeat_timings),
-                    peak_memory_bytes=np.asarray(repeat_peak_memory[-1]),
-                    benchmark_peak_memory_bytes=np.asarray(
-                        repeat_peak_memory),
-                    inference_device=np.asarray(str(device)),
-                )
-                with results_lock:
-                    timings.append(elapsed)
-                    decode_timings.append(decode_elapsed)
-                with print_lock:
-                    print(
-                        f"[{index + 1}/{len(specs)}] {out_path.name} on "
-                        f"{device}: {len(image_frame_idx)} images in "
-                        f"{decode_elapsed:.2f}s decode/remap + "
-                        f"{elapsed:.2f}s inference, "
-                        f"{repeat_peak_memory[-1] / 2**30:.2f} GiB"
-                        + (
-                            " (all repeats: "
-                            + ", ".join(
-                                f"{value:.2f}s"
-                                for value in repeat_timings)
-                            + ")"
-                            if len(repeat_timings) > 1 else ""
-                        ))
-            finally:
-                tasks.task_done()
-
+    # Includes model load and compile warmup, as it did when workers built
+    # their own models.
     wall_start = time.time()
     if pending:
-        with concurrent.futures.ThreadPoolExecutor(
-                max_workers=len(devices)) as executor:
-            futures = [
-                executor.submit(worker, device) for device in devices
-            ]
-            for future in futures:
-                future.result()
+        # One spawned process per GPU. CUDA does not survive fork, and
+        # sharing one process across GPU workers is what made compilation
+        # racy in the first place: Dynamo tracing is thread-unsafe, so
+        # threads forced serial warmup. Separate processes warm up all
+        # devices concurrently while sharing the on-disk Inductor cache.
+        ctx = multiprocessing.get_context("spawn")
+        # args carries func=infer from set_defaults; drop it so the pickle
+        # sent to spawned children has no __main__ function reference.
+        worker_args = argparse.Namespace(**{
+            key: value for key, value in vars(args).items() if key != "func"})
+        task_queue = ctx.Queue()
+        result_queue = ctx.Queue()
+        for task in pending:
+            task_queue.put(task)
+        for _ in devices:
+            task_queue.put(None)
+        workers = [
+            ctx.Process(
+                target=_infer_worker,
+                args=(str(device), worker_args, manifest, len(specs),
+                      str(windows_dir), compile_enabled, task_queue,
+                      result_queue),
+                daemon=True,
+            )
+            for device in devices
+        ]
+        for process in workers:
+            process.start()
+        remaining = len(workers)
+        failures = []
+        while remaining:
+            try:
+                message = result_queue.get(timeout=30)
+            except queue.Empty:
+                # A worker that dies without reporting (segfault, OOM kill)
+                # would otherwise hang this loop forever.
+                dead = [
+                    process for process in workers
+                    if not process.is_alive() and process.exitcode not in
+                    (0, None)]
+                if dead:
+                    raise RuntimeError(
+                        "inference worker died with exit code "
+                        f"{dead[0].exitcode}")
+                continue
+            if message[0] == "window":
+                timings.append(message[1])
+                decode_timings.append(message[2])
+            elif message[0] == "error":
+                failures.append(message)
+                remaining -= 1
+            else:
+                remaining -= 1
+        for process in workers:
+            process.join()
+        for _, device_str, trace in failures:
+            print(f"worker {device_str} failed:\n{trace}")
+        if failures:
+            raise RuntimeError(
+                f"{len(failures)} of {len(workers)} inference workers failed")
     wall_elapsed = time.time() - wall_start
 
     summary = {
@@ -988,11 +1063,8 @@ def infer(args):
         "loop_window_frames": args.loop_window_frames,
         "stereo_interval_seconds": args.stereo_interval_seconds,
         "camera_only": not args.verify_loop_overlap,
-        "torch_compile": args.compile,
-        "torch_compile_mode_requested": (
-            args.compile_mode if args.compile else None),
-        "torch_compile_mode": (
-            effective_compile_mode if args.compile else None),
+        "torch_compile": compile_enabled,
+        "torch_compile_mode": "default" if compile_enabled else None,
         "inference_devices": [str(device) for device in devices],
         "inference_workers": len(devices),
         "windows": [spec["name"] for spec in specs],
@@ -1090,19 +1162,10 @@ def build_parser():
     infer_parser.add_argument(
         "--overlap-relative-tolerance", type=float, default=0.15)
     infer_parser.add_argument(
-        "--compile",
+        "--no-compile",
         action="store_true",
-        help="compile the fixed-shape camera-only model with TorchInductor",
-    )
-    infer_parser.add_argument(
-        "--compile-mode",
-        choices=(
-            "default",
-            "reduce-overhead",
-            "max-autotune",
-            "max-autotune-no-cudagraphs",
-        ),
-        default="reduce-overhead",
+        help="skip the TorchInductor aggregator compile (escape hatch; "
+             "compiling is a strict win on CUDA)",
     )
     infer_parser.add_argument(
         "--benchmark-repeats",

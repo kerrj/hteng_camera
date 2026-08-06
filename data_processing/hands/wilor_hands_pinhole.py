@@ -64,6 +64,9 @@ def parse_args():
                    help="WiLoR asset cache prepared by prepare_wilor_models.py")
     p.add_argument("--max-frames", type=int, default=None)
     p.add_argument("--fp32", action="store_true")
+    p.add_argument("--no-compile", action="store_true",
+                   help="skip the YOLO detector TorchInductor compile "
+                        "(escape hatch; compiling is a strict win on CUDA)")
     return p.parse_args()
 
 
@@ -216,7 +219,8 @@ def main():
     if args.out is None:
         args.out = os.path.join(args.calib_dir, "derived")
     os.makedirs(args.out, exist_ok=True)
-    pipe, dev, dtype = W.build_pipeline(args.fp32, args.model_dir)
+    pipe, dev, dtype = W.build_pipeline(
+        args.fp32, args.model_dir, compile_detector=not args.no_compile)
     calib = load_calib(args.calib_dir, args.left_serial, args.right_serial, dev)
 
     # Two per-eye files: decode each on-GPU, slice nothing. torchcodec decodes

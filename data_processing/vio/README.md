@@ -72,11 +72,47 @@ variation is preserved.
 - gravity weight 1 with a 0.05 g Gaussian acceleration-norm taper
 - constant-velocity weight 0.1
 - soft gauge weights 1.0 translation and 0.01 rotation
+- TorchInductor compilation of the VGGT-Omega aggregator
 
 Run `run_vggt_pipeline.py --help` for configurable parameters. The complete
 configuration and stage timings are stored in
 `<recording>/derived/<tag>/pipeline_run.json`; graph-specific robust/gauge
 settings are also stored in the trajectory NPZ.
+
+## Inference speed
+
+`Aggregator` holds nearly all of the model's FLOPs and takes a single
+fixed-shape tensor, so it is compiled with `fullgraph=True, dynamic=False`.
+Measured on one A6000, 32 images per 512-px window:
+
+| | inference | peak memory |
+|---|---|---|
+| eager | 2.10 s | 6.56 GiB |
+| compiled aggregator | 1.54 s | 4.30 GiB |
+
+Warmup (~70 s cold, shared across GPUs through the on-disk Inductor cache) is
+paid inside each worker's first window; loop windows compile separately since
+their image counts and dense head differ. Results match eager to bf16
+kernel-ordering noise (~0.04 deg rotation, ~0.3 px on 512-px intrinsics).
+
+`VGGTOmega.forward` as a whole cannot be captured: it returns a list of
+per-layer tensors with `None` in the uncached slots, which Dynamo rejects
+(`torch.* op returned non-Tensor`). Pass `--no-compile` to
+`vio_vggt_window_infer.py infer` to force eager.
+
+GPU workers are spawned processes, one per device, not threads. TorchDynamo
+compilation is not thread-safe: concurrent first calls in one process either
+raise `using FX to symbolically trace a dynamo-optimized function` or deadlock
+in the Inductor subprocess pool, and serializing warmup instead cost minutes
+of idle GPUs per run. Separate processes give each worker private compiler
+state, so all devices warm up concurrently while sharing the on-disk Inductor
+cache. Nothing CUDA crosses the process boundary: workers decode, infer, and
+write their own NPZ files.
+
+The Inductor mode is `default`. The aggregator is compute-bound at these
+sizes, so `reduce-overhead`'s CUDA Graphs measured no faster (1.541 s vs
+1.546 s at 32x512), and `max-autotune` was also no faster than `default` while
+costing far more warmup.
 
 ## Visualize
 

@@ -51,6 +51,17 @@ offset between two free-running sensors, the slow drift between their unlocked
 clocks, and one-off USB jitter — bounding skew to ~half a camera frame interval.
 For true simultaneous exposure, wire a hardware trigger.
 
+On top of the pairing, startup PHASE ALIGNMENT (ported from publish_stereo.py)
+re-opens the RIGHT camera until the two sensors' exposure phases land within
+--align-tolerance-ms (default 5 ms). A re-open is the only thing that moves a
+sensor's phase — pause/play, reset_timestamp and ROI/frame-speed bounces all
+leave it untouched — and each re-open lands on a fresh random phase, so the
+loop measures the skew and retries until it falls in range (each attempt costs
+~1.3 s, expected count ≈ period / (2 × tolerance)). Once aligned the offset
+holds for the whole run (measured ~0.01 ms drift over five minutes on this
+rig), so this only runs at startup. It tightens the per-pair skew bound from
+~half a frame interval down to the tolerance.
+
 IMU synchronization (optional, --imu-port)
 -------------------------------------------
 The IMU (hteng_camera.imu.YbImu) has no hardware timestamp counter of its
@@ -121,6 +132,7 @@ import argparse
 import atexit
 import csv
 import json
+import math
 import os
 import platform
 import queue
@@ -666,6 +678,148 @@ def _measure_native_hz(cam: HTCamera, n: int = 30) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
+# Startup phase alignment — ported from publish_stereo.py (see the module
+# docstring's "phase alignment" note). Re-opening the right camera is the only
+# thing that moves a free-running sensor's exposure phase; measure the skew and
+# re-open until it lands within tolerance.
+# ---------------------------------------------------------------------------
+
+def _reset_anchor(cam: HTCamera) -> float:
+    """reset_timestamp() bracketed by perf_counter reads; the midpoint anchors
+    the camera's (now-zeroed) hardware timestamps on the host clock."""
+    before = time.perf_counter()
+    cam.reset_timestamp()
+    after = time.perf_counter()
+    return (before + after) / 2.0
+
+
+def _stamp_stream(cam: HTCamera, anchor: float, count: int,
+                  output: list, errors: list) -> None:
+    """Collect ``count`` host-clock frame timestamps from one camera."""
+    try:
+        while len(output) < count:
+            bayer, info = cam.grab_bayer12(timeout_ms=500)
+            if bayer is None:
+                continue
+            stamp = anchor + int(info["time"]) * 1e-6
+            # Discard SDK-buffered frames from before reset_timestamp().
+            if stamp > time.perf_counter() + 1.0:
+                continue
+            output.append(stamp)
+    except Exception as exc:
+        errors.append(exc)
+
+
+def _measure_skew(left: HTCamera, right: HTCamera,
+                  left_anchor: float, right_anchor: float,
+                  frames: int = 8) -> tuple[float, float]:
+    """Return ``(skew_s, period_s)`` for the pair on the shared time base.
+
+    ``skew_s`` is how far the right sensor's exposures sit from the left's,
+    wrapped into ±period/2. Repeatable to a few tens of microseconds — the
+    hardware counters are quantised at 100 µs and do not drift apart.
+    """
+    left_stamps: list[float] = []
+    right_stamps: list[float] = []
+    errors: list = []
+    threads = [
+        threading.Thread(
+            target=_stamp_stream,
+            args=(cam, anchor, frames, stamps, errors),
+            daemon=True,
+        )
+        for cam, anchor, stamps in (
+            (left, left_anchor, left_stamps),
+            (right, right_anchor, right_stamps),
+        )
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+    if errors:
+        raise RuntimeError(f"skew measurement failed: {errors[0]}")
+    if len(left_stamps) < 3 or len(right_stamps) < 3:
+        raise RuntimeError("skew measurement did not see enough frames")
+    period = float(np.median(np.diff(left_stamps)))
+    right_arr = np.asarray(right_stamps)
+    deltas = []
+    for stamp in left_stamps:
+        offsets = right_arr - stamp
+        deltas.append(offsets[np.argmin(np.abs(offsets))])
+    # Nearest-neighbour deltas alias across ±period/2, so average them on the
+    # circle instead of linearly.
+    phase = np.angle(
+        np.mean(np.exp(2j * np.pi * np.asarray(deltas) / period))
+    )
+    return float(phase * period / (2.0 * math.pi)), period
+
+
+def _align_phase(cam_left: HTCamera, cam_right: HTCamera, serial_right: str,
+                 args, exp_right: float, gain_right: float,
+                 full_right: tuple[int, int], dims_right: tuple[int, int]):
+    """Bring the two free-running sensors within --align-tolerance-ms of each
+    other by re-opening the right camera until its random phase lands in range.
+
+    Each sensor free-runs at an arbitrary phase, and nothing short of a full
+    re-open moves it: pause/play, ``reset_timestamp`` and ROI/frame-speed
+    bounces all leave the offset exactly where it was. A re-open lands the
+    right sensor on a fresh phase — measured on this rig it steps a few ms
+    around the frame period each time — so measure and re-open until the phase
+    falls inside the tolerance. Once aligned the offset holds (~0.01 ms drift
+    over five minutes of bench measurement), so this only runs at startup.
+
+    Returns ``(cam_right, exp_right, gain_right, full_right, dims_right,
+    skew_s, period_s)`` — the right-camera values are refreshed whenever the
+    camera was re-opened.
+    """
+    tolerance_s = args.align_tolerance_ms * 1e-3
+    left_anchor = _reset_anchor(cam_left)
+    right_anchor = _reset_anchor(cam_right)
+    started = time.perf_counter()
+    print(
+        f"[info] phase-aligning sensors to within "
+        f"{tolerance_s * 1e3:.2f} ms (re-opening {serial_right} until the "
+        "random phase lands in range)"
+    )
+    try:
+        for attempt in range(1, args.align_max_attempts + 1):
+            skew, period = _measure_skew(
+                cam_left, cam_right, left_anchor, right_anchor)
+            elapsed = time.perf_counter() - started
+            if abs(skew) <= tolerance_s:
+                print(
+                    f"[info] sensors aligned to {skew * 1e3:+.3f} ms "
+                    f"(period {period * 1e3:.2f} ms) after {attempt} "
+                    f"attempt(s), {elapsed:.1f} s"
+                )
+                return (cam_right, exp_right, gain_right, full_right,
+                        dims_right, skew, period)
+            expected = period / (2.0 * tolerance_s)
+            print(
+                f"[info] align attempt {attempt}/{args.align_max_attempts} "
+                f"({elapsed:.1f} s, ~{expected:.0f} expected): skew "
+                f"{skew * 1e3:+.3f} ms exceeds {tolerance_s * 1e3:.2f} ms; "
+                f"re-opening {serial_right}"
+            )
+            cam_right.close()
+            cam_right, exp_right, gain_right, full_right, dims_right = \
+                _open_and_configure(serial_right, args, "right")
+            right_anchor = _reset_anchor(cam_right)
+    except BaseException:
+        # The caller still holds the handle it was given; only a replacement
+        # it has never seen needs closing here (a double close is guarded).
+        cam_right.close()
+        raise
+    cam_right.close()
+    raise RuntimeError(
+        f"could not align the sensors within {tolerance_s * 1e3:.3f} ms in "
+        f"{args.align_max_attempts} attempts; raise --align-tolerance-ms or "
+        "--align-max-attempts"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Consumer: event-driven encoder loop, left as master, right matched by timestamp
 # ---------------------------------------------------------------------------
 
@@ -911,6 +1065,14 @@ def _write_manifest(out_dir: Path, args, encoder: str, left: dict, right: dict,
         "fps_requested": args.fps or None,
         "sensor_native_hz": rate_info["native_hz"],
         "decimation_stride": rate_info["stride"],
+        # Startup sensor phase alignment (ported from publish_stereo.py):
+        # aligned_skew_ms is the measured exposure-phase offset the run started
+        # with; None means alignment was disabled (--align-tolerance-ms 0).
+        "phase_alignment": {
+            "enabled": args.align_tolerance_ms > 0,
+            "tolerance_ms": args.align_tolerance_ms or None,
+            "aligned_skew_ms": rate_info.get("aligned_skew_ms"),
+        },
         "encoder": encoder,
         "quality": args.quality,
         "transfer": args.transfer,
@@ -1376,6 +1538,21 @@ def main() -> None:
              "cropping height — not width — is what raises fps and tightens the "
              "stereo skew bound. 1.0 = full frame.",
     )
+    # Each re-open costs ~1.3 s and lands on a fresh phase, so the startup
+    # cost is roughly (period / 2 / tolerance) attempts: ~4 s at 5 ms, ~27 s
+    # at 1 ms.
+    ap.add_argument(
+        "--align-tolerance-ms", type=float, default=5.0,
+        help="Startup phase-alignment tolerance: the RIGHT camera is re-opened "
+             "until the two free-running sensors' exposure phases land within "
+             "this many ms of each other (tightens the per-pair skew from "
+             "~half a frame interval down to this bound). 0 disables.",
+    )
+    ap.add_argument(
+        "--align-max-attempts", type=int, default=60,
+        help="Give up (with an error) after this many right-camera re-opens "
+             "without the phase landing inside --align-tolerance-ms.",
+    )
     ap.add_argument(
         "--sync-buffer", type=int, default=8,
         help="Depth (frames) of BOTH the right-camera ring the master timestamp "
@@ -1440,6 +1617,10 @@ def main() -> None:
         sys.exit("[error] --roi-height must be in (0, 1].")
     if args.watchdog_sec < 0:
         sys.exit("[error] --watchdog-sec must be >= 0 (0 disables).")
+    if args.align_tolerance_ms < 0:
+        sys.exit("[error] --align-tolerance-ms must be >= 0 (0 disables).")
+    if args.align_max_attempts < 1:
+        sys.exit("[error] --align-max-attempts must be >= 1.")
     if not 10 <= args.imu_rate <= 100:
         sys.exit("[error] --imu-rate must be in [10, 100] (firmware hard-caps at 100 anyway).")
 
@@ -1597,6 +1778,27 @@ def main() -> None:
                 except Exception:
                     pass
         raise
+
+    # Phase-align the free-running sensors (see the module docstring): re-open
+    # the right camera until the exposure phases land within tolerance. This can
+    # replace the right-camera handle, so it runs before anything else binds to
+    # it. Its timestamp resets are throwaway — the pair is reset again below to
+    # establish the recording's shared time base (resets don't move the phase).
+    aligned_skew_ms = None
+    if args.align_tolerance_ms > 0:
+        try:
+            (cam_right, exp_right, gain_right, full_right, dims_right,
+             skew, _period) = _align_phase(
+                cam_left, cam_right, serial_right, args,
+                exp_right, gain_right, full_right, dims_right)
+            aligned_skew_ms = skew * 1e3
+        except BaseException:
+            for c in (cam_left, cam_right):
+                try:
+                    c.close()
+                except Exception:
+                    pass
+            raise
 
     # Measure the sensor's true delivered rate (before the reset, so these warmup
     # grabs don't consume post-reset timestamps). --fps then decimates by an
@@ -1757,7 +1959,9 @@ def main() -> None:
         imu_info,
         audio_info,
         {"native_hz": round(native_hz, 3), "stride": stride,
-         "effective_hz": round(effective_hz, 3)},
+         "effective_hz": round(effective_hz, 3),
+         "aligned_skew_ms": (round(aligned_skew_ms, 3)
+                             if aligned_skew_ms is not None else None)},
     )
 
     # ── Start one ffmpeg per camera ──────────────────────────────────────────
