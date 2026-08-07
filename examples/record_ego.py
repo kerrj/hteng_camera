@@ -383,9 +383,15 @@ def _start_audio_capture(device: str, output: Path,
     return None
 
 
-def _stop_audio_capture(proc: subprocess.Popen, timeout: float = 10.0) -> int:
-    """Gracefully finalize an audio MKA, killing only if ffmpeg is stuck."""
-    if proc.poll() is None:
+def _stop_audio_capture(proc: subprocess.Popen, timeout: float = 10.0,
+                        already_signalled: bool = False) -> int:
+    """Gracefully finalize an audio MKA, killing only if ffmpeg is stuck.
+
+    Pass ``already_signalled`` when the caller has already sent the one
+    graceful SIGINT: a second one makes ffmpeg exit immediately and abort the
+    Matroska trailer it is in the middle of writing.
+    """
+    if not already_signalled and proc.poll() is None:
         try:
             proc.send_signal(signal.SIGINT)
         except ProcessLookupError:
@@ -924,14 +930,16 @@ def _encode_loop_stereo(
 
                 out_left = _encode(bayer_left, left["cv_code"], transfer, left["wb"])
                 out_right = _encode(bayer_right, right["cv_code"], transfer, right["wb"])
-                log.writerow([frame_idx, t_left, t_right, t_right - t_left, 1])
-
                 try:
                     left["proc"].stdin.write(out_left.view(np.uint8))
                     right["proc"].stdin.write(out_right.view(np.uint8))
                 except (BrokenPipeError, OSError):
                     stop.set()                   # a dead pipe stops the pair
                     break
+                # Logged only once both frames are in the pipes: a row written
+                # first would claim a frame that a dying encoder never got,
+                # leaving sync_log longer than the videos it indexes.
+                log.writerow([frame_idx, t_left, t_right, t_right - t_left, 1])
                 frame_idx += 1
     except Exception as e:
         health.fail(f"encode thread crashed: {e!r}")
@@ -1145,6 +1153,22 @@ def _report_sync(sync_csv: Path) -> None:
 # Camera setup helper
 # ---------------------------------------------------------------------------
 
+def _wait_for_serial(serial: str, timeout: float = 3.0) -> None:
+    """Block until ``serial`` shows up in the SDK's device list.
+
+    CameraUnInit returns before the USB interface is actually released, so a
+    camera we just closed is briefly missing from CameraEnumerateDevice. The
+    phase-alignment loop re-opens the right camera immediately after closing
+    it, which used to fail outright with "No camera with serial ...". Poll
+    instead of assuming; open() raises the same error if it never comes back.
+    """
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        if any(c["serial"] == serial for c in list_cameras()):
+            return
+        time.sleep(0.02)
+
+
 def _open_and_configure(serial: str, args, tag: str
                         ) -> tuple[HTCamera, float, float, tuple[int, int], tuple[int, int]]:
     """Open one camera, apply the fixed-exposure / max-throughput config, and
@@ -1164,6 +1188,7 @@ def _open_and_configure(serial: str, args, tag: str
     stereo skew blows up. So we set, start streaming (some values only latch once
     playing), read back, and re-apply until exposure and gain match — or warn.
     """
+    _wait_for_serial(serial)
     cam = HTCamera(serial=serial, demosaic_quality=args.demosaic)
     cam.set_frame_speed(enums.FRAME_SPEED_HIGH)  # set first: changing speed can reset exposure
 
@@ -1976,7 +2001,13 @@ def main() -> None:
         cmd = _ffmpeg_cmd(encoder, w, h, max(1, round(effective_hz)),
                           args.quality, out_path, args.transfer)
         # bufsize=0: each frame is one big write; buffering just memcpys ~30 MB.
-        procs.append(subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0))
+        # start_new_session: keep terminal Ctrl+C in the parent, as the audio
+        # encoder already does. Left in the foreground group, both encoders take
+        # SIGINT directly and start finalizing mid-pair, so one side's pipe can
+        # close between the left and right writes below and truncate that eye by
+        # a frame. Teardown finalizes them properly by closing stdin instead.
+        procs.append(subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0,
+                                      start_new_session=True))
     proc_left, proc_right = procs
 
     # ── Producers (left FIFO / right ring) + one shared encode thread ────────
@@ -2108,9 +2139,11 @@ def main() -> None:
     stop.set()
     # Audio runs in its own process session, so terminal Ctrl+C reaches only the
     # parent. Send exactly one deliberate SIGINT for a valid Matroska trailer.
+    audio_signalled = False
     if audio_proc is not None and audio_proc.poll() is None:
         try:
             audio_proc.send_signal(signal.SIGINT)
+            audio_signalled = True
         except ProcessLookupError:
             pass
     for t in cap_threads:
@@ -2129,7 +2162,8 @@ def main() -> None:
     if audio_proc is not None:
         if audio_proc.poll() is None:
             print("[info] waiting for audio ffmpeg to finalize...")
-        audio_ret = _stop_audio_capture(audio_proc)
+        audio_ret = _stop_audio_capture(audio_proc,
+                                        already_signalled=audio_signalled)
     cam_left.close()
     cam_right.close()
     if imu is not None:

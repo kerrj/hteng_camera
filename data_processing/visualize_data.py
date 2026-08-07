@@ -698,11 +698,19 @@ def main():
     )
 
     n_v = int(np.asarray(faces).max()) + 1 if faces is not None else 0
+
+    def hand_faces(mirror):
+        """MANO's faces wind for the unmirrored (right) hand. The x-mirror in
+        hand_mesh_cam is orientation-reversing, so the mirrored hand needs its
+        winding reversed too or every normal points into the mesh."""
+        return np.ascontiguousarray(faces[:, ::-1]) if mirror < 0 else faces
+
     mesh_h = {name: server.scene.add_mesh_simple(
-                  f"/hand_{name}", np.zeros((n_v, 3), np.float32), faces,
+                  f"/hand_{name}", np.zeros((n_v, 3), np.float32),
+                  hand_faces(meta["mirror"]),
                   color=color, flat_shading=False, visible=False,
                   cast_shadow=True, receive_shadow=True)
-              for name, (_, _, color) in hand_tracks.items()}
+              for name, (meta, _, color) in hand_tracks.items()}
 
     gui_view = server.gui.add_dropdown(
         "View", ("Overview", "Follow", "Ego"),

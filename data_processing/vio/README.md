@@ -40,6 +40,13 @@ Use `--gpus 2` for a single-GPU run. Reusing the same tag resumes cached
 windows after validating their frame identities and inference settings. Use a
 new tag when changing the field of view, window geometry, or checkpoint.
 
+Launch this in the background (`nohup ... > vio.log 2>&1 & disown`) and start
+the hand pipeline's WiLoR stage concurrently on GPUs outside this `--gpus`
+list. That stage needs only the videos and calibration, not this trajectory,
+so the two overlap completely; see
+[`data_processing/hands/README.md`](../hands/README.md). Only the hand
+optimizer (stage 2) has to wait for the trajectory below.
+
 The final trajectory is written to:
 
 ```text

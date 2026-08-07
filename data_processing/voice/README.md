@@ -18,8 +18,10 @@ conda env create -f data_processing/voice/environment-mac.yml
 conda activate hteng-voice
 ```
 
-The default `small` model is roughly 500 MB and runs comfortably on an Apple
-Silicon laptop. The environment occupies about 1.2 GB before model weights
+The default `large-v3` model is roughly 3 GB and still transcribes faster than
+real time on an Apple Silicon laptop. Smaller models are noticeably worse on
+isolated spoken commands: `small` both misses real commands and hallucinates
+phrases into silence. The environment occupies about 1.2 GB before model weights
 because mlx-whisper currently depends on Torch, SciPy, and Numba in addition to
 MLX. Model weights are downloaded from Hugging Face on first use and cached.
 `ffmpeg` and `ffprobe` must be available on `PATH`.
@@ -41,13 +43,13 @@ conda activate hteng-voice
 python data_processing/voice/transcribe_audio.py take01
 ```
 
-This selects MLX automatically on Apple Silicon and uses the Whisper `small`
-model. For faster command recognition with somewhat lower accuracy, use
-`base`:
+This selects MLX automatically on Apple Silicon and uses the Whisper `large-v3`
+model. Override it with `--model` if you need a smaller download, at a real
+accuracy cost on command recognition:
 
 ```bash
 python data_processing/voice/transcribe_audio.py take01 \
-  --model mlx-community/whisper-base-mlx
+  --model mlx-community/whisper-large-v3-turbo
 ```
 
 Passing a standalone audio file is supported for scratch tests. Its output is

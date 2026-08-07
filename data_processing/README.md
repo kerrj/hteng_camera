@@ -94,7 +94,7 @@ Two modes:
 The spoken command itself is never inside a chunk: boundaries sit `--pad`
 seconds (default 0.5) clear of it. Matching is exact on normalized words
 (lowercased, punctuation removed) and requires every matched word to clear
-`--min-probability` (default 0.9), so a low-confidence mistranscription cannot
+`--min-probability` (default 0.5), so a low-confidence mistranscription cannot
 cut a recording. Repeats chained within `--collapse` seconds of each other
 become one boundary spanning the burst. Existing chunk directories are never
 overwritten without `--force`.
@@ -104,7 +104,7 @@ previous one is ignored, and its span merges into the following chunk. The
 trigger is dropped rather than the short chunk, so footage between two commands
 is never silently discarded.
 
-`--max-no-speech` (default 0.6) rejects matches inside a Whisper segment whose
+`--max-no-speech` (default 0.65) rejects matches inside a Whisper segment whose
 `no_speech_prob` is higher than that. Whisper can lock onto background noise —
 keyboard clatter in a quiet room — and loop a phrase it heard earlier, emitting
 repeats with per-word probabilities as high as 0.99 that no confidence gate can
@@ -174,6 +174,11 @@ often already running on some of the 8 A6000s per box.
 Launch long remote jobs with `nohup ... > log 2>&1 & disown` (or equivalent).
 A dropped VPN/SSH session does not kill these; reconnect and tail the log or
 `ps aux` to pick the job back up with no data loss.
+
+Run `visualize_data.py` on the remote host too, not on the local machine —
+recordings and derived products live on `sphynx`/`moggy`, so launch Viser
+there and forward the port over SSH (`ssh -L <port>:localhost:<port> sphynx`)
+rather than copying data down to view it locally.
 
 `mlx-whisper` transcription is not bit-for-bit deterministic across separate
 runs with identical model/settings — segment boundaries and word counts can

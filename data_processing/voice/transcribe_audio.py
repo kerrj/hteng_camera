@@ -16,8 +16,8 @@ from typing import Any
 
 
 FORMAT_VERSION = "hteng-camera-voice-transcript/1"
-MLX_DEFAULT_MODEL = "mlx-community/whisper-small-mlx"
-FASTER_DEFAULT_MODEL = "small"
+MLX_DEFAULT_MODEL = "mlx-community/whisper-large-v3-mlx"
+FASTER_DEFAULT_MODEL = "large-v3"
 
 
 @dataclass(frozen=True)
@@ -200,6 +200,7 @@ def _transcribe_mlx(
     kwargs: dict[str, Any] = {
         "path_or_hf_repo": model,
         "word_timestamps": word_timestamps,
+        "condition_on_previous_text": False,
         "verbose": False,
     }
     if language is not None:
@@ -207,6 +208,7 @@ def _transcribe_mlx(
     result = mlx_whisper.transcribe(str(path), **kwargs)
     metadata = {
         "language": result.get("language", language),
+        "condition_on_previous_text": False,
     }
     return result, metadata
 
@@ -255,6 +257,7 @@ def _transcribe_faster(
         language=language,
         word_timestamps=word_timestamps,
         vad_filter=vad_filter,
+        condition_on_previous_text=False,
     )
     segments = []
     for segment in segments_iter:
@@ -292,6 +295,7 @@ def _transcribe_faster(
         "device": resolved_device,
         "compute_type": resolved_compute,
         "vad_filter": vad_filter,
+        "condition_on_previous_text": False,
     }
     return result, metadata
 

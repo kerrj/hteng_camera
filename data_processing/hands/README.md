@@ -15,6 +15,24 @@ full-rate trajectory first by following
 [`data_processing/vio/README.md`](../vio/README.md); the hand optimizer will
 consume that trajectory in stage 2.
 
+Only **stage 2** needs the trajectory. Stage 1 reads just the videos and
+calibration, so launch it in the background on a spare GPU the moment VIO
+starts rather than waiting for VIO to finish — the two run concurrently and
+the pipeline finishes in roughly the time of the slower one:
+
+```bash
+REC=take01
+CUDA_VISIBLE_DEVICES=6 nohup python \
+  data_processing/hands/wilor_hands_pinhole.py \
+  "$REC/left.mp4" "$REC/right.mp4" --calib-dir "$REC" \
+  > "$REC"_wilor.log 2>&1 & disown
+```
+
+Pick GPUs that VIO's `--gpus` list does not claim, and check `nvidia-smi`
+first — other jobs are often already on the box. `nohup ... & disown` keeps
+both jobs alive across a dropped VPN or SSH session; reconnect and tail the
+logs to pick them back up.
+
 ## Inputs
 
 A recording directory must contain:
